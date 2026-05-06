@@ -1,0 +1,1937 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Lava Lamp — SPH Fluid Simulation</title>
+<style>
+  :root {
+    --bg: #0a0612;
+    --panel: rgba(255,255,255,0.04);
+    --panel-border: rgba(255,255,255,0.08);
+    --text: #e8d8ff;
+    --muted: #8a7ba0;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: #000;
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 36px;
+    padding: 24px;
+    flex-wrap: wrap;
+  }
+  .stage {
+    position: relative;
+    border-radius: 28px;
+    box-shadow: 0 30px 80px -20px rgba(0,0,0,0.7),
+                0 10px 30px -10px rgba(120,40,180,0.3);
+  }
+  canvas#lava {
+    display: block;
+    width: 380px;
+    height: 700px;
+    border-radius: 28px;
+  }
+  .controls {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 18px;
+    padding: 22px 22px 18px;
+    width: 280px;
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+  }
+  .controls h1 {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 18px;
+  }
+  .control { margin-bottom: 16px; }
+  .control label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+  .control .val { font-variant-numeric: tabular-nums; opacity: 0.7; font-size: 11px; }
+  input[type=range] {
+    width: 100%;
+    accent-color: #b85cff;
+    background: transparent;
+  }
+  input[type=color] {
+    width: 100%;
+    height: 32px;
+    border-radius: 6px;
+    border: 1px solid var(--panel-border);
+    background: transparent;
+    cursor: pointer;
+    padding: 2px;
+  }
+  .row { display: flex; gap: 8px; }
+  .row > .control { flex: 1; margin-bottom: 0; }
+  button {
+    width: 100%;
+    padding: 9px 12px;
+    border-radius: 9px;
+    background: rgba(184, 92, 255, 0.12);
+    color: inherit;
+    border: 1px solid rgba(184, 92, 255, 0.24);
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    transition: background 0.15s;
+  }
+  button:hover { background: rgba(184, 92, 255, 0.2); }
+  .stats {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--panel-border);
+    font-size: 10px;
+    color: var(--muted);
+    letter-spacing: 0.06em;
+    display: flex;
+    justify-content: space-between;
+  }
+  .preset-row {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+  .preset {
+    flex: 1;
+    padding: 6px 4px;
+    font-size: 10px;
+    border-radius: 7px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--panel-border);
+    cursor: pointer;
+    color: var(--muted);
+    transition: all 0.15s;
+  }
+  .preset:hover { color: var(--text); border-color: rgba(184,92,255,0.4); }
+  @media (max-width: 760px) {
+    body { padding: 12px; gap: 16px; }
+    canvas#lava { width: 320px; height: 580px; }
+    .controls { width: 100%; max-width: 320px; }
+  }
+
+  /* Floating toolbar (fullscreen + panel toggle) */
+  .toolbar {
+    position: fixed;
+    top: 14px;
+    right: 14px;
+    display: flex;
+    gap: 8px;
+    z-index: 10;
+  }
+  .toolbar button {
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    border-radius: 9px;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.10);
+    color: var(--text);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    transition: background 0.15s;
+  }
+  .toolbar button:hover { background: rgba(184, 92, 255, 0.20); }
+
+  /* Hidden state for the controls panel */
+  .controls.hidden { display: none; }
+
+  /* Fullscreen: scale the canvas to fill the viewport, keep aspect ratio */
+  :fullscreen canvas#lava,
+  :-webkit-full-screen canvas#lava {
+    height: min(94vh, calc(94vw * 700 / 380));
+    width:  min(94vw, calc(94vh * 380 / 700));
+  }
+  :fullscreen body,
+  :-webkit-full-screen body {
+    background: #000;
+  }
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <button id="togglePanel" title="Toggle controls (C)" aria-label="Toggle controls">&#x2261;</button>
+  <button id="toggleFs" title="Fullscreen (F)" aria-label="Fullscreen">&#x26F6;</button>
+</div>
+
+<div class="stage"><canvas id="lava" width="760" height="1400"></canvas></div>
+
+<div class="controls">
+  <h1>Lava Lamp</h1>
+
+  <div class="preset-row">
+    <button class="preset" data-preset="classic">Classic</button>
+    <button class="preset" data-preset="cosmic">Cosmic</button>
+    <button class="preset" data-preset="ocean">Ocean</button>
+    <button class="preset" data-preset="forest">Forest</button>
+  </div>
+
+  <div class="row">
+    <div class="control">
+      <label>Background</label>
+      <input type="color" id="bgColor" value="#2a0d3e" />
+    </div>
+    <div class="control">
+      <label>Cold wax</label>
+      <input type="color" id="coldColor" value="#9a0f1a" />
+    </div>
+    <div class="control">
+      <label>Hot wax</label>
+      <input type="color" id="hotColor" value="#ffcf3a" />
+    </div>
+  </div>
+
+  <div class="control">
+    <label>Bulb glow <span class="val" id="glowVal">0.55</span></label>
+    <input type="range" id="glow" min="0" max="1" step="0.01" value="0.55" />
+  </div>
+
+  <div class="control">
+    <label>Speed <span class="val" id="speedVal">1.00</span></label>
+    <input type="range" id="speed" min="0.05" max="2.0" step="0.01" value="1.00" />
+  </div>
+
+  <div class="control">
+    <label>Buoyancy <span class="val" id="sgVal">1.60</span></label>
+    <input type="range" id="sg" min="0.2" max="8.0" step="0.05" value="1.60" />
+  </div>
+
+  <div class="control">
+    <label>Heat <span class="val" id="heatVal">0.65</span></label>
+    <input type="range" id="heat" min="0.05" max="4.0" step="0.01" value="0.65" />
+  </div>
+
+  <div class="control">
+    <label>Heater height <span class="val" id="bulbVal">65</span></label>
+    <input type="range" id="bulb" min="20" max="260" step="1" value="65" />
+  </div>
+
+  <div class="control">
+    <label>Heater spread <span class="val" id="edgeVal">0.45</span></label>
+    <input type="range" id="edge" min="0" max="1.0" step="0.01" value="0.45" />
+  </div>
+
+  <div class="control">
+    <label>Heat mixing <span class="val" id="diffVal">2.50</span></label>
+    <input type="range" id="diff" min="0" max="6.0" step="0.05" value="2.50" />
+  </div>
+
+  <div class="control">
+    <label>Heat flicker <span class="val" id="noiseVal">1.00</span></label>
+    <input type="range" id="noise" min="0" max="2.0" step="0.01" value="1.00" />
+  </div>
+
+  <div class="control">
+    <label>Cooling <span class="val" id="acoolVal">1.00</span></label>
+    <input type="range" id="acool" min="0" max="6.0" step="0.05" value="1.00" />
+  </div>
+
+  <div class="control">
+    <label>Bounce <span class="val" id="stVal">0.90</span></label>
+    <input type="range" id="st" min="0" max="3.0" step="0.01" value="0.90" />
+  </div>
+
+  <div class="control">
+    <label>Phase separation <span class="val" id="trVal">0.0</span></label>
+    <input type="range" id="tr" min="0" max="15" step="0.1" value="0.0" />
+  </div>
+
+  <div class="control">
+    <label>Surface tension <span class="val" id="stenVal">0.80</span></label>
+    <input type="range" id="sten" min="0" max="4.0" step="0.05" value="0.80" />
+  </div>
+
+  <div class="control">
+    <label>Floor pull <span class="val" id="stickyVal">0.65</span></label>
+    <input type="range" id="sticky" min="0" max="3.0" step="0.01" value="0.65" />
+  </div>
+
+  <div class="control">
+    <label>Wax size <span class="val" id="sizeVal">1.30</span></label>
+    <input type="range" id="size" min="0.7" max="2.0" step="0.01" value="1.30" />
+  </div>
+
+  <div class="control">
+    <label>Viscosity <span class="val" id="viscVal">1.50</span></label>
+    <input type="range" id="visc" min="0" max="6.0" step="0.05" value="1.50" />
+  </div>
+
+  <div class="control">
+    <label>Particle count <span class="val" id="countVal">160</span></label>
+    <input type="range" id="count" min="60" max="600" step="10" value="160" />
+  </div>
+
+  <button id="reset">Reset simulation</button>
+
+  <div class="stats">
+    <span id="fpsText">— fps</span>
+    <span id="partText">— particles</span>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ============================================================
+// Smoothed Particle Hydrodynamics — 2D, with thermal buoyancy.
+//
+// We simulate wax blobs whose density depends on temperature.
+// Bottom of the bottle heats particles; top of the bottle cools
+// them. Hot particles become buoyant and rise; cold ones sink.
+// Heat advects with the particle and diffuses across neighbors.
+// ============================================================
+
+// Simulation domain (independent of canvas resolution)
+const SIM_W = 380;
+const SIM_H = 700;
+
+// --------- Bottle silhouette (shared by sim and shader) -------
+// t = vertical position normalized to [0, 1] where 0 is the top
+// of the canvas. Returns half-width as a *fraction of SIM_W*.
+// Returns 0 in the cap regions (no fluid space).
+function bottleHalfFrac(t) {
+  if (t < 0.05) return 0;
+  if (t < 0.07) return 0.42 * ((t - 0.05) / 0.02); // open from neck top
+  if (t < 0.16) return 0.42 + (0.50 - 0.42) * ((t - 0.07) / 0.09);
+  if (t < 0.50) {
+    const u = (t - 0.16) / 0.34;
+    // Smooth widen with ease
+    const e = 1 - Math.pow(1 - u, 2);
+    return 0.50 + (0.96 - 0.50) * e;
+  }
+  if (t < 0.90) {
+    const u = (t - 0.50) / 0.40;
+    const e = u * u;
+    return 0.96 - (0.96 - 0.55) * e;
+  }
+  if (t < 0.93) return 0.55 - (0.55 - 0.40) * ((t - 0.90) / 0.03);
+  if (t < 0.95) return 0.40 * (1 - (t - 0.93) / 0.02);
+  return 0;
+}
+
+function bottleHalfWidth(y) {
+  return bottleHalfFrac(y / SIM_H) * SIM_W;
+}
+
+// ----------------- SPH simulation -----------------------------
+class SPH {
+  constructor(opts = {}) {
+    this.numParticles = opts.numParticles || 220;
+
+    // Kernel and core fluid params
+    this.h = 26;                  // smoothing radius (px)
+    this.mass = 1.0;
+    this.gasK = 1400;             // pressure stiffness (push particles apart)
+    // Base kinematic viscosity (slider 1.0 = this value). The previous value
+    // of 0.2 was calibrated against an incorrect VISC_LAP kernel constant
+    // that was off by a factor of h; the corrected 2D constant is h× larger,
+    // so this value is reduced by h (= 26) to preserve the same effective
+    // viscous force at the slider's nominal position.
+    this.viscosity = 0.2 / 26;    // ≈ 0.00769
+    this.viscScale = 1.5;         // user multiplier
+    // Intra-blob surface tension. The Akinci kernel cohesion AND the
+    // edge-only roundness pull are now both controlled by a single
+    // user-facing "Surface tension" slider — together they're what
+    // gives each mass its boundary.
+    this.cohesion = 0.30;          // base cohesion strength (slider 1.0 = this)
+    this.surfaceTensionScale = 0.80;
+
+    // Distinct masses ("blobs") — group IDs are recomputed every frame
+    // via connected components on the particle graph. Two particles are
+    // "connected" if they're closer than `connectDist`. So masses form
+    // dynamically based on density/position: a stretched mass that pinches
+    // off becomes two; two masses bouncing off each other never merge
+    // because surface-tension repulsion keeps them just outside the
+    // connect distance.
+    // Cap on simultaneous distinct blobs. Must match the shader's MAX_G.
+    // When this is exceeded, recomputeGroups() collapses overflow components
+    // to the last id, which makes them share a centroid — and the roundness
+    // force then pulls physically separate drops toward their joint COM
+    // (looks like long-range attraction across the bulb). 32 gives plenty
+    // of headroom for fragmented scenes without inflating shader-side
+    // memory meaningfully.
+    this.MAX_BLOBS = 32;
+    this.surfaceTension = 0.9;     // user multiplier for inter-blob repulsion
+    // Inter-blob repulsion scaled down to match the new (tiny) effective
+    // gravity: at contact the force is now a few px/s², comparable to
+    // the buoyancy-driven net force. Strong enough to prevent merging,
+    // soft enough that two cool blobs of similar temperature can join.
+    this.interRepel = 80;
+    // When two masses meet, repulsion is amplified by their temperature
+    // difference. Same-temperature blobs (cool + cool) can merge; a hot
+    // bubble bouncing off the cold pool stays separate.
+    this.tempRepelMult = 0.0;
+    this.connectDist = this.h * 0.82; // intra-mass connectivity threshold
+    this.groupId = new Int32Array(this.cap);
+    this.uf = new Int32Array(this.cap);  // union-find parent array
+
+    // Edge-only roundness pull: particles with few same-group neighbors
+    // (i.e., on the boundary of a torn or stretched blob) get pulled
+    // toward the blob centroid. Interior particles feel zero — so a
+    // round blob is the stable equilibrium and won't compress to a
+    // point.
+    // Edge-only roundness pull. Combined with cohesion under the
+    // Surface Tension slider — this is the inward pull on boundary
+    // particles that springs torn pieces back into circles.
+    this.roundness = 30;           // px/s^2 at full edge factor (slider 1.0)
+    this.interiorN = 5.0;          // neighbor count above which a particle is "interior"
+
+    // Sticky bottom layer: a small downward pull plus extra velocity
+    // damping for particles in the bottom of the fluid region. The pull
+    // augments cool-wax buoyancy so the resting pool stays anchored
+    // even when its temperature drifts close to the neutral-buoyancy
+    // crossover. Both effects ramp from zero at `stickyTop` to full at
+    // the bottle floor and are scaled by `stickyStrength` (the slider).
+    this.stickyHeight = 90;        // px above the fluid bottom
+    this.stickyStrength = 0.65;    // slider; scales both drag and pull
+    // Peak downward accel (px/s²) at the floor before stickyStrength
+    // scaling. Set strong enough to overcome cool-wax buoyancy and
+    // close-range cohesion, so small detached drops sitting just above
+    // the pool get pulled in and absorbed instead of lingering as
+    // independent blobs. Hot blobs in the bulb zone still escape
+    // (their +14.4 px/s² rise beats the ~13 px/s² peak pull at default
+    // slider value).
+    this.stickyPull = 20.0;
+
+    // Pool-zone barrier attenuation. The activation barrier between a
+    // blob and the pool weakens the longer the blob lingers in the
+    // region just above the pool — it's an annealing-style effect: a
+    // hovering drop has more time to "tunnel" the squeeze film, drain
+    // the boundary layer, and merge. Per-particle dwell-time
+    // accumulates while y is inside the zone (weighted by depth) and
+    // resets to 0 when the particle leaves; the barrier scale then
+    // decays exponentially with dwell time.
+    this.poolZoneTop = SIM_H * 0.83;       // upper edge of the pool-vicinity zone
+    this.poolZoneFloor = SIM_H * 0.92;     // lower edge (~ pool floor)
+    this.poolDwellTau = 3.0;               // seconds — barrier 1/e time
+    this.poolBarrierFloor = 0.05;          // minimum barrier scale at long dwell
+
+    // Pinned wall particles forming a permanent pool at the bottle
+    // floor. They never integrate (skipped by the velocity update),
+    // hold their position and ambient temperature, and contribute to
+    // density / pressure / viscosity for nearby fluid — so active wax
+    // sits on top of them rather than passing through. Group id 0
+    // keeps them out of the fluid connectivity graph. Sized so the
+    // bottom row spans the entire bottle width at the floor, with a
+    // second hex-offset row on top for depth.
+    this.nFixed = 0;
+    this.MAX_FIXED = 60;
+
+    // Compressible "boundary layer" around each blob — a soft cushion
+    // zone extending past the hard SPH kernel where different masses
+    // first feel each other. Models the squeeze-film of the surrounding
+    // fluid being pushed out of the way as two blobs approach.
+    this.cushionRange = this.h * 1.35;   // outer reach (px)
+    this.cushionStrength = 2.50;         // fraction of inter-blob repulsion strength
+
+    // Global time scale — scales the effective dt for the entire sim
+    // (motion, noise drift, heat exchange). 1.0 = real time, 0.35 means
+    // everything runs at 35% speed. Lava-lamp fluid is very viscous in
+    // real life and motion takes tens of seconds, so we run slow by
+    // default.
+    this.timeScale = 1.0;
+
+    // Visual particle size — multiplies the metaball kernel radius
+    // passed to the shader. Doesn't affect the physics (the SPH solver
+    // still uses sim.h), only how big the wax appears on screen.
+    this.renderScale = 1.30;
+
+    // ------------------------------------------------------------
+    //  Realistic physics block — calibrated from the standard recipe.
+    //
+    //  Lava (by mass): 42% perchloroethylene + 10% paraffin oil + 48%
+    //  paraffin wax. Densities (g/cm³): perc 1.622, oil 0.85, wax
+    //  ~0.90 cool / ~0.78 hot. Total volume per 100 g:
+    //    cool ≈ 91.0 cm³  → ρ_cool ≈ 1.099 g/cm³
+    //    hot  ≈ 99.2 cm³  → ρ_hot  ≈ 1.008 g/cm³
+    //  Background fluid is tuned to sit between these (~1.05 g/cm³),
+    //  so the wax has a ±0.02 g/cm³ excess/deficit at the extremes —
+    //  i.e., ~2% effective gravity on wax. Buoyancy is therefore very
+    //  small and motion is slow.
+    //
+    //  Specific heat (mass-weighted):
+    //    c_p = 0.42·0.91 + 0.10·2.13 + 0.48·2.5 ≈ 1.795 J/(g·K)
+    //  Bulb: 40 W, 70% loss → 12 W effective into 100 g of lava.
+    //  Average ΔT/Δt = P/(m·c_p) = 12/(100·1.795) ≈ 0.0668 K/s.
+    //  Mapping T∈[0,1] to a 35 K active range: ≈ 0.0019 norm/s avg,
+    //  ~3× that for a particle currently in the bulb zone (~30% of
+    //  the wax is there at once) → ~0.006 norm/s per particle.
+    // ------------------------------------------------------------
+    this.gravity = 240;            // px/s^2 — full-gravity scale
+    this.coolDensityExcess = 0.020; // (ρ_wax - ρ_fluid)/ρ_wax at T_ambient (sinks)
+    // Asymmetric on purpose: the upward (positive-buoyancy) bound is ~3×
+    // the downward bound. Real-recipe wax is roughly symmetric ±2%, but
+    // the rising side is amplified here so hot blobs ascend with more
+    // visual punch while the descending pool still sinks at recipe rate.
+    // Side effect: the neutrally-buoyant temperature shifts down to
+    // tNorm = 0.020/(0.020+0.060) = 0.25, so blobs start lifting at a
+    // lower temperature than they did under symmetric buoyancy.
+    this.hotDensityDeficit = 0.060; // (ρ_fluid - ρ_wax)/ρ_wax at T = 1.0    (rises)
+    // User-tunable specific-gravity multiplier on both the cool excess
+    // and the hot deficit. 1.0 = recipe physics; >1.0 = wax acts denser
+    // / less dense (stronger sinking and rising); <1.0 = closer to
+    // neutrally buoyant.
+    this.gravityScale = 1.6;
+
+    // Buoyancy curve steepness. The temperature → density mapping is
+    // (e^(k·tNorm) − 1) / (e^k − 1) instead of a linear blend, so a
+    // drop has to cook well past the midpoint before its density flips
+    // — and once it does, the rise accelerates exponentially. With
+    // k = 4, the neutral-buoyancy crossover sits at tNorm ≈ 0.67
+    // instead of the linear-curve crossover at 0.25, which means drops
+    // spend a lot longer heating up before lifting off and the lift
+    // itself is a sharper "release".
+    this.buoyancyExp = 4.0;
+
+    // Cooling-by-mass reference: a blob of this many particles cools at
+    // the slider's nominal rate; bigger blobs cool ∝ 1/√N (surface-to-
+    // volume falls), smaller ones cool faster.
+    this.coolMassRef = 8;
+
+    // Heat
+    this.tAmbient = 0.18;
+    this.heatScale = 0.65;
+    // Calibrated to the recipe block above: ~0.006 norm/s per particle
+    // when in the bulb zone at typical occupancy. The slider's "1.0"
+    // position equals this physically-grounded base rate.
+    this.heatRate = 0.05;          // norm/s at the very center of the bulb
+    // Heat diffusion is split by mass:
+    //   intra-mass: particles within the same blob share heat freely so
+    //     each mass tends toward a single uniform temperature.
+    //   inter-mass: a tiny fraction — a hot bubble in contact with the
+    //     cold pool barely loses heat, so it survives the trip up.
+    this.heatDiff = 0.05;           // intra-mass base (slider 1.0 = this rate)
+    this.heatDiffScale = 2.5;       // user multiplier
+    this.interDiffRatio = 0.03;     // inter-mass diffusion as fraction of intra
+    // Ambient-cooling base — slider's 1.0 position equals this rate.
+    this.ambientCool = 0.01;
+    this.ambientCoolScale = 1.0;
+    // Heat-source flicker — slow, organic spatiotemporal fluctuations.
+    this.heatNoise = 1.0;          // 0 = steady, 1 = wild swings
+    this.simTime = 0;              // accumulator (drives the noise phase)
+    // Heat plate above the bulb. Vertical reach decays over `bulbHeight`
+    // pixels above the fluid bottom; horizontally the center is hottest
+    // (factor 1.0) and the edge is `edgeFactor` (still warm, never zero).
+    this.bulbHeight = 65;          // px — only the bottom 2.5*h is heated
+    this.edgeFactor = 0.45;        // heat scaling at the bottle wall vs. center
+
+
+    // Spatial hash grid
+    this.cellSize = this.h;
+    this.gridW = Math.ceil(SIM_W / this.cellSize) + 4;
+    this.gridH = Math.ceil(SIM_H / this.cellSize) + 4;
+    this.gridCount = this.gridW * this.gridH;
+    this.cellHead = new Int32Array(this.gridCount);
+    this.cellNext = new Int32Array(0); // resized in reset
+
+    // Particle SoA (struct-of-arrays for speed). We allocate room for
+    // both the fluid count AND the fixed-wall budget.
+    this.allocate(this.numParticles + this.MAX_FIXED);
+    this.reset();
+  }
+
+  allocate(n) {
+    this.n = 0;
+    this.cap = n;
+    this.x  = new Float32Array(n);
+    this.y  = new Float32Array(n);
+    this.vx = new Float32Array(n);
+    this.vy = new Float32Array(n);
+    this.fx = new Float32Array(n);
+    this.fy = new Float32Array(n);
+    this.density  = new Float32Array(n);
+    this.pressure = new Float32Array(n);
+    this.temp = new Float32Array(n);
+    this.dT   = new Float32Array(n);
+    // Per-particle dwell time in the pool zone (seconds since entering;
+    // resets to 0 when the particle leaves the zone). Drives the
+    // barrier-attenuation effect — the longer a blob lingers above
+    // the pool, the easier it is to merge with it.
+    this.zoneDwell = new Float32Array(n);
+    this.cellNext = new Int32Array(n);
+    this.groupId = new Int32Array(n);
+    // Last frame's groupId (used by _updateBlobZ to detect blob
+    // formation / breakage events: when a current group's members
+    // come mostly from a single previous group it's a continuation;
+    // a smaller fragment of the same previous group is a "broken-off"
+    // new blob and gets a fresh z).
+    this.prevGroupId = new Int32Array(n);
+    this.uf = new Int32Array(n);
+    // Per-blob centroid storage (resized to MAX_BLOBS)
+    const K = this.MAX_BLOBS || 8;
+    this.cmx = new Float32Array(K);
+    this.cmy = new Float32Array(K);
+    this.cmn = new Int32Array(K);
+    // Per-blob roundness running totals (used to make roundness a
+    // net-zero shape-only force per blob — see the force loop).
+    this.sumRoundX = new Float32Array(K);
+    this.sumRoundY = new Float32Array(K);
+    // Per-blob inter-blob force totals. Inter-blob interactions are
+    // accumulated as blob→blob and then redistributed equally across
+    // the blob's particles, so each mass behaves as one body when it
+    // contacts a neighboring mass (graph-of-blobs interaction model).
+    this.sumFrx = new Float32Array(K);
+    this.sumFry = new Float32Array(K);
+    // Per-blob pseudo-3D depth. Set when a blob is formed (new
+    // component or smaller fragment of a split) and inherited from
+    // the previous frame's blob when the same blob continues.
+    this.blobZ = new Float32Array(K);
+  }
+
+  // ---- Union-find helpers (path compression + union-by-rank-lite) ----
+  _ufFind(i) {
+    let r = i;
+    while (this.uf[r] !== r) r = this.uf[r];
+    // Path compression
+    while (this.uf[i] !== r) { const next = this.uf[i]; this.uf[i] = r; i = next; }
+    return r;
+  }
+  _ufUnion(a, b) {
+    const ra = this._ufFind(a), rb = this._ufFind(b);
+    if (ra !== rb) this.uf[ra] = rb;
+  }
+
+  // Recompute group IDs each step from current particle positions.
+  // Two particles within `connectDist` are unioned; the resulting
+  // connected components are relabeled by descending size. Pinned
+  // particles (the bottom pool) participate in connectivity exactly
+  // like fluid — they can join the same component as nearby fluid so
+  // sinking blobs visually merge with the pool, and the pool itself
+  // forms one large group.
+  recomputeGroups() {
+    const n = this.n;
+    if (n === 0) return;
+    for (let i = 0; i < n; i++) this.uf[i] = i;
+    const cd2 = this.connectDist * this.connectDist;
+    const nFixed = this.nFixed;
+    for (let i = 0; i < n; i++) {
+      const xi = this.x[i], yi = this.y[i];
+      const gi = this.groupId[i];   // previous-frame group for blob-z lookup
+      const zi = this.blobZ[gi];
+      const sizeI = Math.max(1, this.cmn[gi]);
+      const isWallI = i < nFixed;
+      this.forNeighbors(i, (j) => {
+        if (j <= i) return;
+        const dx = xi - this.x[j];
+        const dy = yi - this.y[j];
+        if (dx*dx + dy*dy >= cd2) return;
+        const isWallJ = j < nFixed;
+        // Walls are universal absorbers — they merge regardless of z.
+        if (isWallI || isWallJ) {
+          this._ufUnion(i, j);
+          return;
+        }
+        // Fluid-fluid merge gate. Inverse to the squeeze-interaction
+        // reach: small drops merge readily (they're the easy absorber
+        // for small detached droplets / singletons), but bigger blobs
+        // require near-identical z to fuse — they should bounce off
+        // each other on contact rather than coalescing the moment
+        // their z values get close. The squeeze + bounce dynamics
+        // (cross-group density, inter-blob barrier) handle the
+        // interaction; merging is reserved for cases where the z
+        // layers really line up.
+        const gj = this.groupId[j];
+        const zj = this.blobZ[gj];
+        const sizeJ = Math.max(1, this.cmn[gj]);
+        const sizeMin = Math.min(sizeI, sizeJ);
+        const zMerge = Math.max(0.02, 0.15 / sizeMin);
+        if (Math.abs(zi - zj) < zMerge) {
+          this._ufUnion(i, j);
+        }
+      });
+    }
+    // Count component sizes by root
+    const rootSize = new Map();
+    for (let i = 0; i < n; i++) {
+      const r = this._ufFind(i);
+      rootSize.set(r, (rootSize.get(r) || 0) + 1);
+    }
+    // Rank roots by size (descending) → assign IDs 1..K-1
+    const roots = Array.from(rootSize.entries()).sort((a, b) => b[1] - a[1]);
+    const idOf = new Map();
+    const cap = this.MAX_BLOBS;
+    for (let k = 0; k < roots.length; k++) {
+      idOf.set(roots[k][0], Math.min(k + 1, cap - 1));
+    }
+    for (let i = 0; i < n; i++) {
+      this.groupId[i] = idOf.get(this._ufFind(i));
+    }
+  }
+
+  // Per-blob z is set when a blob is FORMED — either as a brand-new
+  // component, a merger, or a fragment broken off another blob.
+  // Continuation rule: for each previous group, the largest current
+  // group whose majority of members came from it inherits its z;
+  // smaller fragments and unrelated new blobs get a fresh random z.
+  // Walls' group is forced to z = 0.5 so the bottom pool sits at
+  // mid-depth and absorbs blobs from any z-layer.
+  _updateBlobZ() {
+    const n = this.n;
+    const K = this.MAX_BLOBS;
+
+    // Tally: for each current group, count members by their previous group.
+    const groupSize = new Int32Array(K);
+    const prevForCurr = new Array(K).fill(null);
+    for (let i = 0; i < n; i++) {
+      const cur = this.groupId[i];
+      const prev = this.prevGroupId[i];
+      groupSize[cur]++;
+      let m = prevForCurr[cur];
+      if (!m) { m = new Map(); prevForCurr[cur] = m; }
+      m.set(prev, (m.get(prev) || 0) + 1);
+    }
+
+    // For each current group, find majority previous group (skipping
+    // prev = 0, which means "no previous group" — happens at reset).
+    const majPrev = new Int32Array(K);
+    for (let c = 0; c < K; c++) {
+      const m = prevForCurr[c];
+      if (!m) { majPrev[c] = -1; continue; }
+      let bestP = -1, bestCnt = 0;
+      for (const [p, cnt] of m) {
+        if (p > 0 && cnt > bestCnt) { bestCnt = cnt; bestP = p; }
+      }
+      majPrev[c] = bestP;
+    }
+
+    // Group current groups by their majority previous, sort each
+    // bucket by current size. Largest in each bucket inherits z;
+    // others (smaller fragments of the same prev group) get fresh z.
+    const claimedBy = new Map();
+    for (let c = 1; c < K; c++) {
+      if (groupSize[c] === 0) continue;
+      const p = majPrev[c];
+      if (p < 0) continue;
+      let arr = claimedBy.get(p);
+      if (!arr) { arr = []; claimedBy.set(p, arr); }
+      arr.push(c);
+    }
+
+    const newBlobZ = new Float32Array(K);
+    const handled = new Uint8Array(K);
+    for (const [p, arr] of claimedBy) {
+      arr.sort((a, b) => groupSize[b] - groupSize[a]);
+      newBlobZ[arr[0]] = this.blobZ[p];
+      handled[arr[0]] = 1;
+      for (let k = 1; k < arr.length; k++) {
+        newBlobZ[arr[k]] = Math.random();
+        handled[arr[k]] = 1;
+      }
+    }
+    // Brand-new blobs (no prev majority): fresh z.
+    for (let c = 1; c < K; c++) {
+      if (groupSize[c] > 0 && !handled[c]) {
+        newBlobZ[c] = Math.random();
+      }
+    }
+
+    for (let k = 0; k < K; k++) this.blobZ[k] = newBlobZ[k];
+
+    // Walls always sit at mid-depth so the pool spans all incoming z.
+    for (let i = 0; i < this.nFixed; i++) {
+      this.blobZ[this.groupId[i]] = 0.5;
+    }
+  }
+
+  // Compute each blob's centroid. Pinned pool particles are included —
+  // they're full members of their group.
+  computeCentroids() {
+    const K = this.MAX_BLOBS;
+    for (let k = 0; k < K; k++) { this.cmx[k] = 0; this.cmy[k] = 0; this.cmn[k] = 0; }
+    for (let i = 0; i < this.n; i++) {
+      const g = this.groupId[i];
+      this.cmx[g] += this.x[i];
+      this.cmy[g] += this.y[i];
+      this.cmn[g]++;
+    }
+    for (let k = 0; k < K; k++) {
+      if (this.cmn[k] > 0) {
+        this.cmx[k] /= this.cmn[k];
+        this.cmy[k] /= this.cmn[k];
+      }
+    }
+  }
+
+  setNumParticles(n) {
+    const total = n + this.MAX_FIXED;
+    if (total !== this.cap) this.allocate(total);
+    this.numParticles = n;
+    this.reset();
+  }
+
+  reset() {
+    this.n = 0;
+    // ---- 1) Permanent pool: pinned wall particles in 2 staggered rows
+    //         at the bottle floor. Group id 0, ambient temperature,
+    //         zero velocity, never integrated.
+    const wallSpacingX = this.h * 0.55;
+    const wallSpacingY = this.h * 0.48;
+    const wallBaseY = SIM_H * 0.918;
+    const numRows = 2;
+    const perRow = Math.floor(this.MAX_FIXED / numRows);
+    for (let row = 0; row < numRows; row++) {
+      const wy = wallBaseY - row * wallSpacingY;
+      const halfW = bottleHalfWidth(wy) - 6;
+      if (halfW < 8) continue;
+      // Hex offset: alternate rows shifted by half-spacing so particles
+      // in the upper row sit between the lower row's particles.
+      const offsetX = (row % 2 === 1) ? wallSpacingX * 0.5 : 0;
+      const fitsInRow = Math.floor((2 * halfW) / wallSpacingX);
+      const numCol = Math.min(perRow, fitsInRow);
+      if (numCol < 2) continue;
+      const totalSpan = (numCol - 1) * wallSpacingX;
+      const startX = SIM_W * 0.5 - totalSpan * 0.5;
+      for (let i = 0; i < numCol; i++) {
+        if (this.n >= this.MAX_FIXED) break;
+        const wx = startX + i * wallSpacingX + offsetX;
+        if (Math.abs(wx - SIM_W * 0.5) > halfW) continue;
+        this.x[this.n] = wx;
+        this.y[this.n] = wy;
+        this.vx[this.n] = 0;
+        this.vy[this.n] = 0;
+        this.temp[this.n] = this.tAmbient;
+        this.groupId[this.n] = 0;
+        this.n++;
+      }
+    }
+    this.nFixed = this.n;
+
+    // ---- 2) Place fluid particles roughly hexagonal in lower body ----
+    const targetSpacing = this.h * 0.55;
+    let placed = 0;
+    let attempts = 0;
+    const maxAttempts = this.numParticles * 200;
+    while (placed < this.numParticles && attempts < maxAttempts) {
+      attempts++;
+      const t = 0.5 + Math.random() * 0.40;
+      const y = t * SIM_H;
+      const halfW = bottleHalfWidth(y);
+      if (halfW < 8) continue;
+      const cx = SIM_W * 0.5;
+      const x = cx + (Math.random() * 2 - 1) * (halfW - 6);
+      let ok = true;
+      // Don't overlap previously-placed particles (walls + fluid)
+      for (let i = 0; i < this.n; i++) {
+        const dx = this.x[i] - x;
+        const dy = this.y[i] - y;
+        if (dx*dx + dy*dy < (targetSpacing*0.7)*(targetSpacing*0.7)) {
+          ok = false; break;
+        }
+      }
+      if (!ok) continue;
+      this.x[this.n] = x;
+      this.y[this.n] = y;
+      this.vx[this.n] = (Math.random()-0.5) * 4;
+      this.vy[this.n] = (Math.random()-0.5) * 4;
+      this.temp[this.n] = this.tAmbient + (Math.random()-0.5) * 0.05;
+      this.n++;
+      placed++;
+    }
+    // Initial dynamic grouping (will be recomputed every step)
+    this.rebuildGrid();
+    // Zero prevGroupId so the very first recomputeGroups + _updateBlobZ
+    // treat every component as freshly-formed (random z).
+    this.prevGroupId.fill(0);
+    this.blobZ.fill(0);
+    this.recomputeGroups();
+    this._updateBlobZ();
+    // Estimate rest density from current arrangement (per-blob)
+    this.computeDensities();
+    const sorted = Array.from(this.density.slice(0, this.n)).sort((a,b)=>a-b);
+    const median = sorted[Math.floor(sorted.length / 2)] || 1;
+    this.restDensity = median * 0.92;
+  }
+
+  cellIndex(x, y) {
+    let cx = (x / this.cellSize) | 0;
+    let cy = (y / this.cellSize) | 0;
+    cx = Math.max(0, Math.min(this.gridW - 1, cx + 2));
+    cy = Math.max(0, Math.min(this.gridH - 1, cy + 2));
+    return cy * this.gridW + cx;
+  }
+
+  rebuildGrid() {
+    this.cellHead.fill(-1);
+    for (let i = 0; i < this.n; i++) {
+      const idx = this.cellIndex(this.x[i], this.y[i]);
+      this.cellNext[i] = this.cellHead[idx];
+      this.cellHead[idx] = i;
+    }
+  }
+
+  // Run a callback fn(j) for all particle indices in the 3x3 neighborhood
+  forNeighbors(i, fn) {
+    const cx = Math.max(0, Math.min(this.gridW - 1, ((this.x[i] / this.cellSize) | 0) + 2));
+    const cy = Math.max(0, Math.min(this.gridH - 1, ((this.y[i] / this.cellSize) | 0) + 2));
+    for (let dy = -1; dy <= 1; dy++) {
+      const ny = cy + dy;
+      if (ny < 0 || ny >= this.gridH) continue;
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = cx + dx;
+        if (nx < 0 || nx >= this.gridW) continue;
+        let j = this.cellHead[ny * this.gridW + nx];
+        while (j !== -1) {
+          fn(j);
+          j = this.cellNext[j];
+        }
+      }
+    }
+  }
+
+  computeDensities() {
+    const h = this.h, h2 = h * h;
+    const POLY6 = 4 / (Math.PI * Math.pow(h, 8));
+    const m = this.mass;
+    const nFixed = this.nFixed;
+    for (let i = 0; i < this.n; i++) {
+      let rho = 0;
+      const xi = this.x[i], yi = this.y[i];
+      const gi = this.groupId[i];
+      const isFluidI = i >= nFixed;
+      this.forNeighbors(i, (j) => {
+        const dx = xi - this.x[j];
+        const dy = yi - this.y[j];
+        const r2 = dx*dx + dy*dy;
+        if (r2 >= h2) return;
+        const w = h2 - r2;
+        const term = m * POLY6 * w * w * w;
+        const gj = this.groupId[j];
+        if (gj === gi) {
+          rho += term;
+          return;
+        }
+        // Cross-group: fluid pairs in overlapping z layers contribute
+        // partially to each other's density. The resulting pressure
+        // boost is what makes the two blobs visibly squeeze when they
+        // overlap — same-group neighbors near the contact get pushed
+        // outward by the elevated pressure. Coefficient kept modest
+        // (0.3) so the squeeze is visible without the pressure
+        // gradient becoming steep enough to tear single particles
+        // off the blob's edge.
+        if (!isFluidI || j < nFixed) return;
+        const zi = this.blobZ[gi];
+        const zj = this.blobZ[gj];
+        const absZ = Math.abs(zi - zj);
+        const sizeI = Math.max(1, this.cmn[gi]);
+        const sizeJ = Math.max(1, this.cmn[gj]);
+        const zReach = Math.min(0.55, (Math.sqrt(sizeI) + Math.sqrt(sizeJ)) * 0.07);
+        if (absZ < zReach) {
+          const fade = 1 - absZ / zReach;
+          rho += 0.3 * fade * term;
+        }
+      });
+      this.density[i] = rho;
+    }
+  }
+
+  step(dt) {
+    if (this.n === 0) return;
+    this.rebuildGrid();
+    // Save previous-frame group ids so _updateBlobZ can detect blob
+    // formation/breakage events.
+    this.prevGroupId.set(this.groupId);
+    // Dynamic group assignment: connected components on the particle graph
+    this.recomputeGroups();
+    // Propagate blob z (continuation / fresh on formation / fresh on split)
+    this._updateBlobZ();
+
+    const h = this.h, h2 = h * h;
+    const POLY6      =  4 / (Math.PI * Math.pow(h, 8));
+    const SPIKY_GRAD = -30 / (Math.PI * Math.pow(h, 5));
+    const VISC_LAP   =  40 / (Math.PI * Math.pow(h, 4));   // 2D Müller viscosity Laplacian
+    const m = this.mass;
+
+    // 1) Density & pressure. Same-group neighbors contribute fully;
+    //    cross-group fluid pairs in overlapping z-layers contribute
+    //    partially, raising the local density (and therefore pressure)
+    //    at the overlap so each blob visibly squeezes outward through
+    //    the SPH pressure response.
+    const nFixed = this.nFixed;
+    for (let i = 0; i < this.n; i++) {
+      let rho = 0;
+      const xi = this.x[i], yi = this.y[i];
+      const gi = this.groupId[i];
+      const isFluidI = i >= nFixed;
+      this.forNeighbors(i, (j) => {
+        const dx = xi - this.x[j];
+        const dy = yi - this.y[j];
+        const r2 = dx*dx + dy*dy;
+        if (r2 >= h2) return;
+        const w = h2 - r2;
+        const term = m * POLY6 * w * w * w;
+        const gj = this.groupId[j];
+        if (gj === gi) {
+          rho += term;
+          return;
+        }
+        if (!isFluidI || j < nFixed) return;
+        const zi = this.blobZ[gi];
+        const zj = this.blobZ[gj];
+        const absZ = Math.abs(zi - zj);
+        const sizeI = Math.max(1, this.cmn[gi]);
+        const sizeJ = Math.max(1, this.cmn[gj]);
+        const zReach = Math.min(0.55, (Math.sqrt(sizeI) + Math.sqrt(sizeJ)) * 0.07);
+        if (absZ < zReach) {
+          const fade = 1 - absZ / zReach;
+          rho += 0.3 * fade * term;
+        }
+      });
+      if (rho < this.restDensity) rho = this.restDensity;
+      this.density[i] = rho;
+      this.pressure[i] = this.gasK * (rho - this.restDensity);
+    }
+
+    // Compute centroids per blob (needed for the edge-only roundness force)
+    this.computeCentroids();
+    // Reset per-blob accumulators filled in during the force loop
+    this.sumRoundX.fill(0);
+    this.sumRoundY.fill(0);
+    this.sumFrx.fill(0);
+    this.sumFry.fill(0);
+
+    // 2) Forces + heat exchange
+    const visc = this.viscosity * this.viscScale;
+    // Activation-barrier model parameters. A single radial repulsion
+    // shaped so it peaks right at the merge threshold (connectDist) and
+    // decays smoothly to zero at the outer reach. Integral of F·dr from
+    // threshold to outer is the activation work — two blobs must bring
+    // enough relative kinetic energy to cross it. Below the threshold,
+    // union-find collapses them into one group and cohesion takes over.
+    const repelPeak = this.interRepel * this.surfaceTension * this.cushionStrength;
+    const repelOuter = this.cushionRange;
+    const repelOuter2 = repelOuter * repelOuter;
+    const mergeThreshold = this.connectDist;
+    const barrierWidth = repelOuter - mergeThreshold;
+    const stScale  = this.surfaceTensionScale;
+    const cohScale = this.cohesion * stScale;
+    const tempRepel = this.tempRepelMult;
+    const roundness = this.roundness * stScale;
+    const interiorN = this.interiorN;
+    // Cached pool-zone dwell parameters (used in the inner force loop).
+    const poolDwellTau = this.poolDwellTau;
+    const poolBarrierFloor = this.poolBarrierFloor;
+    // Cached exponential-buoyancy constants (evaluated once per step).
+    const buoK = this.buoyancyExp;
+    const buoDenom = Math.exp(buoK) - 1;
+    const buoTotal = this.coolDensityExcess + this.hotDensityDeficit;
+    // Fraction of inter-blob force applied locally to the contact
+    // particle (the rest is redistributed across the blob's particles).
+    // Kept small (5%) because the cross-group density contribution
+    // below is now the primary deformation driver — leaving more of
+    // the inter-blob force as local risks tearing single particles
+    // off the blob's edge under sustained overlap.
+    const localFraction = 0.05;
+    // Loop over ALL particles (pinned + fluid). Pinned ones still
+    // accumulate forces and dT — those forces never get integrated
+    // (the velocity update skips them) but heat exchange and density
+    // contributions matter, and treating them uniformly here lets
+    // them participate in the same blob as adjacent fluid.
+    for (let i = 0; i < this.n; i++) {
+      let fpx = 0, fpy = 0;       // pressure
+      let fvx = 0, fvy = 0;       // viscosity
+      let fcx = 0, fcy = 0;       // cohesion (within blob)
+      let frx = 0, fry = 0;       // inter-blob repulsion (per-particle, NOT redistributed)
+      let dT = 0; let neighCount = 0;
+      let sameGroupCount = 0;     // # same-blob neighbors (for boundary detection)
+      const xi = this.x[i], yi = this.y[i];
+      const vxi = this.vx[i], vyi = this.vy[i];
+      const Pi = this.pressure[i];
+      const rhoi = this.density[i];
+      const Ti = this.temp[i];
+      const gi = this.groupId[i];
+
+      const interRatio = this.interDiffRatio;
+      this.forNeighbors(i, (j) => {
+        if (j === i) return;
+        const dx = xi - this.x[j];
+        const dy = yi - this.y[j];
+        const r2 = dx*dx + dy*dy;
+        // Outer cutoff: beyond the repulsion's outer reach, no inter-blob
+        // interaction at all.
+        if (r2 >= repelOuter2 || r2 < 1e-6) return;
+        const r = Math.sqrt(r2);
+        const sameGroupJ = (this.groupId[j] === gi);
+
+        // ---- Inter-blob repulsion (activation barrier) ----
+        // Single radial force F(r) = peak · u² where u ramps from 0 at
+        // the outer reach to 1 at the merge threshold. Force is purely
+        // repulsive, accumulated to the BLOB so each mass translates as
+        // one body on contact. Two approaching blobs must do work
+        // ∫F·dr against this force to cross the threshold; if their
+        // relative KE is too small, they bounce. Once across, the
+        // union-find merges them and surface-tension forces (cohesion
+        // + pressure) take over.
+        if (!sameGroupJ) {
+          const tDelta = Math.abs(Ti - this.temp[j]);
+          const tBoost = 1.0 + tempRepel * tDelta;
+          const u = (repelOuter - r) / barrierWidth;   // 0 at outer, 1 at threshold
+          // Pool-zone barrier attenuation: the longer either particle
+          // has been lingering above the pool, the weaker the barrier
+          // between them. Pair-averaged dwell time gives a symmetric
+          // factor (Newton's 3rd law preserved).
+          const dwell = (this.zoneDwell[i] + this.zoneDwell[j]) * 0.5;
+          const dwellFactor = poolBarrierFloor + (1.0 - poolBarrierFloor) * Math.exp(-dwell / poolDwellTau);
+          // Pseudo-3D z modulation. Each blob has one z; deformation
+          // amount scales with blob size (large blobs span more z) and
+          // z-closeness, and is asymmetric: the front blob (higher z)
+          // feels less force (passes over), the back blob feels more
+          // (gets stretched). If the z separation is larger than the
+          // combined z-extent, the two blobs ignore each other entirely.
+          let zFactor = 1.0;
+          if (i >= nFixed && j >= nFixed) {
+            const zi = this.blobZ[gi];
+            const zj = this.blobZ[this.groupId[j]];
+            const zDiff = zi - zj;                      // positive: i is in front
+            const absZ = Math.abs(zDiff);
+            const sizeI = Math.max(1, this.cmn[gi]);
+            const sizeJ = Math.max(1, this.cmn[this.groupId[j]]);
+            const zReach = Math.min(0.55, (Math.sqrt(sizeI) + Math.sqrt(sizeJ)) * 0.07);
+            if (absZ >= zReach) {
+              zFactor = 0;
+            } else {
+              const fade = 1 - absZ / zReach;
+              // Asymmetric: i in front gets 1 − 0.5·zRel, i in back
+              // gets 1 + 0.5·zRel. Total per pair stays at 2·fade.
+              const zRel = zDiff / zReach;             // signed [-1, 1]
+              zFactor = fade * (1 - 0.5 * zRel);
+            }
+          }
+          const forceMag = repelPeak * tBoost * dwellFactor * zFactor * u * u; // vector magnitude
+          const force = forceMag / r;                                 // so force·(dx,dy) gives the vector
+          const fdx = force * dx, fdy = force * dy;
+          // Split between local (deformation) and per-blob distributed
+          // (rigid translation). Pure local would let contact particles
+          // get blasted clean out of the blob and disintegrate it; pure
+          // distributed gives a rigid bounce with no jiggle. A smallish
+          // local share gives the contact patch real compression while
+          // the rest of the blob comes along together.
+          frx += localFraction * fdx;
+          fry += localFraction * fdy;
+          this.sumFrx[gi] += (1 - localFraction) * fdx;
+          this.sumFry[gi] += (1 - localFraction) * fdy;
+        }
+
+        // ---- Standard SPH operations only at r < h ----
+        if (r2 < h2) {
+          let diffWeight;
+          if (sameGroupJ) {
+            sameGroupCount++;
+            const rhoj = this.density[j];
+            const pTerm = -m * (Pi + this.pressure[j]) / (2 * rhoj) * SPIKY_GRAD * (h - r) * (h - r) / r;
+            fpx += pTerm * dx;
+            fpy += pTerm * dy;
+            const vTerm = visc * m / rhoj * VISC_LAP * (h - r);
+            fvx += vTerm * (this.vx[j] - vxi);
+            fvy += vTerm * (this.vy[j] - vyi);
+            // Akinci cohesion (attractive in mid range)
+            const q = r / h;
+            let C;
+            if (q < 0.5) C = 2 * (1 - q) * (1 - q) * (1 - q) * q * q * q - 1.0/64.0;
+            else         C = (1 - q) * (1 - q) * (1 - q) * q * q * q;
+            const cTerm = -cohScale * m * 380 * C / r;
+            fcx += cTerm * dx;
+            fcy += cTerm * dy;
+            diffWeight = 1.0;
+          } else {
+            // Inter-blob force already applied above; nothing more here
+            diffWeight = interRatio;
+          }
+          // Heat diffusion (mass-aware weight)
+          const wT = (h - r) / h;
+          dT += (this.temp[j] - Ti) * wT * diffWeight;
+          neighCount++;
+        }
+      });
+
+      // Edge-only roundness pull — only particles on the boundary of a
+      // mass (few same-group neighbors) feel a pull toward the centroid.
+      // Interior particles feel zero, so a round blob is stable and a
+      // torn/stretched blob springs back into shape.
+      let roundX = 0, roundY = 0;
+      if (sameGroupCount < interiorN && this.cmn[gi] > 1) {
+        const dxc = xi - this.cmx[gi];
+        const dyc = yi - this.cmy[gi];
+        const rc2 = dxc*dxc + dyc*dyc;
+        if (rc2 > 0.25) {
+          const rc = Math.sqrt(rc2);
+          const boundaryF = (interiorN - sameGroupCount) / interiorN;
+          const pull = roundness * boundaryF / rc;
+          roundX = -pull * dxc;
+          roundY = -pull * dyc;
+        }
+      }
+
+      // Net effective gravity from temperature-dependent density ratio.
+      // Exponential rise factor — drops stay sinking through the lower
+      // half of their heating range, then flip and accelerate sharply.
+      const tNorm = Math.max(0, Math.min(1, (Ti - this.tAmbient) / (1.0 - this.tAmbient)));
+      const riseFactor = (Math.exp(buoK * tNorm) - 1) / buoDenom;
+      const densRatio = this.coolDensityExcess - buoTotal * riseFactor;
+      const effG = this.gravity * densRatio * this.gravityScale;
+
+      this.fx[i] = (fpx + fvx) / rhoi + fcx + roundX + frx;
+      this.fy[i] = (fpy + fvy) / rhoi + fcy + roundY + effG + fry;
+      // Track per-blob roundness sums so we can subtract the per-blob
+      // average afterwards — keeps roundness purely a SHAPE force,
+      // never affecting the blob's center-of-mass motion.
+      this.sumRoundX[gi] += roundX;
+      this.sumRoundY[gi] += roundY;
+      this.dT[i] = (neighCount > 0 ? dT / neighCount : 0) * (this.heatDiff * this.heatDiffScale);
+    }
+
+    // Per-blob redistribution. Roundness avg is subtracted so the
+    // shape force is COM-net-zero. The rigid-translation share of the
+    // inter-blob force (1 - localFraction) is also distributed evenly
+    // across the blob's particles — the local share already went
+    // straight to the contact particles up in the force loop.
+    {
+      const K = this.MAX_BLOBS;
+      const aX = new Float64Array(K);
+      const aY = new Float64Array(K);
+      const fX = new Float64Array(K);
+      const fY = new Float64Array(K);
+      for (let k = 0; k < K; k++) {
+        const cnt = this.cmn[k];
+        if (cnt > 0) {
+          aX[k] = this.sumRoundX[k] / cnt;
+          aY[k] = this.sumRoundY[k] / cnt;
+          fX[k] = this.sumFrx[k] / cnt;
+          fY[k] = this.sumFry[k] / cnt;
+        }
+      }
+      for (let i = nFixed; i < this.n; i++) {
+        const g = this.groupId[i];
+        this.fx[i] += fX[g] - aX[g];
+        this.fy[i] += fY[g] - aY[g];
+      }
+    }
+
+    // 3) Integrate (fluid only — walls are pinned)
+    const fluidBotY = SIM_H * 0.92;
+    const stickyTop = fluidBotY - this.stickyHeight;
+    const stickyDt = this.stickyStrength * dt;
+    const stickyPullDt = this.stickyPull * this.stickyStrength * dt;
+    for (let i = nFixed; i < this.n; i++) {
+      this.vx[i] += this.fx[i] * dt;
+      this.vy[i] += this.fy[i] * dt;
+      // Light velocity damping
+      this.vx[i] *= 0.997;
+      this.vy[i] *= 0.997;
+      // Sticky bottom layer — drag + a slight downward pull for
+      // particles near the bottle floor. Both ramp from 0 at stickyTop
+      // to full at the floor. The pull augments cool-wax buoyancy so
+      // the resting pool stays anchored even when blobs in it warm up
+      // toward neutral buoyancy; it's small enough that hot blobs in
+      // the bulb zone still rise out of it without trouble.
+      if (this.y[i] > stickyTop) {
+        const t = Math.min(1, (this.y[i] - stickyTop) / this.stickyHeight);
+        const drag = Math.max(0, 1 - stickyDt * t);
+        this.vx[i] *= drag;
+        this.vy[i] *= drag;
+        this.vy[i] += stickyPullDt * t;   // negative-pull (downward) toward the floor
+      }
+      // Clamp velocity (stability)
+      const vmax = 600;
+      const vlen2 = this.vx[i]*this.vx[i] + this.vy[i]*this.vy[i];
+      if (vlen2 > vmax*vmax) {
+        const s = vmax / Math.sqrt(vlen2);
+        this.vx[i] *= s; this.vy[i] *= s;
+      }
+      this.x[i] += this.vx[i] * dt;
+      this.y[i] += this.vy[i] * dt;
+    }
+
+    // 4) Heat sources & diffusion
+    // Warm plate above the bulb. Vertical falloff (squared) means
+    // particles right above the bulb heat up fastest; horizontal
+    // falloff is gentler — the center is hottest but particles all
+    // the way out at the bottle wall still warm up (at `edgeFactor`
+    // of the center rate).
+    const hr = this.heatRate * this.heatScale;
+    const bulbY = SIM_H * 0.93;
+    const bH = this.bulbHeight;
+    const cxFluid = SIM_W * 0.5;
+    const edgeF = this.edgeFactor;
+    // Advance simulation time and pre-compute slowly-evolving noise terms
+    this.simTime += dt;
+    const T = this.simTime;
+    const nAmt = this.heatNoise;
+    // The bulb noise is a sum of three slow spatial sine waves whose
+    // *phases* and *amplitudes* themselves drift on a much slower
+    // timescale. The result is an ever-shifting pattern of warm/cool
+    // patches across the plate that never quite repeats.
+    // Drift signals (very slow — full cycle in 30–90 seconds).
+    const d1 = T * 0.071, d2 = T * 0.103, d3 = T * 0.047;
+    // Phases wander: linear drift plus a slow sinusoidal wobble.
+    const ph1 = T * 0.22 + Math.sin(d1) * 2.4;
+    const ph2 = T * 0.18 + Math.sin(d2 + 1.7) * 2.8;
+    const ph3 = T * 0.31 + Math.sin(d3 + 0.5) * 3.2;
+    // Amplitudes breathe in and out (always >= 0).
+    const a1 = 0.30 + 0.30 * Math.sin(d1 * 1.3);
+    const a2 = 0.25 + 0.25 * Math.sin(d2 * 0.8 + 0.4);
+    const a3 = 0.20 + 0.20 * Math.sin(d3 * 1.5 + 1.2);
+    // Spatial frequencies — drift slowly. Tuned so each sine has a
+    // wavelength of roughly 80–200 px (a few "patches" across the
+    // bottle width), giving distinct local hot spots rather than one
+    // bottle-wide warm half.
+    const k1 = 0.045 + 0.012 * Math.sin(d2 * 0.7);
+    const k2 = 0.030 + 0.010 * Math.sin(d3 * 0.9 + 2.1);
+    const k3 = 0.060 + 0.018 * Math.sin(d1 * 0.5 + 0.8);
+    // Heat all particles, including the pinned bottom pool — the pool
+    // sits in the bulb zone and warms up just like any other wax in
+    // contact with the heat plate. It can't rise (integration skips it)
+    // but it does spread heat to fluid neighbors via diffusion.
+    for (let i = 0; i < this.n; i++) {
+      const distAbove = bulbY - this.y[i];        // >0 above the bulb
+      if (distAbove > -10 && distAbove < bH) {
+        const v = 1 - Math.max(0, distAbove) / bH; // 1 at plate, 0 at top
+        const halfW = Math.max(20, bottleHalfWidth(this.y[i]));
+        const xNorm = Math.min(1, Math.abs(this.x[i] - cxFluid) / halfW);
+        // Horizontal: center=1, wall=edgeF (smooth, monotonic)
+        const hFactor = 1 - (1 - edgeF) * xNorm * xNorm;
+        // Slow spatiotemporal noise — drifting phases & amplitudes give
+        // wandering hot patches on the plate. Clamped non-negative.
+        let noiseMul = 1.0;
+        if (nAmt > 0) {
+          const xi = this.x[i], yi = this.y[i];
+          const sn = (
+            a1 * Math.sin(xi * k1 + ph1) +
+            a2 * Math.sin(xi * k2 - yi * 0.012 + ph2) +
+            a3 * Math.sin(xi * k3 + yi * 0.018 + ph3)
+          );
+          noiseMul = Math.max(0, 1 + nAmt * sn);
+        }
+        this.temp[i] += hr * v * v * hFactor * noiseMul * dt;
+      }
+      // Ambient cooling — wax loses heat to the surrounding liquid as
+      // it rises. Scaled by 1/√(N/N_ref): big blobs have a smaller
+      // surface-to-volume ratio so they cool MUCH slower, while small
+      // detached drops cool quickly. (No separate top-cooling region;
+      // the bulb is the only thermal source/sink besides ambient.)
+      const blobN = Math.max(1, this.cmn[this.groupId[i]]);
+      const massFactor = Math.max(0.5, Math.sqrt(blobN / this.coolMassRef));
+      const ambEff = this.ambientCool * this.ambientCoolScale;
+      this.temp[i] -= (ambEff / massFactor) * (this.temp[i] - this.tAmbient) * dt;
+      // Apply neighbor diffusion (weak, so blobs keep their identity)
+      this.temp[i] += this.dT[i] * dt;
+      // Clamp
+      if (this.temp[i] < 0) this.temp[i] = 0;
+      if (this.temp[i] > 1.5) this.temp[i] = 1.5;
+
+      // Pool-zone dwell tracking: accumulates while in the zone
+      // (weighted by depth — deeper = faster accumulation), resets
+      // when the particle leaves. Drives the activation-barrier
+      // attenuation in the inter-blob force.
+      const yi_dwell = this.y[i];
+      if (yi_dwell > this.poolZoneTop) {
+        const z = Math.min(1, (yi_dwell - this.poolZoneTop) / (this.poolZoneFloor - this.poolZoneTop));
+        this.zoneDwell[i] += z * dt;
+      } else {
+        this.zoneDwell[i] = 0;
+      }
+    }
+
+    // 5) Boundary handling — bottle silhouette
+    // Bounce horizontally to keep particles inside the bottle and
+    // cap vertically at fluid top/bottom.
+    const fluidTop = SIM_H * 0.07;
+    const fluidBot = SIM_H * 0.92;
+    for (let i = nFixed; i < this.n; i++) {
+      const yi = this.y[i];
+      if (yi < fluidTop) {
+        this.y[i] = fluidTop;
+        this.vy[i] = Math.abs(this.vy[i]) * 0.3;
+      } else if (yi > fluidBot) {
+        this.y[i] = fluidBot;
+        this.vy[i] = -Math.abs(this.vy[i]) * 0.3;
+      }
+      const halfW = bottleHalfWidth(this.y[i]);
+      const cx = SIM_W * 0.5;
+      const limit = halfW - 4;
+      if (limit < 4) continue;
+      const off = this.x[i] - cx;
+      if (off > limit) {
+        this.x[i] = cx + limit;
+        this.vx[i] = -Math.abs(this.vx[i]) * 0.3;
+      } else if (off < -limit) {
+        this.x[i] = cx - limit;
+        this.vx[i] = Math.abs(this.vx[i]) * 0.3;
+      }
+    }
+  }
+}
+
+// ----------------- WebGL Renderer -----------------------------
+class MetaballRenderer {
+  constructor(canvas, maxParticles) {
+    this.canvas = canvas;
+    this.maxParticles = maxParticles;
+    const gl = canvas.getContext("webgl2", { alpha: false, antialias: true });
+    if (!gl) throw new Error("WebGL2 is required for this lava lamp.");
+    // Need float textures (core in WebGL2; need EXT to actually use as samplable, but RGBA32F sampling NEAREST is core)
+    if (!gl.getExtension("EXT_color_buffer_float") && !gl.getExtension("OES_texture_float_linear")) {
+      // Sampling RGBA32F with NEAREST works in core WebGL2; this is a soft check.
+    }
+    this.gl = gl;
+
+    const VS = `#version 300 es
+      in vec2 a_pos;
+      void main(){ gl_Position = vec4(a_pos, 0.0, 1.0); }`;
+    const FS = this.fragmentSource();
+
+    const compile = (type, src) => {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
+      gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        throw new Error("shader: " + gl.getShaderInfoLog(sh));
+      }
+      return sh;
+    };
+    const vs = compile(gl.VERTEX_SHADER, VS);
+    const fs = compile(gl.FRAGMENT_SHADER, FS);
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      throw new Error("link: " + gl.getProgramInfoLog(prog));
+    }
+    this.program = prog;
+
+    // Fullscreen quad
+    this.vao = gl.createVertexArray();
+    gl.bindVertexArray(this.vao);
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -1,-1,  1,-1, -1, 1,
+      -1, 1,  1,-1,  1, 1,
+    ]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(prog, "a_pos");
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    // Particle texture (each texel: x, y, temperature, _)
+    this.tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, maxParticles, 1, 0, gl.RGBA, gl.FLOAT, null);
+
+    this.pixData = new Float32Array(maxParticles * 4);
+
+    // Uniforms
+    this.uloc = (n) => gl.getUniformLocation(prog, n);
+    this.u = {
+      particles:   this.uloc("uParticles"),
+      count:       this.uloc("uCount"),
+      sim:         this.uloc("uSim"),
+      res:         this.uloc("uRes"),
+      h:           this.uloc("uH"),
+      bg:          this.uloc("uBg"),
+      cold:        this.uloc("uCold"),
+      hot:         this.uloc("uHot"),
+      glow:        this.uloc("uGlow"),
+      time:        this.uloc("uTime"),
+      blobZ:       this.uloc("uBlobZ"),
+      poolGroupId: this.uloc("uPoolGroupId"),
+    };
+  }
+
+  fragmentSource() {
+    return `#version 300 es
+precision highp float;
+
+uniform sampler2D uParticles;
+uniform int   uCount;
+uniform vec2  uSim;     // simulation domain (px)
+uniform vec2  uRes;     // canvas size (px)
+uniform float uH;       // smoothing radius (sim px)
+uniform vec3  uBg;
+uniform vec3  uCold;
+uniform vec3  uHot;
+uniform float uGlow;
+uniform float uTime;
+uniform float uBlobZ[32];   // pseudo-3D depth per blob; size must equal MAX_G
+uniform int   uPoolGroupId; // group id of the pinned pool, or -1 if none
+
+out vec4 fragColor;
+
+// Match JS bottleHalfFrac exactly
+float bottleHalfFrac(float t) {
+  if (t < 0.05) return 0.0;
+  if (t < 0.07) return 0.42 * ((t - 0.05) / 0.02);
+  if (t < 0.16) return mix(0.42, 0.50, (t - 0.07) / 0.09);
+  if (t < 0.50) {
+    float u = (t - 0.16) / 0.34;
+    float e = 1.0 - pow(1.0 - u, 2.0);
+    return mix(0.50, 0.96, e);
+  }
+  if (t < 0.90) {
+    float u = (t - 0.50) / 0.40;
+    float e = u * u;
+    return mix(0.96, 0.55, e);
+  }
+  if (t < 0.93) return mix(0.55, 0.40, (t - 0.90) / 0.03);
+  if (t < 0.95) return 0.40 * (1.0 - (t - 0.93) / 0.02);
+  return 0.0;
+}
+
+// Hash for film grain
+float hash(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+
+void main() {
+  // Pixel position in *simulation* space (so kernel radius matches sim)
+  vec2 pix = gl_FragCoord.xy;
+  vec2 simPos = vec2(pix.x, uRes.y - pix.y) * (uSim / uRes);
+
+  float t = simPos.y / uSim.y;
+  float halfFrac = bottleHalfFrac(t);
+  float halfW = halfFrac * uSim.x;
+  float cx = uSim.x * 0.5;
+  float distFromCenter = abs(simPos.x - cx);
+
+  // -------- Per-blob metaball field & temperature ---------
+  // Each blob accumulates its own field; the dominant blob at this
+  // pixel decides the color and whether to draw wax. Two blobs that
+  // are physically apart therefore stay visually distinct even when
+  // close to each other (no false merging in the render).
+  const int MAX_G = 32;   // must match SPH.MAX_BLOBS in JS
+  float fields[MAX_G];
+  float wtemps[MAX_G];
+  for (int g = 0; g < MAX_G; g++) { fields[g] = 0.0; wtemps[g] = 0.0; }
+  float h2 = uH * uH;
+
+  for (int i = 0; i < 700; i++) {
+    if (i >= uCount) break;
+    vec4 part = texelFetch(uParticles, ivec2(i, 0), 0);
+    vec2 d = simPos - part.xy;
+    float r2 = dot(d, d);
+    if (r2 < h2) {
+      float w = 1.0 - r2 / h2;
+      float k = w * w * w;
+      int g = int(part.w + 0.5);
+      g = clamp(g, 0, MAX_G - 1);
+      fields[g] += k;
+      wtemps[g] += k * part.z;
+    }
+  }
+  // Pick the dominant blob at this pixel. The default winner is
+  // whichever has the highest field, but if two or more blobs both
+  // have a "rendered" field (above the metaball threshold) the one
+  // with the higher z wins — that's what produces the front-blob-
+  // passes-over-back-blob look. Also track a secondary blob so we
+  // can detect overlaps and add a highlight.
+  const float SHOW_THRESH = 0.55;
+  int dom = 0;
+  float maxF = 0.0;
+  for (int g = 0; g < MAX_G; g++) {
+    if (fields[g] > maxF) { maxF = fields[g]; dom = g; }
+  }
+  // Override by z among blobs that are "visible" at this pixel.
+  int frontDom = -1;
+  float frontZ = -1.0;
+  int otherDom = -1;
+  float otherF = 0.0;
+  for (int g = 1; g < MAX_G; g++) {
+    if (fields[g] > SHOW_THRESH) {
+      if (uBlobZ[g] > frontZ) {
+        otherDom = frontDom; otherF = (frontDom >= 0) ? fields[frontDom] : 0.0;
+        frontDom = g; frontZ = uBlobZ[g];
+      } else if (fields[g] > otherF) {
+        otherDom = g; otherF = fields[g];
+      }
+    }
+  }
+  if (frontDom >= 0) dom = frontDom;
+  float field = fields[dom];
+  float temp = field > 0.001 ? (wtemps[dom] / field) : 0.18;
+
+  // -------- Bottle / fluid masks ---------
+  // Inside the glass = within silhouette and in fluid region
+  float glassEdgeSoft = 1.5; // sim px
+  float insideGlass = 1.0 - smoothstep(halfW - glassEdgeSoft, halfW + glassEdgeSoft, distFromCenter);
+  // No glass in cap regions (where halfFrac == 0)
+  insideGlass *= step(0.001, halfFrac);
+
+  // -------- Background inside glass (purple base + warm light from below) -------
+  // Gradient from background (top) to a warm tint at bottom.
+  float bottomT = clamp((t - 0.55) / 0.40, 0.0, 1.0);
+  // Bulb glow concentrated near the base of the fluid
+  float bulb = pow(clamp((t - 0.78) / 0.16, 0.0, 1.0), 1.7) * uGlow;
+  // The bulb falls off horizontally (from center)
+  float horiz = 1.0 - smoothstep(0.0, halfW * 0.95, distFromCenter);
+  bulb *= mix(0.35, 1.0, horiz);
+
+  vec3 warmTint = mix(uCold, uHot, 0.65) * 1.2;
+  vec3 fluidBg = mix(uBg, uBg * 1.4 + warmTint * 0.35, bottomT);
+  fluidBg = mix(fluidBg, warmTint, bulb * 0.55);
+  // Subtle vertical tint variation (looks like settled liquid)
+  fluidBg *= mix(0.85, 1.0, smoothstep(0.0, 1.0, t));
+
+  // Permanent opaque pool block. A solid wax-colored band sitting at
+  // the pool's particle band — covers the bulb-glow gradient with a
+  // hard, stable layer regardless of what the SPH walls happen to
+  // look like through the metaball renderer. Top edge fades sharply
+  // right at the topmost wall row (t = 0.90, y ≈ 630). Sits in the
+  // background, so any wax blob still renders normally on top.
+  float poolBlockMask = smoothstep(0.89, 0.90, t);
+  vec3 poolBlockColor = mix(uCold, uHot, 0.45) * mix(0.55, 1.15, pow(t, 1.4));
+  fluidBg = mix(fluidBg, poolBlockColor, poolBlockMask);
+
+  // -------- Wax shading from temperature ---------
+  // Compute wax color: cold -> hot color across temp range.
+  float tempN = clamp((temp - 0.18) / 0.85, 0.0, 1.0);
+  vec3 waxColor = mix(uCold, uHot, smoothstep(0.0, 1.0, tempN));
+  // Light from below: brighter near bottom, dimmer near top
+  float lightFromBelow = mix(0.55, 1.15, pow(t, 1.4));
+  waxColor *= lightFromBelow;
+  // Boost saturation a touch
+  waxColor = pow(waxColor, vec3(0.95));
+
+  // -------- Metaball edge ---------
+  float threshold = 0.55;
+  float alpha = smoothstep(threshold - 0.18, threshold + 0.04, field);
+  // Temperature-based core transparency: the EDGE of a hot blob stays
+  // fully opaque (so it still reads as a defined shape), but the
+  // CENTER goes translucent so you can see the bulb glow through it.
+  // centerness is 0 near the metaball boundary and 1 deep inside
+  // where multiple particles' fields overlap. As the blob cools the
+  // effect fades and the center returns to fully opaque.
+  float centerness = smoothstep(threshold + 0.20, threshold + 0.55, field);
+  alpha *= 1.0 - centerness * 0.45 * tempN;
+  // A subtle inner highlight: a smaller threshold for a brighter core
+  float coreAlpha = smoothstep(threshold + 0.05, threshold + 0.55, field);
+  vec3 inner = mix(waxColor, waxColor * 1.25 + uHot * 0.18 * tempN, coreAlpha);
+  // Overlap layering: at pixels where two blobs both cover this
+  // location, render the front blob's wax color over the back blob's
+  // wax color (rather than over the bottle background). This stops
+  // the front blob's soft alpha edge from "clipping" out to the bg
+  // and revealing nothing — instead the front sits properly on top
+  // of the back, the way real layered depth would read.
+  if (otherDom >= 0) {
+    float otherFieldRaw = fields[otherDom];
+    float otherTemp = otherFieldRaw > 0.001 ? (wtemps[otherDom] / otherFieldRaw) : 0.18;
+    float otherTempN = clamp((otherTemp - 0.18) / 0.85, 0.0, 1.0);
+    vec3 otherWax = mix(uCold, uHot, smoothstep(0.0, 1.0, otherTempN)) * lightFromBelow;
+    // The back blob's metaball alpha — same shape as the front's,
+    // applied to the back blob's field. Where the back is solid,
+    // its full color sits behind the front; where it's tapering
+    // off, it blends out to the bottle bg.
+    float otherAlpha = smoothstep(threshold - 0.18, threshold + 0.04, otherFieldRaw);
+    float otherCenterness = smoothstep(threshold + 0.20, threshold + 0.55, otherFieldRaw);
+    otherAlpha *= 1.0 - otherCenterness * 0.45 * otherTempN;
+    fluidBg = mix(fluidBg, otherWax, otherAlpha);
+  }
+
+  // Mix wax over fluid bg
+  vec3 inside = mix(fluidBg, inner, alpha);
+
+  // -------- Bottle frame (cap + base) ---------
+  // Frame regions: t < 0.05 (top cap), t > 0.95 (bottom base)
+  // Plus the area outside silhouette in the glass region.
+  float capTop  = smoothstep(0.05, 0.045, t);                // 1 above 0.045, 0 below 0.05
+  float capBot  = smoothstep(0.95, 0.955, t);                // 1 below 0.955, 0 above 0.95
+
+  // Top cap: dark metallic with subtle highlight
+  vec3 topCapCol = vec3(0.06, 0.05, 0.10);
+  // Add a thin neck collar shape
+  float neckBand = smoothstep(0.030, 0.035, t) * (1.0 - smoothstep(0.045, 0.050, t));
+  topCapCol += vec3(0.10, 0.08, 0.14) * neckBand;
+  // Slight highlight on left side of cap
+  float capLight = smoothstep(0.4, 0.0, distFromCenter / (uSim.x * 0.3));
+  topCapCol *= mix(1.0, 1.5, capLight * (1.0 - smoothstep(0.0, 0.05, t)));
+
+  // Bottom base: heated metallic, warm glow on top edge
+  vec3 botCapCol = mix(vec3(0.07, 0.04, 0.09), vec3(0.16, 0.10, 0.13), smoothstep(0.95, 1.00, t));
+  // Add bulb glow seeping up from the base
+  float baseGlow = smoothstep(0.99, 0.95, t) * uGlow;
+  botCapCol += uHot * baseGlow * 0.4;
+  botCapCol += uCold * baseGlow * 0.18;
+  // A bright slit at top of base
+  float slit = smoothstep(0.948, 0.955, t) * (1.0 - smoothstep(0.955, 0.962, t));
+  botCapCol += uHot * slit * uGlow * 1.4;
+
+  // Frame outside silhouette in the body region:
+  vec3 frameOut = vec3(0.0);
+
+  vec3 col;
+  if (t < 0.05) {
+    col = topCapCol;
+  } else if (t > 0.95) {
+    col = botCapCol;
+  } else {
+    col = mix(frameOut, inside, insideGlass);
+    // Glass rim highlight on the silhouette edge
+    float rimDist = halfW - distFromCenter;
+    float rim = smoothstep(0.0, 1.5, rimDist) * (1.0 - smoothstep(1.5, 4.0, rimDist));
+    col += vec3(0.22, 0.18, 0.30) * rim * 0.45;
+    // Specular streak on the left side
+    float streakX = clamp(1.0 - abs((simPos.x - (cx - halfW * 0.55)) / 6.0), 0.0, 1.0);
+    float streakY = smoothstep(0.10, 0.40, t) * (1.0 - smoothstep(0.40, 0.62, t));
+    col += vec3(0.85, 0.80, 1.0) * streakX * streakY * 0.10 * insideGlass;
+  }
+
+  // Soft outer glow from the bulb extending past the bottle
+  float outerGlow = smoothstep(0.96, 0.55, t) * uGlow * 0.18;
+  outerGlow *= smoothstep(uSim.x * 0.9, 0.0, distFromCenter);
+  col += uHot * outerGlow * (1.0 - insideGlass) * 0.25;
+
+  // Vignette
+  vec2 ndc = (pix / uRes) - 0.5;
+  float vig = 1.0 - smoothstep(0.45, 0.95, length(ndc) * 1.2);
+  col *= mix(0.7, 1.0, vig);
+
+  // Subtle film grain
+  float g = (hash(pix + uTime * 0.01) - 0.5) * 0.012;
+  col += g;
+
+  fragColor = vec4(col, 1.0);
+}
+`;
+  }
+
+  render(sim, params) {
+    const gl = this.gl;
+    const n = sim.n;
+    const data = this.pixData;
+    for (let i = 0; i < n; i++) {
+      data[i*4    ] = sim.x[i];
+      data[i*4 + 1] = sim.y[i];
+      data[i*4 + 2] = sim.temp[i];
+      data[i*4 + 3] = sim.groupId[i];   // group ID for per-blob rendering
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.tex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.maxParticles, 1, gl.RGBA, gl.FLOAT, data, 0);
+
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.useProgram(this.program);
+    gl.bindVertexArray(this.vao);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.tex);
+    gl.uniform1i(this.u.particles, 0);
+    gl.uniform1i(this.u.count, n);
+    gl.uniform2f(this.u.sim, SIM_W, SIM_H);
+    gl.uniform2f(this.u.res, this.canvas.width, this.canvas.height);
+    gl.uniform1f(this.u.h, sim.h * (sim.renderScale || 1.0));
+    gl.uniform3fv(this.u.bg, params.bg);
+    gl.uniform3fv(this.u.cold, params.cold);
+    gl.uniform3fv(this.u.hot, params.hot);
+    gl.uniform1f(this.u.glow, params.glow);
+    gl.uniform1f(this.u.time, params.time);
+    // Per-blob z values for the front/back picker and the overlap
+    // highlight. Pass the whole array (size = MAX_G).
+    if (this.u.blobZ) gl.uniform1fv(this.u.blobZ, sim.blobZ);
+    // Pool group id (so the shader knows which blob to render on top
+    // unconditionally). Walls always share a single group, so any
+    // wall's groupId works; pass -1 if no pool.
+    const poolGid = sim.nFixed > 0 ? sim.groupId[0] : -1;
+    if (this.u.poolGroupId) gl.uniform1i(this.u.poolGroupId, poolGid);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+}
+
+// ----------------- App glue ----------------------------------
+const canvas = document.getElementById("lava");
+// Scale internal resolution for crisp rendering on retina, capped to 2x
+const dpr = Math.min(window.devicePixelRatio || 1, 2);
+canvas.width  = Math.floor(380 * dpr);
+canvas.height = Math.floor(700 * dpr);
+
+const MAX_P = 700;   // fluid (slider max 600) + wall budget (~40)
+const sim = new SPH({ numParticles: 160 });
+const renderer = new MetaballRenderer(canvas, MAX_P);
+
+function hexToRgb(hex) {
+  hex = hex.replace("#", "");
+  if (hex.length === 3) hex = hex.split("").map(c => c + c).join("");
+  return new Float32Array([
+    parseInt(hex.slice(0, 2), 16) / 255,
+    parseInt(hex.slice(2, 4), 16) / 255,
+    parseInt(hex.slice(4, 6), 16) / 255,
+  ]);
+}
+
+const params = {
+  bg:   hexToRgb("#2a0d3e"),
+  cold: hexToRgb("#9a0f1a"),
+  hot:  hexToRgb("#ffcf3a"),
+  glow: 0.55,
+  time: 0,
+};
+
+// --- UI ---
+const $ = (id) => document.getElementById(id);
+
+$("bgColor").oninput   = (e) => params.bg   = hexToRgb(e.target.value);
+$("coldColor").oninput = (e) => params.cold = hexToRgb(e.target.value);
+$("hotColor").oninput  = (e) => params.hot  = hexToRgb(e.target.value);
+
+$("glow").oninput = (e) => {
+  params.glow = parseFloat(e.target.value);
+  $("glowVal").textContent = params.glow.toFixed(2);
+};
+$("speed").oninput = (e) => {
+  sim.timeScale = parseFloat(e.target.value);
+  $("speedVal").textContent = sim.timeScale.toFixed(2);
+};
+$("sg").oninput = (e) => {
+  sim.gravityScale = parseFloat(e.target.value);
+  $("sgVal").textContent = sim.gravityScale.toFixed(2);
+};
+$("heat").oninput = (e) => {
+  sim.heatScale = parseFloat(e.target.value);
+  $("heatVal").textContent = sim.heatScale.toFixed(2);
+};
+$("bulb").oninput = (e) => {
+  sim.bulbHeight = parseFloat(e.target.value);
+  $("bulbVal").textContent = sim.bulbHeight.toFixed(0);
+};
+$("edge").oninput = (e) => {
+  sim.edgeFactor = parseFloat(e.target.value);
+  $("edgeVal").textContent = sim.edgeFactor.toFixed(2);
+};
+$("diff").oninput = (e) => {
+  sim.heatDiffScale = parseFloat(e.target.value);
+  $("diffVal").textContent = sim.heatDiffScale.toFixed(2);
+};
+$("acool").oninput = (e) => {
+  sim.ambientCoolScale = parseFloat(e.target.value);
+  $("acoolVal").textContent = sim.ambientCoolScale.toFixed(2);
+};
+$("noise").oninput = (e) => {
+  sim.heatNoise = parseFloat(e.target.value);
+  $("noiseVal").textContent = sim.heatNoise.toFixed(2);
+};
+$("st").oninput = (e) => {
+  sim.surfaceTension = parseFloat(e.target.value);
+  $("stVal").textContent = sim.surfaceTension.toFixed(2);
+};
+$("tr").oninput = (e) => {
+  sim.tempRepelMult = parseFloat(e.target.value);
+  $("trVal").textContent = sim.tempRepelMult.toFixed(1);
+};
+$("sten").oninput = (e) => {
+  sim.surfaceTensionScale = parseFloat(e.target.value);
+  $("stenVal").textContent = sim.surfaceTensionScale.toFixed(2);
+};
+$("sticky").oninput = (e) => {
+  sim.stickyStrength = parseFloat(e.target.value);
+  $("stickyVal").textContent = sim.stickyStrength.toFixed(2);
+};
+$("size").oninput = (e) => {
+  sim.renderScale = parseFloat(e.target.value);
+  $("sizeVal").textContent = sim.renderScale.toFixed(2);
+};
+$("visc").oninput = (e) => {
+  sim.viscScale = parseFloat(e.target.value);
+  $("viscVal").textContent = sim.viscScale.toFixed(2);
+};
+$("count").oninput = (e) => {
+  const n = parseInt(e.target.value, 10);
+  $("countVal").textContent = n;
+  sim.setNumParticles(n);
+};
+$("reset").onclick = () => sim.reset();
+
+// --- Fullscreen + panel toggle ---
+const controlsEl = document.querySelector(".controls");
+$("togglePanel").onclick = () => controlsEl.classList.toggle("hidden");
+$("toggleFs").onclick = async () => {
+  const inFs = document.fullscreenElement || document.webkitFullscreenElement;
+  try {
+    if (!inFs) {
+      const el = document.documentElement;
+      await (el.requestFullscreen ? el.requestFullscreen() : el.webkitRequestFullscreen?.());
+    } else {
+      await (document.exitFullscreen ? document.exitFullscreen() : document.webkitExitFullscreen?.());
+    }
+  } catch (_) { /* user-cancelled or unsupported */ }
+};
+// Keyboard shortcuts: F = fullscreen, C = toggle controls (ignored while typing in inputs)
+window.addEventListener("keydown", (e) => {
+  if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
+  if (e.key === "f" || e.key === "F") $("toggleFs").click();
+  else if (e.key === "c" || e.key === "C") $("togglePanel").click();
+});
+
+// Presets
+const PRESETS = {
+  classic: { bg: "#2a0d3e", cold: "#9a0f1a", hot: "#ffcf3a" },
+  cosmic:  { bg: "#0d0a2e", cold: "#5e1ab8", hot: "#f068ff" },
+  ocean:   { bg: "#031421", cold: "#0a4f8a", hot: "#5be3ff" },
+  forest:  { bg: "#0d1f12", cold: "#1f5f2a", hot: "#c9ff5b" },
+};
+document.querySelectorAll(".preset").forEach((b) => {
+  b.onclick = () => {
+    const p = PRESETS[b.dataset.preset];
+    if (!p) return;
+    $("bgColor").value = p.bg;     params.bg   = hexToRgb(p.bg);
+    $("coldColor").value = p.cold; params.cold = hexToRgb(p.cold);
+    $("hotColor").value = p.hot;   params.hot  = hexToRgb(p.hot);
+  };
+});
+
+// --- Main loop ---
+let last = performance.now();
+let frames = 0;
+let fpsTime = last;
+function frame(now) {
+  const rawDt = (now - last) / 1000;
+  last = now;
+  // Clamp per-frame dt and split into substeps for SPH stability.
+  // Multiply by sim.timeScale so the entire simulation (motion, heat,
+  // noise drift) all runs slower together — keeps physics consistent
+  // while letting the lamp breathe at lava-lamp pace.
+  const dt = Math.min(0.033, rawDt) * sim.timeScale;
+  const substeps = 5;
+  const sub = dt / substeps;
+  for (let i = 0; i < substeps; i++) sim.step(sub);
+
+  params.time = now / 1000;
+  renderer.render(sim, params);
+
+  frames++;
+  if (now - fpsTime > 500) {
+    const fps = Math.round((frames * 1000) / (now - fpsTime));
+    $("fpsText").textContent = fps + " fps";
+    $("partText").textContent = sim.n + " particles";
+    frames = 0;
+    fpsTime = now;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
