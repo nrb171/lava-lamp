@@ -219,43 +219,43 @@
   </div>
 
   <div class="control">
-    <label>Buoyancy <span class="val" id="sgVal">1.60</span></label>
-    <input type="range" id="sg" min="0.2" max="8.0" step="0.05" value="1.60" />
+    <label>Buoyancy <span class="val" id="sgVal">0.80</span></label>
+    <input type="range" id="sg" min="0.2" max="8.0" step="0.05" value="0.80" />
   </div>
 
   <div class="control">
-    <label>Heat <span class="val" id="heatVal">0.65</span></label>
-    <input type="range" id="heat" min="0.05" max="4.0" step="0.01" value="0.65" />
+    <label>Heat <span class="val" id="heatVal">0.90</span></label>
+    <input type="range" id="heat" min="0.05" max="4.0" step="0.01" value="0.90" />
   </div>
 
   <div class="control">
-    <label>Heater height <span class="val" id="bulbVal">65</span></label>
-    <input type="range" id="bulb" min="20" max="260" step="1" value="65" />
+    <label>Heater height <span class="val" id="bulbVal">51</span></label>
+    <input type="range" id="bulb" min="20" max="260" step="1" value="51" />
   </div>
 
   <div class="control">
-    <label>Heater spread <span class="val" id="edgeVal">0.45</span></label>
-    <input type="range" id="edge" min="0" max="1.0" step="0.01" value="0.45" />
+    <label>Heater spread <span class="val" id="edgeVal">0.21</span></label>
+    <input type="range" id="edge" min="0" max="1.0" step="0.01" value="0.21" />
   </div>
 
   <div class="control">
-    <label>Heat mixing <span class="val" id="diffVal">2.50</span></label>
-    <input type="range" id="diff" min="0" max="6.0" step="0.05" value="2.50" />
+    <label>Heat mixing <span class="val" id="diffVal">3.20</span></label>
+    <input type="range" id="diff" min="0" max="6.0" step="0.05" value="3.20" />
   </div>
 
   <div class="control">
-    <label>Heat flicker <span class="val" id="noiseVal">1.00</span></label>
-    <input type="range" id="noise" min="0" max="2.0" step="0.01" value="1.00" />
+    <label>Heat flicker <span class="val" id="noiseVal">1.04</span></label>
+    <input type="range" id="noise" min="0" max="2.0" step="0.01" value="1.04" />
   </div>
 
   <div class="control">
-    <label>Cooling <span class="val" id="acoolVal">1.00</span></label>
-    <input type="range" id="acool" min="0" max="6.0" step="0.05" value="1.00" />
+    <label>Cooling <span class="val" id="acoolVal">1.95</span></label>
+    <input type="range" id="acool" min="0" max="6.0" step="0.05" value="1.95" />
   </div>
 
   <div class="control">
-    <label>Bounce <span class="val" id="stVal">0.90</span></label>
-    <input type="range" id="st" min="0" max="3.0" step="0.01" value="0.90" />
+    <label>Bounce <span class="val" id="stVal">0.57</span></label>
+    <input type="range" id="st" min="0" max="3.0" step="0.01" value="0.57" />
   </div>
 
   <div class="control">
@@ -264,13 +264,18 @@
   </div>
 
   <div class="control">
-    <label>Surface tension <span class="val" id="stenVal">0.80</span></label>
-    <input type="range" id="sten" min="0" max="4.0" step="0.05" value="0.80" />
+    <label>Surface tension <span class="val" id="stenVal">0.70</span></label>
+    <input type="range" id="sten" min="0" max="4.0" step="0.05" value="0.70" />
   </div>
 
   <div class="control">
-    <label>Floor pull <span class="val" id="stickyVal">0.65</span></label>
-    <input type="range" id="sticky" min="0" max="3.0" step="0.01" value="0.65" />
+    <label>Spring strength <span class="val" id="springVal">3.70</span></label>
+    <input type="range" id="spring" min="0" max="4.0" step="0.05" value="3.70" />
+  </div>
+
+  <div class="control">
+    <label>Floor pull <span class="val" id="stickyVal">0.15</span></label>
+    <input type="range" id="sticky" min="0" max="3.0" step="0.01" value="0.15" />
   </div>
 
   <div class="control">
@@ -279,8 +284,18 @@
   </div>
 
   <div class="control">
-    <label>Viscosity <span class="val" id="viscVal">1.50</span></label>
-    <input type="range" id="visc" min="0" max="6.0" step="0.05" value="1.50" />
+    <label>Mass <span class="val" id="massVal">2.40</span></label>
+    <input type="range" id="mass" min="0.5" max="10.0" step="0.1" value="2.40" />
+  </div>
+
+  <div class="control">
+    <label>Internal pressure <span class="val" id="pressureVal">1.95</span></label>
+    <input type="range" id="pressure" min="0" max="3.0" step="0.05" value="1.95" />
+  </div>
+
+  <div class="control">
+    <label>Viscosity <span class="val" id="viscVal">1.65</span></label>
+    <input type="range" id="visc" min="0" max="6.0" step="0.05" value="1.65" />
   </div>
 
   <div class="control">
@@ -317,22 +332,47 @@ const SIM_H = 700;
 // of the canvas. Returns half-width as a *fraction of SIM_W*.
 // Returns 0 in the cap regions (no fluid space).
 function bottleHalfFrac(t) {
-  if (t < 0.05) return 0;
-  if (t < 0.07) return 0.42 * ((t - 0.05) / 0.02); // open from neck top
-  if (t < 0.16) return 0.42 + (0.50 - 0.42) * ((t - 0.07) / 0.09);
-  if (t < 0.50) {
-    const u = (t - 0.16) / 0.34;
-    // Smooth widen with ease
-    const e = 1 - Math.pow(1 - u, 2);
-    return 0.50 + (0.96 - 0.50) * e;
+  // Profile fit to the user-supplied waypoints (radius, height) where
+  // the origin is at the bottom/center of the pool with y increasing
+  // upward and x increasing to the right. Peak bulge is *near the
+  // bottom* of the body and the bottle narrows to a slim neck at the
+  // top — the classic lava-lamp silhouette.
+  //
+  // User waypoints (radius, y from pool center):
+  //   (0.075, -0.017)  small foot just below pool floor
+  //   (0.698,  0.000)  pool floor
+  //   (0.938,  0.029)
+  //   (1.071,  0.099)
+  //   (1.107,  0.147)  peak bulge near the bottom
+  //   (0.547,  0.998)  narrow neck at top
+  //
+  // Re-mapped to t in [0,1] with t=0 at canvas top, t=1 at canvas
+  // bottom, and scaled so the peak halfFrac is 0.50 (so the bulge
+  // does not exceed the canvas width).
+  if (t < 0.03) return 0;                                              // closed silver cap region
+  if (t < 0.06) {                                                      // cap mouth opens to top neck (halfFrac 0.247)
+    const u = (t - 0.03) / 0.03;
+    return 0.247 * (u * u * (3 - 2 * u));
   }
-  if (t < 0.90) {
-    const u = (t - 0.50) / 0.40;
-    const e = u * u;
-    return 0.96 - (0.96 - 0.55) * e;
+  if (t < 0.82) {                                                      // long gradual widening from neck (0.247) to peak bulge (0.50)
+    const u = (t - 0.06) / 0.76;
+    const e = u * u * (3 - 2 * u);
+    return 0.247 + (0.50 - 0.247) * e;
   }
-  if (t < 0.93) return 0.55 - (0.55 - 0.40) * ((t - 0.90) / 0.03);
-  if (t < 0.95) return 0.40 * (1 - (t - 0.93) / 0.02);
+  if (t < 0.93) {                                                      // peak (0.50) tapers down to body base (~0.40)
+    const u = (t - 0.82) / 0.11;
+    const e = u * u * (3 - 2 * u);
+    return 0.50 - (0.50 - 0.40) * e;
+  }
+  if (t < 0.96) {                                                      // body base narrows toward pool floor (~0.32)
+    const u = (t - 0.93) / 0.03;
+    const e = u * u * (3 - 2 * u);
+    return 0.40 - (0.40 - 0.32) * e;
+  }
+  if (t < 0.99) {                                                      // pool floor closes down to small foot, then sealed
+    const u = (t - 0.96) / 0.03;
+    return 0.32 * (1 - u);
+  }
   return 0;
 }
 
@@ -347,21 +387,27 @@ class SPH {
 
     // Kernel and core fluid params
     this.h = 26;                  // smoothing radius (px)
-    this.mass = 1.0;
-    this.gasK = 1400;             // pressure stiffness (push particles apart)
+    // Per-particle mass. Used by the SPH density / pressure / cohesion
+    // formulas (rho = Σ m·W, etc.) and as the inertia divisor in the
+    // velocity integration step (vᵢ += Fᵢ·dt / m). Higher → particles
+    // feel heavier, accelerate more slowly under buoyancy / pressure /
+    // spring forces; restDensity is auto-recalibrated on reset() to
+    // match the new equilibrium density.
+    this.mass = 2.4;
+    this.gasK = 2400 * 1.95;      // pressure stiffness (push particles apart) — slider default 1.95
     // Base kinematic viscosity (slider 1.0 = this value). The previous value
     // of 0.2 was calibrated against an incorrect VISC_LAP kernel constant
     // that was off by a factor of h; the corrected 2D constant is h× larger,
     // so this value is reduced by h (= 26) to preserve the same effective
     // viscous force at the slider's nominal position.
     this.viscosity = 0.2 / 26;    // ≈ 0.00769
-    this.viscScale = 1.5;         // user multiplier
+    this.viscScale = 1.65;        // user multiplier
     // Intra-blob surface tension. The Akinci kernel cohesion AND the
     // edge-only roundness pull are now both controlled by a single
     // user-facing "Surface tension" slider — together they're what
     // gives each mass its boundary.
     this.cohesion = 0.30;          // base cohesion strength (slider 1.0 = this)
-    this.surfaceTensionScale = 0.80;
+    this.surfaceTensionScale = 0.70;
 
     // Distinct masses ("blobs") — group IDs are recomputed every frame
     // via connected components on the particle graph. Two particles are
@@ -378,7 +424,7 @@ class SPH {
     // of headroom for fragmented scenes without inflating shader-side
     // memory meaningfully.
     this.MAX_BLOBS = 32;
-    this.surfaceTension = 0.9;     // user multiplier for inter-blob repulsion
+    this.surfaceTension = 0.57;    // user multiplier for inter-blob repulsion
     // Inter-blob repulsion scaled down to match the new (tiny) effective
     // gravity: at contact the force is now a few px/s², comparable to
     // the buoyancy-driven net force. Strong enough to prevent merging,
@@ -400,8 +446,48 @@ class SPH {
     // Edge-only roundness pull. Combined with cohesion under the
     // Surface Tension slider — this is the inward pull on boundary
     // particles that springs torn pieces back into circles.
-    this.roundness = 30;           // px/s^2 at full edge factor (slider 1.0)
-    this.interiorN = 5.0;          // neighbor count above which a particle is "interior"
+    // Damped-harmonic-oscillator binding between same-group ("attached")
+    // particles. Each pair within kernel range acts like a spring with
+    // rest length r0 + a velocity damper along the connecting axis.
+    // Pulls back stretched bonds; damps relative motion. Replaces the
+    // earlier centroid-based "roundness/circularity" pull, which was
+    // forcing blobs into circles. With pair-wise springs the blob can
+    // take any topology — elongated, lobed, tangled — and just
+    // oscillate around its current shape.
+    this.springRest = this.h * 0.55;   // rest length matches initial particle spacing
+    // Tuned for "barely contained, underdamped" oscillations:
+    // strong stiffness so blobs visibly ring, tiny per-pair damping
+    // so the oscillations persist for many cycles, and the
+    // springMaxStretch + springMin caps + global velocity damping
+    // together provide the only thing keeping the system from
+    // running away.
+    this.springK = 300;                // px/s² per px of stretch (springScale = 1.0 → this)
+    this.springDamp = 0.05;            // px/s² per (px/s) of relative axial speed
+    // Saturation cap on stretch — beyond this, the spring force stops
+    // growing. Without it the linear F = −k·x term diverges as
+    // particles drift apart, blowing up the integrator under stiff
+    // conditions. ~h·0.4 means the spring is fully linear over its
+    // useful range and clamps just before particles leave the SPH
+    // kernel anyway.
+    this.springMaxStretch = this.h * 0.4;
+    // Minimum allowed pair distance. If r drops below this, the spring
+    // pushes the pair APART (compressed-spring branch) — a hard floor
+    // against particles being squeezed into each other.
+    this.springMin = this.h * 0.4;     // h · 0.4 ≈ 10.4 px, below the rest length of h · 0.55
+    // Maximum range over which the spring acts on a same-group neighbor.
+    // Larger than the SPH smoothing radius h (so a same-blob pair that
+    // drifts past h still feels the spring's saturated peak force pulling
+    // it back, resisting tearing under fast impacts), but kept inside
+    // the per-pair early-return cutoff (cushionRange = h · 1.35) so the
+    // outer guard still skips truly far-apart pairs.
+    this.springReach = this.h * 1.3;
+
+    // User multiplier (Spring strength slider). The slider is rebased
+    // so the displayed unit value (1.00) corresponds to springScale
+    // 0.0005 internally — i.e. what used to read as 0.05 on the old
+    // /100 mapping. Slider value v maps to springScale = v / 2000.
+    // Default slider position 3.70 → springScale 0.00185.
+    this.springScale = 3.70 / 2000;
 
     // Sticky bottom layer: a small downward pull plus extra velocity
     // damping for particles in the bottom of the fluid region. The pull
@@ -410,7 +496,7 @@ class SPH {
     // crossover. Both effects ramp from zero at `stickyTop` to full at
     // the bottle floor and are scaled by `stickyStrength` (the slider).
     this.stickyHeight = 90;        // px above the fluid bottom
-    this.stickyStrength = 0.65;    // slider; scales both drag and pull
+    this.stickyStrength = 0.15;    // slider; scales both drag and pull (slider 1.0 = 90% of max buoyant accel)
     // Peak downward accel (px/s²) at the floor before stickyStrength
     // scaling. Set strong enough to overcome cool-wax buoyancy and
     // close-range cohesion, so small detached drops sitting just above
@@ -418,7 +504,13 @@ class SPH {
     // independent blobs. Hot blobs in the bulb zone still escape
     // (their +14.4 px/s² rise beats the ~13 px/s² peak pull at default
     // slider value).
-    this.stickyPull = 20.0;
+    // Calibrated so that at slider = 1.0 the peak floor-pull
+    // acceleration equals 90% of the maximum buoyant acceleration:
+    //   max buoyant accel = (gravity · hotDensityDeficit · gravityScale) / mass
+    //                     = 240 · 0.060 · 1.0 / 3 = 4.8 px/s²
+    //   target floor pull = 0.9 · 4.8 ≈ 4.32 px/s²
+    // The slider value is the literal multiplier on this base.
+    this.stickyPull = 4.32;
 
     // Pool-zone barrier attenuation. The activation barrier between a
     // blob and the pool weakens the longer the blob lingers in the
@@ -498,7 +590,7 @@ class SPH {
     // and the hot deficit. 1.0 = recipe physics; >1.0 = wax acts denser
     // / less dense (stronger sinking and rising); <1.0 = closer to
     // neutrally buoyant.
-    this.gravityScale = 1.6;
+    this.gravityScale = 0.80;
 
     // Buoyancy curve steepness. The temperature → density mapping is
     // (e^(k·tNorm) − 1) / (e^k − 1) instead of a linear blend, so a
@@ -517,7 +609,7 @@ class SPH {
 
     // Heat
     this.tAmbient = 0.18;
-    this.heatScale = 0.65;
+    this.heatScale = 0.90;
     // Calibrated to the recipe block above: ~0.006 norm/s per particle
     // when in the bulb zone at typical occupancy. The slider's "1.0"
     // position equals this physically-grounded base rate.
@@ -528,19 +620,19 @@ class SPH {
     //   inter-mass: a tiny fraction — a hot bubble in contact with the
     //     cold pool barely loses heat, so it survives the trip up.
     this.heatDiff = 0.05;           // intra-mass base (slider 1.0 = this rate)
-    this.heatDiffScale = 2.5;       // user multiplier
+    this.heatDiffScale = 3.2;       // user multiplier
     this.interDiffRatio = 0.03;     // inter-mass diffusion as fraction of intra
     // Ambient-cooling base — slider's 1.0 position equals this rate.
     this.ambientCool = 0.01;
-    this.ambientCoolScale = 1.0;
+    this.ambientCoolScale = 1.95;
     // Heat-source flicker — slow, organic spatiotemporal fluctuations.
-    this.heatNoise = 1.0;          // 0 = steady, 1 = wild swings
+    this.heatNoise = 1.04;         // 0 = steady, 1 = wild swings
     this.simTime = 0;              // accumulator (drives the noise phase)
     // Heat plate above the bulb. Vertical reach decays over `bulbHeight`
     // pixels above the fluid bottom; horizontally the center is hottest
     // (factor 1.0) and the edge is `edgeFactor` (still warm, never zero).
-    this.bulbHeight = 65;          // px — only the bottom 2.5*h is heated
-    this.edgeFactor = 0.45;        // heat scaling at the bottle wall vs. center
+    this.bulbHeight = 51;          // px — vertical reach of the heat plate
+    this.edgeFactor = 0.21;        // heat scaling at the bottle wall vs. center
 
 
     // Spatial hash grid
@@ -661,7 +753,11 @@ class SPH {
         const zj = this.blobZ[gj];
         const sizeJ = Math.max(1, this.cmn[gj]);
         const sizeMin = Math.min(sizeI, sizeJ);
-        const zMerge = Math.max(0.02, 0.15 / sizeMin);
+        // Loosened z-merge tolerance: √-scaling instead of linear, with
+        // a generous floor so bigger blobs still absorb close-z drops
+        // instead of becoming unable to grow. Result: larger mean blob
+        // size at equilibrium.
+        const zMerge = Math.max(0.10, 0.25 / Math.sqrt(sizeMin));
         if (Math.abs(zi - zj) < zMerge) {
           this._ufUnion(i, j);
         }
@@ -793,7 +889,7 @@ class SPH {
     //         zero velocity, never integrated.
     const wallSpacingX = this.h * 0.55;
     const wallSpacingY = this.h * 0.48;
-    const wallBaseY = SIM_H * 0.918;
+    const wallBaseY = SIM_H * 0.93;
     const numRows = 2;
     const perRow = Math.floor(this.MAX_FIXED / numRows);
     for (let row = 0; row < numRows; row++) {
@@ -823,15 +919,25 @@ class SPH {
     }
     this.nFixed = this.n;
 
-    // ---- 2) Place fluid particles roughly hexagonal in lower body ----
+    // ---- 2) Place fluid particles tightly packed just above the pool
+    //         so they all start fused with it as one big resting blob.
+    //         The fluid stack fills upward from the pool's top until
+    //         the budget is spent; with the default 160 particles it
+    //         comes out as ~5–6 hex-packed rows sitting on the pool.
     const targetSpacing = this.h * 0.55;
+    const minSpacing2 = (targetSpacing * 0.7) * (targetSpacing * 0.7);
     let placed = 0;
     let attempts = 0;
-    const maxAttempts = this.numParticles * 200;
+    const maxAttempts = this.numParticles * 400;
+    // Top of the wall pool — fluid stacks up from just above this y.
+    const wallTopY = wallBaseY - wallSpacingY * (numRows - 1);
     while (placed < this.numParticles && attempts < maxAttempts) {
       attempts++;
-      const t = 0.5 + Math.random() * 0.40;
-      const y = t * SIM_H;
+      // Sample a y in the strip immediately above the pool. The stack
+      // is allowed to extend further upward as needed to fit the
+      // requested particle count.
+      const y = wallTopY - 4 - Math.random() * 110;
+      if (y < SIM_H * 0.10) continue;
       const halfW = bottleHalfWidth(y);
       if (halfW < 8) continue;
       const cx = SIM_W * 0.5;
@@ -841,15 +947,15 @@ class SPH {
       for (let i = 0; i < this.n; i++) {
         const dx = this.x[i] - x;
         const dy = this.y[i] - y;
-        if (dx*dx + dy*dy < (targetSpacing*0.7)*(targetSpacing*0.7)) {
+        if (dx*dx + dy*dy < minSpacing2) {
           ok = false; break;
         }
       }
       if (!ok) continue;
       this.x[this.n] = x;
       this.y[this.n] = y;
-      this.vx[this.n] = (Math.random()-0.5) * 4;
-      this.vy[this.n] = (Math.random()-0.5) * 4;
+      this.vx[this.n] = (Math.random()-0.5) * 2;
+      this.vy[this.n] = (Math.random()-0.5) * 2;
       this.temp[this.n] = this.tAmbient + (Math.random()-0.5) * 0.05;
       this.n++;
       placed++;
@@ -1008,11 +1114,9 @@ class SPH {
       this.pressure[i] = this.gasK * (rho - this.restDensity);
     }
 
-    // Compute centroids per blob (needed for the edge-only roundness force)
+    // Compute centroids per blob (still useful for size-aware logic)
     this.computeCentroids();
-    // Reset per-blob accumulators filled in during the force loop
-    this.sumRoundX.fill(0);
-    this.sumRoundY.fill(0);
+    // Reset per-blob inter-blob force accumulators
     this.sumFrx.fill(0);
     this.sumFry.fill(0);
 
@@ -1030,10 +1134,14 @@ class SPH {
     const mergeThreshold = this.connectDist;
     const barrierWidth = repelOuter - mergeThreshold;
     const stScale  = this.surfaceTensionScale;
-    const cohScale = this.cohesion * stScale;
+    // When the user dials viscosity down for more jiggle, internal
+    // damping drops and contact particles can drift far enough off
+    // their blob's edge to be peeled off as singletons. Compensate by
+    // scaling up the cohesion when viscScale < 1, so blobs stay
+    // coherent at any viscosity setting. At viscScale ≥ 1 no boost.
+    const cohBoost = 1.0 + 0.6 * Math.max(0, 1.0 - this.viscScale);
+    const cohScale = this.cohesion * stScale * cohBoost;
     const tempRepel = this.tempRepelMult;
-    const roundness = this.roundness * stScale;
-    const interiorN = this.interiorN;
     // Cached pool-zone dwell parameters (used in the inner force loop).
     const poolDwellTau = this.poolDwellTau;
     const poolBarrierFloor = this.poolBarrierFloor;
@@ -1048,6 +1156,18 @@ class SPH {
     // the inter-blob force as local risks tearing single particles
     // off the blob's edge under sustained overlap.
     const localFraction = 0.05;
+    const springRest = this.springRest;
+    const springScale = this.springScale;
+    const springK = this.springK * springScale;
+    const springDamp = this.springDamp * springScale;
+    const springMaxStretch = this.springMaxStretch;
+    const springMin = this.springMin;
+    const springReach = this.springReach;
+    const springReach2 = springReach * springReach;
+    // Identify the pool group (any wall's groupId works — they all
+    // end up in the same component). Used to scope the lateral-
+    // spreading repulsion below to pool same-group pairs only.
+    const poolGroupId = (this.nFixed > 0) ? this.groupId[0] : -1;
     // Loop over ALL particles (pinned + fluid). Pinned ones still
     // accumulate forces and dT — those forces never get integrated
     // (the velocity update skips them) but heat exchange and density
@@ -1056,10 +1176,10 @@ class SPH {
     for (let i = 0; i < this.n; i++) {
       let fpx = 0, fpy = 0;       // pressure
       let fvx = 0, fvy = 0;       // viscosity
-      let fcx = 0, fcy = 0;       // cohesion (within blob)
+      let fcx = 0, fcy = 0;       // cohesion + spring/damper (within blob)
       let frx = 0, fry = 0;       // inter-blob repulsion (per-particle, NOT redistributed)
       let dT = 0; let neighCount = 0;
-      let sameGroupCount = 0;     // # same-blob neighbors (for boundary detection)
+      let sameGroupCount = 0;     // # same-blob neighbors (legacy, unused for force now)
       const xi = this.x[i], yi = this.y[i];
       const vxi = this.vx[i], vyi = this.vy[i];
       const Pi = this.pressure[i];
@@ -1168,25 +1288,32 @@ class SPH {
           dT += (this.temp[j] - Ti) * wT * diffWeight;
           neighCount++;
         }
-      });
 
-      // Edge-only roundness pull — only particles on the boundary of a
-      // mass (few same-group neighbors) feel a pull toward the centroid.
-      // Interior particles feel zero, so a round blob is stable and a
-      // torn/stretched blob springs back into shape.
-      let roundX = 0, roundY = 0;
-      if (sameGroupCount < interiorN && this.cmn[gi] > 1) {
-        const dxc = xi - this.cmx[gi];
-        const dyc = yi - this.cmy[gi];
-        const rc2 = dxc*dxc + dyc*dyc;
-        if (rc2 > 0.25) {
-          const rc = Math.sqrt(rc2);
-          const boundaryF = (interiorN - sameGroupCount) / interiorN;
-          const pull = roundness * boundaryF / rc;
-          roundX = -pull * dxc;
-          roundY = -pull * dyc;
+        // ---- Long-reach spring (same-group only) ----
+        // Acts beyond the SPH kernel out to springReach so neighbors that
+        // get knocked past h by an impact still feel the spring's
+        // saturated peak force pulling them back into the blob. Below
+        // springMin the same quadratic ramps in reverse to push the pair
+        // apart (compression branch). Quadratic in stretch so small
+        // displacements barely register; large ones snap back hard.
+        if (sameGroupJ && r2 < springReach2) {
+          const dvx = vxi - this.vx[j];
+          const dvy = vyi - this.vy[j];
+          const vAxial = (dvx * dx + dvy * dy) / r;   // + when separating
+          if (r > springRest) {
+            const rawStretch = r - springRest;
+            const stretch = rawStretch < springMaxStretch ? rawStretch : springMaxStretch;
+            const sdMag = -springK * stretch * stretch / springMaxStretch - springDamp * vAxial;
+            fcx += sdMag * dx / r;
+            fcy += sdMag * dy / r;
+          } else if (r < springMin) {
+            const compress = springMin - r;
+            const sdMag = springK * compress * compress / springMaxStretch - springDamp * vAxial;
+            fcx += sdMag * dx / r;
+            fcy += sdMag * dy / r;
+          }
         }
-      }
+      });
 
       // Net effective gravity from temperature-dependent density ratio.
       // Exponential rise factor — drops stay sinking through the lower
@@ -1196,40 +1323,30 @@ class SPH {
       const densRatio = this.coolDensityExcess - buoTotal * riseFactor;
       const effG = this.gravity * densRatio * this.gravityScale;
 
-      this.fx[i] = (fpx + fvx) / rhoi + fcx + roundX + frx;
-      this.fy[i] = (fpy + fvy) / rhoi + fcy + roundY + effG + fry;
-      // Track per-blob roundness sums so we can subtract the per-blob
-      // average afterwards — keeps roundness purely a SHAPE force,
-      // never affecting the blob's center-of-mass motion.
-      this.sumRoundX[gi] += roundX;
-      this.sumRoundY[gi] += roundY;
+      this.fx[i] = (fpx + fvx) / rhoi + fcx + frx;
+      this.fy[i] = (fpy + fvy) / rhoi + fcy + effG + fry;
       this.dT[i] = (neighCount > 0 ? dT / neighCount : 0) * (this.heatDiff * this.heatDiffScale);
     }
 
-    // Per-blob redistribution. Roundness avg is subtracted so the
-    // shape force is COM-net-zero. The rigid-translation share of the
-    // inter-blob force (1 - localFraction) is also distributed evenly
-    // across the blob's particles — the local share already went
-    // straight to the contact particles up in the force loop.
+    // Per-blob redistribution: spread the 1−localFraction share of
+    // the inter-blob force across each blob's particles so contact
+    // impulses translate the blob as a whole. (The roundness/COM
+    // shape force is gone; pair springs handle blob coherence.)
     {
       const K = this.MAX_BLOBS;
-      const aX = new Float64Array(K);
-      const aY = new Float64Array(K);
       const fX = new Float64Array(K);
       const fY = new Float64Array(K);
       for (let k = 0; k < K; k++) {
         const cnt = this.cmn[k];
         if (cnt > 0) {
-          aX[k] = this.sumRoundX[k] / cnt;
-          aY[k] = this.sumRoundY[k] / cnt;
           fX[k] = this.sumFrx[k] / cnt;
           fY[k] = this.sumFry[k] / cnt;
         }
       }
       for (let i = nFixed; i < this.n; i++) {
         const g = this.groupId[i];
-        this.fx[i] += fX[g] - aX[g];
-        this.fy[i] += fY[g] - aY[g];
+        this.fx[i] += fX[g];
+        this.fy[i] += fY[g];
       }
     }
 
@@ -1238,12 +1355,18 @@ class SPH {
     const stickyTop = fluidBotY - this.stickyHeight;
     const stickyDt = this.stickyStrength * dt;
     const stickyPullDt = this.stickyPull * this.stickyStrength * dt;
+    const invMass = 1.0 / this.mass;
     for (let i = nFixed; i < this.n; i++) {
-      this.vx[i] += this.fx[i] * dt;
-      this.vy[i] += this.fy[i] * dt;
-      // Light velocity damping
-      this.vx[i] *= 0.997;
-      this.vy[i] *= 0.997;
+      this.vx[i] += this.fx[i] * dt * invMass;
+      this.vy[i] += this.fy[i] * dt * invMass;
+      // Very light velocity damping (0.9995 per substep, ~14% loss per
+      // second of real time) so blobs ring for several seconds when
+      // jostled. The internal SPH viscosity term is still doing the
+      // work of damping particle-vs-particle relative motion within a
+      // blob; this term only handles bulk translation through the
+      // (un-modeled) surrounding fluid.
+      this.vx[i] *= 0.9995;
+      this.vy[i] *= 0.9995;
       // Sticky bottom layer — drag + a slight downward pull for
       // particles near the bottle floor. Both ramp from 0 at stickyTop
       // to full at the floor. The pull augments cool-wax buoyancy so
@@ -1489,21 +1612,30 @@ out vec4 fragColor;
 
 // Match JS bottleHalfFrac exactly
 float bottleHalfFrac(float t) {
-  if (t < 0.05) return 0.0;
-  if (t < 0.07) return 0.42 * ((t - 0.05) / 0.02);
-  if (t < 0.16) return mix(0.42, 0.50, (t - 0.07) / 0.09);
-  if (t < 0.50) {
-    float u = (t - 0.16) / 0.34;
-    float e = 1.0 - pow(1.0 - u, 2.0);
-    return mix(0.50, 0.96, e);
+  if (t < 0.03) return 0.0;                                              // closed silver cap region
+  if (t < 0.06) {                                                        // cap mouth opens to top neck
+    float u = (t - 0.03) / 0.03;
+    return 0.247 * (u * u * (3.0 - 2.0 * u));
   }
-  if (t < 0.90) {
-    float u = (t - 0.50) / 0.40;
-    float e = u * u;
-    return mix(0.96, 0.55, e);
+  if (t < 0.82) {                                                        // long gradual widening from neck to peak bulge
+    float u = (t - 0.06) / 0.76;
+    float e = u * u * (3.0 - 2.0 * u);
+    return mix(0.247, 0.50, e);
   }
-  if (t < 0.93) return mix(0.55, 0.40, (t - 0.90) / 0.03);
-  if (t < 0.95) return 0.40 * (1.0 - (t - 0.93) / 0.02);
+  if (t < 0.93) {                                                        // peak tapers down to body base
+    float u = (t - 0.82) / 0.11;
+    float e = u * u * (3.0 - 2.0 * u);
+    return mix(0.50, 0.40, e);
+  }
+  if (t < 0.96) {                                                        // body base narrows toward pool floor
+    float u = (t - 0.93) / 0.03;
+    float e = u * u * (3.0 - 2.0 * u);
+    return mix(0.40, 0.32, e);
+  }
+  if (t < 0.99) {                                                        // pool floor closes to foot
+    float u = (t - 0.96) / 0.03;
+    return 0.32 * (1.0 - u);
+  }
   return 0.0;
 }
 
@@ -1845,6 +1977,15 @@ $("sten").oninput = (e) => {
   sim.surfaceTensionScale = parseFloat(e.target.value);
   $("stenVal").textContent = sim.surfaceTensionScale.toFixed(2);
 };
+$("spring").oninput = (e) => {
+  // Slider unit (1.00) corresponds to springScale = 0.0005 internally —
+  // rebased so the previous "sweet spot" of slider 0.05 is now the
+  // displayed default of 1.00. Slider 0 → no spring; slider 4 → 4× the
+  // unit force (0.002 internal).
+  const v = parseFloat(e.target.value);
+  sim.springScale = v / 2000;
+  $("springVal").textContent = v.toFixed(2);
+};
 $("sticky").oninput = (e) => {
   sim.stickyStrength = parseFloat(e.target.value);
   $("stickyVal").textContent = sim.stickyStrength.toFixed(2);
@@ -1852,6 +1993,24 @@ $("sticky").oninput = (e) => {
 $("size").oninput = (e) => {
   sim.renderScale = parseFloat(e.target.value);
   $("sizeVal").textContent = sim.renderScale.toFixed(2);
+};
+$("mass").oninput = (e) => {
+  const newMass = parseFloat(e.target.value);
+  // restDensity was calibrated to the OLD mass at reset time. Rescale
+  // it proportionally so equilibrium pressure stays balanced when the
+  // user drags the slider mid-simulation.
+  if (sim.mass > 0) {
+    sim.restDensity *= newMass / sim.mass;
+  }
+  sim.mass = newMass;
+  $("massVal").textContent = sim.mass.toFixed(2);
+};
+$("pressure").oninput = (e) => {
+  // Slider scales the SPH pressure stiffness (gasK). 1.00 ≙ baseline
+  // gasK of 2400; 0 disables internal pressure entirely; 3 triples it.
+  const v = parseFloat(e.target.value);
+  sim.gasK = 2400 * v;
+  $("pressureVal").textContent = v.toFixed(2);
 };
 $("visc").oninput = (e) => {
   sim.viscScale = parseFloat(e.target.value);
