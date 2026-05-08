@@ -435,8 +435,6 @@ class SPH {
     // bubble bouncing off the cold pool stays separate.
     this.tempRepelMult = 0.0;
     this.connectDist = this.h * 0.82; // intra-mass connectivity threshold
-    this.groupId = new Int32Array(this.cap);
-    this.uf = new Int32Array(this.cap);  // union-find parent array
 
     // Edge-only roundness pull: particles with few same-group neighbors
     // (i.e., on the boundary of a torn or stretched blob) get pulled
@@ -695,9 +693,32 @@ class SPH {
     // component or smaller fragment of a split) and inherited from
     // the previous frame's blob when the same blob continues.
     this.blobZ = new Float32Array(K);
+
+    // Pre-allocated arrays for recomputeGroups (avoid Map/Array per call)
+    this._rootSizeKeys = new Int32Array(n);   // root indices
+    this._rootSizeVals = new Int32Array(n);   // sizes per root
+    this._rootSorted   = new Int32Array(n);   // sorted root list
+    this._rootIdMap    = new Int32Array(n);   // root → group id mapping
+
+    // Pre-allocated arrays for _updateBlobZ
+    this._groupSize   = new Int32Array(K);
+    this._majPrev     = new Int32Array(K);
+    this._newBlobZ    = new Float32Array(K);
+    this._handled     = new Uint8Array(K);
+    // Per-group prev-group tallies: [K][K] flattened
+    this._prevTally   = new Int32Array(K * K);
+    // Bucket storage for claimedBy
+    this._claimBuckets = new Int32Array(K * K); // flattened: bucket k starts at k*K
+    this._claimCounts  = new Int32Array(K);
+
+    // Precomputed SPH kernel constants (depend only on h)
+    const h = this.h;
+    this.POLY6      =  4 / (Math.PI * Math.pow(h, 8));
+    this.SPIKY_GRAD = -30 / (Math.PI * Math.pow(h, 5));
+    this.VISC_LAP   =  40 / (Math.PI * Math.pow(h, 4));
   }
 
-  // ---- Union-find helpers (path compression + union-by-rank-lite) ----
+  // ---- Union-find helpers (path compression + union-by-rank) ----
   _ufFind(i) {
     let r = i;
     while (this.uf[r] !== r) r = this.uf[r];
@@ -723,61 +744,97 @@ class SPH {
     for (let i = 0; i < n; i++) this.uf[i] = i;
     const cd2 = this.connectDist * this.connectDist;
     const nFixed = this.nFixed;
+    const cellSize = this.cellSize;
+    const gridW = this.gridW, gridH = this.gridH;
+    const cellHead = this.cellHead, cellNext = this.cellNext;
+    const px = this.x, py = this.y;
+
     for (let i = 0; i < n; i++) {
-      const xi = this.x[i], yi = this.y[i];
-      const gi = this.groupId[i];   // previous-frame group for blob-z lookup
+      const xi = px[i], yi = py[i];
+      const gi = this.groupId[i];
       const zi = this.blobZ[gi];
       const sizeI = Math.max(1, this.cmn[gi]);
       const isWallI = i < nFixed;
-      this.forNeighbors(i, (j) => {
-        if (j <= i) return;
-        const dx = xi - this.x[j];
-        const dy = yi - this.y[j];
-        if (dx*dx + dy*dy >= cd2) return;
-        const isWallJ = j < nFixed;
-        // Walls are universal absorbers — they merge regardless of z.
-        if (isWallI || isWallJ) {
-          this._ufUnion(i, j);
-          return;
+
+      // Inline neighbor walk (replaces forNeighbors closure)
+      const cxI = Math.max(0, Math.min(gridW - 1, ((xi / cellSize) | 0) + 2));
+      const cyI = Math.max(0, Math.min(gridH - 1, ((yi / cellSize) | 0) + 2));
+      for (let dy = -1; dy <= 1; dy++) {
+        const ny = cyI + dy;
+        if (ny < 0 || ny >= gridH) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = cxI + dx;
+          if (nx < 0 || nx >= gridW) continue;
+          let j = cellHead[ny * gridW + nx];
+          while (j !== -1) {
+            if (j > i) {
+              const ddx = xi - px[j];
+              const ddy = yi - py[j];
+              if (ddx*ddx + ddy*ddy < cd2) {
+                const isWallJ = j < nFixed;
+                if (isWallI || isWallJ) {
+                  this._ufUnion(i, j);
+                } else {
+                  const gj = this.groupId[j];
+                  const zj = this.blobZ[gj];
+                  const sizeJ = Math.max(1, this.cmn[gj]);
+                  const sizeMin = Math.min(sizeI, sizeJ);
+                  const zMerge = Math.max(0.10, 0.25 / Math.sqrt(sizeMin));
+                  if (Math.abs(zi - zj) < zMerge) {
+                    this._ufUnion(i, j);
+                  }
+                }
+              }
+            }
+            j = cellNext[j];
+          }
         }
-        // Fluid-fluid merge gate. Inverse to the squeeze-interaction
-        // reach: small drops merge readily (they're the easy absorber
-        // for small detached droplets / singletons), but bigger blobs
-        // require near-identical z to fuse — they should bounce off
-        // each other on contact rather than coalescing the moment
-        // their z values get close. The squeeze + bounce dynamics
-        // (cross-group density, inter-blob barrier) handle the
-        // interaction; merging is reserved for cases where the z
-        // layers really line up.
-        const gj = this.groupId[j];
-        const zj = this.blobZ[gj];
-        const sizeJ = Math.max(1, this.cmn[gj]);
-        const sizeMin = Math.min(sizeI, sizeJ);
-        // Loosened z-merge tolerance: √-scaling instead of linear, with
-        // a generous floor so bigger blobs still absorb close-z drops
-        // instead of becoming unable to grow. Result: larger mean blob
-        // size at equilibrium.
-        const zMerge = Math.max(0.10, 0.25 / Math.sqrt(sizeMin));
-        if (Math.abs(zi - zj) < zMerge) {
-          this._ufUnion(i, j);
-        }
-      });
+      }
     }
-    // Count component sizes by root
-    const rootSize = new Map();
+
+    // Count component sizes by root — use pre-allocated arrays
+    const rootSizeVals = this._rootSizeVals;
+    const rootIdMap = this._rootIdMap;
+    rootSizeVals.fill(0);
+    let numRoots = 0;
+    const rootSizeKeys = this._rootSizeKeys;
+    // Mark which roots we've seen (use rootIdMap as a "seen" marker)
+    rootIdMap.fill(-1);
+
     for (let i = 0; i < n; i++) {
       const r = this._ufFind(i);
-      rootSize.set(r, (rootSize.get(r) || 0) + 1);
+      if (rootIdMap[r] === -1) {
+        rootIdMap[r] = numRoots;
+        rootSizeKeys[numRoots] = r;
+        numRoots++;
+      }
+      rootSizeVals[rootIdMap[r]]++;
     }
-    // Rank roots by size (descending) → assign IDs 1..K-1
-    const roots = Array.from(rootSize.entries()).sort((a, b) => b[1] - a[1]);
-    const idOf = new Map();
+
+    // Sort roots by descending size (insertion sort — numRoots is small, ≤32 typically)
+    const sorted = this._rootSorted;
+    for (let i = 0; i < numRoots; i++) sorted[i] = i;
+    for (let i = 1; i < numRoots; i++) {
+      const key = sorted[i];
+      const keyVal = rootSizeVals[key];
+      let j = i - 1;
+      while (j >= 0 && rootSizeVals[sorted[j]] < keyVal) {
+        sorted[j + 1] = sorted[j];
+        j--;
+      }
+      sorted[j + 1] = key;
+    }
+
+    // Assign group IDs: rank 0 → id 1, rank 1 → id 2, ..., capped at MAX_BLOBS-1
     const cap = this.MAX_BLOBS;
-    for (let k = 0; k < roots.length; k++) {
-      idOf.set(roots[k][0], Math.min(k + 1, cap - 1));
+    // Reset rootIdMap for re-use as root→groupId
+    rootIdMap.fill(0);
+    for (let k = 0; k < numRoots; k++) {
+      const rootIdx = sorted[k];
+      rootIdMap[rootSizeKeys[rootIdx]] = Math.min(k + 1, cap - 1);
     }
     for (let i = 0; i < n; i++) {
-      this.groupId[i] = idOf.get(this._ufFind(i));
+      this.groupId[i] = rootIdMap[this._ufFind(i)];
     }
   }
 
@@ -793,52 +850,70 @@ class SPH {
     const K = this.MAX_BLOBS;
 
     // Tally: for each current group, count members by their previous group.
-    const groupSize = new Int32Array(K);
-    const prevForCurr = new Array(K).fill(null);
+    // Uses pre-allocated flat array [K×K] instead of Array<Map>.
+    const groupSize = this._groupSize;
+    const prevTally = this._prevTally;
+    groupSize.fill(0);
+    prevTally.fill(0);
     for (let i = 0; i < n; i++) {
       const cur = this.groupId[i];
       const prev = this.prevGroupId[i];
       groupSize[cur]++;
-      let m = prevForCurr[cur];
-      if (!m) { m = new Map(); prevForCurr[cur] = m; }
-      m.set(prev, (m.get(prev) || 0) + 1);
+      prevTally[cur * K + prev]++;
     }
 
     // For each current group, find majority previous group (skipping
     // prev = 0, which means "no previous group" — happens at reset).
-    const majPrev = new Int32Array(K);
+    const majPrev = this._majPrev;
     for (let c = 0; c < K; c++) {
-      const m = prevForCurr[c];
-      if (!m) { majPrev[c] = -1; continue; }
+      if (groupSize[c] === 0) { majPrev[c] = -1; continue; }
       let bestP = -1, bestCnt = 0;
-      for (const [p, cnt] of m) {
-        if (p > 0 && cnt > bestCnt) { bestCnt = cnt; bestP = p; }
+      const base = c * K;
+      for (let p = 1; p < K; p++) {
+        const cnt = prevTally[base + p];
+        if (cnt > bestCnt) { bestCnt = cnt; bestP = p; }
       }
       majPrev[c] = bestP;
     }
 
     // Group current groups by their majority previous, sort each
     // bucket by current size. Largest in each bucket inherits z;
-    // others (smaller fragments of the same prev group) get fresh z.
-    const claimedBy = new Map();
+    // others get fresh z. Uses pre-allocated flat buckets.
+    const claimBuckets = this._claimBuckets;
+    const claimCounts = this._claimCounts;
+    claimCounts.fill(0);
     for (let c = 1; c < K; c++) {
       if (groupSize[c] === 0) continue;
       const p = majPrev[c];
       if (p < 0) continue;
-      let arr = claimedBy.get(p);
-      if (!arr) { arr = []; claimedBy.set(p, arr); }
-      arr.push(c);
+      claimBuckets[p * K + claimCounts[p]] = c;
+      claimCounts[p]++;
     }
 
-    const newBlobZ = new Float32Array(K);
-    const handled = new Uint8Array(K);
-    for (const [p, arr] of claimedBy) {
-      arr.sort((a, b) => groupSize[b] - groupSize[a]);
-      newBlobZ[arr[0]] = this.blobZ[p];
-      handled[arr[0]] = 1;
-      for (let k = 1; k < arr.length; k++) {
-        newBlobZ[arr[k]] = Math.random();
-        handled[arr[k]] = 1;
+    const newBlobZ = this._newBlobZ;
+    const handled = this._handled;
+    newBlobZ.fill(0);
+    handled.fill(0);
+    for (let p = 0; p < K; p++) {
+      const cnt = claimCounts[p];
+      if (cnt === 0) continue;
+      // Sort bucket by descending groupSize (insertion sort, tiny)
+      const base = p * K;
+      for (let a = 1; a < cnt; a++) {
+        const key = claimBuckets[base + a];
+        const keySize = groupSize[key];
+        let b = a - 1;
+        while (b >= 0 && groupSize[claimBuckets[base + b]] < keySize) {
+          claimBuckets[base + b + 1] = claimBuckets[base + b];
+          b--;
+        }
+        claimBuckets[base + b + 1] = key;
+      }
+      newBlobZ[claimBuckets[base]] = this.blobZ[p];
+      handled[claimBuckets[base]] = 1;
+      for (let k = 1; k < cnt; k++) {
+        newBlobZ[claimBuckets[base + k]] = Math.random();
+        handled[claimBuckets[base + k]] = 1;
       }
     }
     // Brand-new blobs (no prev majority): fresh z.
@@ -968,10 +1043,13 @@ class SPH {
     this.blobZ.fill(0);
     this.recomputeGroups();
     this._updateBlobZ();
+    this.computeCentroids();
     // Estimate rest density from current arrangement (per-blob)
     this.computeDensities();
-    const sorted = Array.from(this.density.slice(0, this.n)).sort((a,b)=>a-b);
-    const median = sorted[Math.floor(sorted.length / 2)] || 1;
+    // Find median density without allocating (selection via sort of slice copy)
+    const densSlice = this.density.slice(0, this.n);
+    densSlice.sort();
+    const median = densSlice[Math.floor(densSlice.length / 2)] || 1;
     this.restDensity = median * 0.92;
   }
 
@@ -1011,313 +1089,318 @@ class SPH {
     }
   }
 
+  // Unified density computation — used by both reset() calibration and step().
+  // Inlined neighbor walk; uses precomputed kernel constants.
   computeDensities() {
+    const n = this.n;
     const h = this.h, h2 = h * h;
-    const POLY6 = 4 / (Math.PI * Math.pow(h, 8));
+    const POLY6 = this.POLY6;
     const m = this.mass;
     const nFixed = this.nFixed;
-    for (let i = 0; i < this.n; i++) {
+    const cellSize = this.cellSize;
+    const gridW = this.gridW, gridH = this.gridH;
+    const cellHead = this.cellHead, cellNext = this.cellNext;
+    const px = this.x, py = this.y;
+    const gid = this.groupId;
+    const bz = this.blobZ;
+    const cmn = this.cmn;
+
+    for (let i = 0; i < n; i++) {
       let rho = 0;
-      const xi = this.x[i], yi = this.y[i];
-      const gi = this.groupId[i];
+      const xi = px[i], yi = py[i];
+      const gi = gid[i];
       const isFluidI = i >= nFixed;
-      this.forNeighbors(i, (j) => {
-        const dx = xi - this.x[j];
-        const dy = yi - this.y[j];
-        const r2 = dx*dx + dy*dy;
-        if (r2 >= h2) return;
-        const w = h2 - r2;
-        const term = m * POLY6 * w * w * w;
-        const gj = this.groupId[j];
-        if (gj === gi) {
-          rho += term;
-          return;
+
+      const cxI = Math.max(0, Math.min(gridW - 1, ((xi / cellSize) | 0) + 2));
+      const cyI = Math.max(0, Math.min(gridH - 1, ((yi / cellSize) | 0) + 2));
+      for (let dy = -1; dy <= 1; dy++) {
+        const ny = cyI + dy;
+        if (ny < 0 || ny >= gridH) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = cxI + dx;
+          if (nx < 0 || nx >= gridW) continue;
+          let j = cellHead[ny * gridW + nx];
+          while (j !== -1) {
+            const ddx = xi - px[j];
+            const ddy = yi - py[j];
+            const r2 = ddx*ddx + ddy*ddy;
+            if (r2 < h2) {
+              const w = h2 - r2;
+              const term = m * POLY6 * w * w * w;
+              const gj = gid[j];
+              if (gj === gi) {
+                rho += term;
+              } else if (isFluidI && j >= nFixed) {
+                const zi = bz[gi];
+                const zj = bz[gj];
+                const absZ = Math.abs(zi - zj);
+                const sI = Math.max(1, cmn[gi]);
+                const sJ = Math.max(1, cmn[gj]);
+                const zReach = Math.min(0.55, (Math.sqrt(sI) + Math.sqrt(sJ)) * 0.07);
+                if (absZ < zReach) {
+                  rho += 0.3 * (1 - absZ / zReach) * term;
+                }
+              }
+            }
+            j = cellNext[j];
+          }
         }
-        // Cross-group: fluid pairs in overlapping z layers contribute
-        // partially to each other's density. The resulting pressure
-        // boost is what makes the two blobs visibly squeeze when they
-        // overlap — same-group neighbors near the contact get pushed
-        // outward by the elevated pressure. Coefficient kept modest
-        // (0.3) so the squeeze is visible without the pressure
-        // gradient becoming steep enough to tear single particles
-        // off the blob's edge.
-        if (!isFluidI || j < nFixed) return;
-        const zi = this.blobZ[gi];
-        const zj = this.blobZ[gj];
-        const absZ = Math.abs(zi - zj);
-        const sizeI = Math.max(1, this.cmn[gi]);
-        const sizeJ = Math.max(1, this.cmn[gj]);
-        const zReach = Math.min(0.55, (Math.sqrt(sizeI) + Math.sqrt(sizeJ)) * 0.07);
-        if (absZ < zReach) {
-          const fade = 1 - absZ / zReach;
-          rho += 0.3 * fade * term;
-        }
-      });
+      }
       this.density[i] = rho;
     }
+  }
+
+  // Called once per frame — handles group computation, blob z, centroids,
+  // and heat noise pre-computation. These don't need to run every substep.
+  stepFrame(totalDt) {
+    if (this.n === 0) return;
+    this.rebuildGrid();
+    // Save previous-frame group ids for blob-z continuity detection.
+    this.prevGroupId.set(this.groupId);
+    this.recomputeGroups();
+    this._updateBlobZ();
+    this.computeCentroids();
+
+    // Pre-compute slowly-evolving heat noise terms (used by all substeps).
+    // These barely change across substeps so computing once per frame is fine.
+    const T = this.simTime + totalDt; // use end-of-frame time
+    const d1 = T * 0.071, d2 = T * 0.103, d3 = T * 0.047;
+    this._ph1 = T * 0.22 + Math.sin(d1) * 2.4;
+    this._ph2 = T * 0.18 + Math.sin(d2 + 1.7) * 2.8;
+    this._ph3 = T * 0.31 + Math.sin(d3 + 0.5) * 3.2;
+    this._a1 = 0.30 + 0.30 * Math.sin(d1 * 1.3);
+    this._a2 = 0.25 + 0.25 * Math.sin(d2 * 0.8 + 0.4);
+    this._a3 = 0.20 + 0.20 * Math.sin(d3 * 1.5 + 1.2);
+    this._k1 = 0.045 + 0.012 * Math.sin(d2 * 0.7);
+    this._k2 = 0.030 + 0.010 * Math.sin(d3 * 0.9 + 2.1);
+    this._k3 = 0.060 + 0.018 * Math.sin(d1 * 0.5 + 0.8);
+
+    // Cache per-step force constants that don't change across substeps
+    this._visc = this.viscosity * this.viscScale;
+    this._repelPeak = this.interRepel * this.surfaceTension * this.cushionStrength;
+    this._barrierWidth = this.cushionRange - this.connectDist;
+    const cohBoost = 1.0 + 0.6 * Math.max(0, 1.0 - this.viscScale);
+    this._cohScale = this.cohesion * this.surfaceTensionScale * cohBoost;
+    this._buoDenom = Math.exp(this.buoyancyExp) - 1;
+    this._buoTotal = this.coolDensityExcess + this.hotDensityDeficit;
+    this._springK = this.springK * this.springScale;
+    this._springDamp = this.springDamp * this.springScale;
   }
 
   step(dt) {
     if (this.n === 0) return;
     this.rebuildGrid();
-    // Save previous-frame group ids so _updateBlobZ can detect blob
-    // formation/breakage events.
-    this.prevGroupId.set(this.groupId);
-    // Dynamic group assignment: connected components on the particle graph
-    this.recomputeGroups();
-    // Propagate blob z (continuation / fresh on formation / fresh on split)
-    this._updateBlobZ();
 
+    const n = this.n;
     const h = this.h, h2 = h * h;
-    const POLY6      =  4 / (Math.PI * Math.pow(h, 8));
-    const SPIKY_GRAD = -30 / (Math.PI * Math.pow(h, 5));
-    const VISC_LAP   =  40 / (Math.PI * Math.pow(h, 4));   // 2D Müller viscosity Laplacian
+    const POLY6      = this.POLY6;
+    const SPIKY_GRAD = this.SPIKY_GRAD;
+    const VISC_LAP   = this.VISC_LAP;
     const m = this.mass;
-
-    // 1) Density & pressure. Same-group neighbors contribute fully;
-    //    cross-group fluid pairs in overlapping z-layers contribute
-    //    partially, raising the local density (and therefore pressure)
-    //    at the overlap so each blob visibly squeezes outward through
-    //    the SPH pressure response.
     const nFixed = this.nFixed;
-    for (let i = 0; i < this.n; i++) {
+    const cellSize = this.cellSize;
+    const gridW = this.gridW, gridH = this.gridH;
+    const cellHead = this.cellHead, cellNextArr = this.cellNext;
+    const px = this.x, py = this.y;
+    const pvx = this.vx, pvy = this.vy;
+    const ptemp = this.temp;
+    const gid = this.groupId;
+    const bz = this.blobZ;
+    const cmn = this.cmn;
+    const pden = this.density;
+    const ppres = this.pressure;
+
+    // 1) Density & pressure (inlined neighbor walk)
+    for (let i = 0; i < n; i++) {
       let rho = 0;
-      const xi = this.x[i], yi = this.y[i];
-      const gi = this.groupId[i];
+      const xi = px[i], yi = py[i];
+      const gi = gid[i];
       const isFluidI = i >= nFixed;
-      this.forNeighbors(i, (j) => {
-        const dx = xi - this.x[j];
-        const dy = yi - this.y[j];
-        const r2 = dx*dx + dy*dy;
-        if (r2 >= h2) return;
-        const w = h2 - r2;
-        const term = m * POLY6 * w * w * w;
-        const gj = this.groupId[j];
-        if (gj === gi) {
-          rho += term;
-          return;
+
+      const cxI = Math.max(0, Math.min(gridW - 1, ((xi / cellSize) | 0) + 2));
+      const cyI = Math.max(0, Math.min(gridH - 1, ((yi / cellSize) | 0) + 2));
+      for (let dy = -1; dy <= 1; dy++) {
+        const ny = cyI + dy;
+        if (ny < 0 || ny >= gridH) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = cxI + dx;
+          if (nx < 0 || nx >= gridW) continue;
+          let j = cellHead[ny * gridW + nx];
+          while (j !== -1) {
+            const ddx = xi - px[j];
+            const ddy = yi - py[j];
+            const r2 = ddx*ddx + ddy*ddy;
+            if (r2 < h2) {
+              const w = h2 - r2;
+              const term = m * POLY6 * w * w * w;
+              const gj = gid[j];
+              if (gj === gi) {
+                rho += term;
+              } else if (isFluidI && j >= nFixed) {
+                const zi = bz[gi], zj = bz[gj];
+                const absZ = Math.abs(zi - zj);
+                const sI = Math.max(1, cmn[gi]);
+                const sJ = Math.max(1, cmn[gj]);
+                const zReach = Math.min(0.55, (Math.sqrt(sI) + Math.sqrt(sJ)) * 0.07);
+                if (absZ < zReach) {
+                  rho += 0.3 * (1 - absZ / zReach) * term;
+                }
+              }
+            }
+            j = cellNextArr[j];
+          }
         }
-        if (!isFluidI || j < nFixed) return;
-        const zi = this.blobZ[gi];
-        const zj = this.blobZ[gj];
-        const absZ = Math.abs(zi - zj);
-        const sizeI = Math.max(1, this.cmn[gi]);
-        const sizeJ = Math.max(1, this.cmn[gj]);
-        const zReach = Math.min(0.55, (Math.sqrt(sizeI) + Math.sqrt(sizeJ)) * 0.07);
-        if (absZ < zReach) {
-          const fade = 1 - absZ / zReach;
-          rho += 0.3 * fade * term;
-        }
-      });
+      }
       if (rho < this.restDensity) rho = this.restDensity;
-      this.density[i] = rho;
-      this.pressure[i] = this.gasK * (rho - this.restDensity);
+      pden[i] = rho;
+      ppres[i] = this.gasK * (rho - this.restDensity);
     }
 
-    // Compute centroids per blob (still useful for size-aware logic)
-    this.computeCentroids();
     // Reset per-blob inter-blob force accumulators
     this.sumFrx.fill(0);
     this.sumFry.fill(0);
 
-    // 2) Forces + heat exchange
-    const visc = this.viscosity * this.viscScale;
-    // Activation-barrier model parameters. A single radial repulsion
-    // shaped so it peaks right at the merge threshold (connectDist) and
-    // decays smoothly to zero at the outer reach. Integral of F·dr from
-    // threshold to outer is the activation work — two blobs must bring
-    // enough relative kinetic energy to cross it. Below the threshold,
-    // union-find collapses them into one group and cohesion takes over.
-    const repelPeak = this.interRepel * this.surfaceTension * this.cushionStrength;
+    // 2) Forces + heat exchange (inlined neighbor walk)
+    const visc = this._visc;
+    const repelPeak = this._repelPeak;
     const repelOuter = this.cushionRange;
     const repelOuter2 = repelOuter * repelOuter;
-    const mergeThreshold = this.connectDist;
-    const barrierWidth = repelOuter - mergeThreshold;
-    const stScale  = this.surfaceTensionScale;
-    // When the user dials viscosity down for more jiggle, internal
-    // damping drops and contact particles can drift far enough off
-    // their blob's edge to be peeled off as singletons. Compensate by
-    // scaling up the cohesion when viscScale < 1, so blobs stay
-    // coherent at any viscosity setting. At viscScale ≥ 1 no boost.
-    const cohBoost = 1.0 + 0.6 * Math.max(0, 1.0 - this.viscScale);
-    const cohScale = this.cohesion * stScale * cohBoost;
+    const barrierWidth = this._barrierWidth;
+    const cohScale = this._cohScale;
     const tempRepel = this.tempRepelMult;
-    // Cached pool-zone dwell parameters (used in the inner force loop).
     const poolDwellTau = this.poolDwellTau;
     const poolBarrierFloor = this.poolBarrierFloor;
-    // Cached exponential-buoyancy constants (evaluated once per step).
     const buoK = this.buoyancyExp;
-    const buoDenom = Math.exp(buoK) - 1;
-    const buoTotal = this.coolDensityExcess + this.hotDensityDeficit;
-    // Fraction of inter-blob force applied locally to the contact
-    // particle (the rest is redistributed across the blob's particles).
-    // Kept small (5%) because the cross-group density contribution
-    // below is now the primary deformation driver — leaving more of
-    // the inter-blob force as local risks tearing single particles
-    // off the blob's edge under sustained overlap.
+    const buoDenom = this._buoDenom;
+    const buoTotal = this._buoTotal;
     const localFraction = 0.05;
     const springRest = this.springRest;
-    const springScale = this.springScale;
-    const springK = this.springK * springScale;
-    const springDamp = this.springDamp * springScale;
+    const springK = this._springK;
+    const springDamp = this._springDamp;
     const springMaxStretch = this.springMaxStretch;
     const springMin = this.springMin;
-    const springReach = this.springReach;
-    const springReach2 = springReach * springReach;
-    // Identify the pool group (any wall's groupId works — they all
-    // end up in the same component). Used to scope the lateral-
-    // spreading repulsion below to pool same-group pairs only.
-    const poolGroupId = (this.nFixed > 0) ? this.groupId[0] : -1;
-    // Loop over ALL particles (pinned + fluid). Pinned ones still
-    // accumulate forces and dT — those forces never get integrated
-    // (the velocity update skips them) but heat exchange and density
-    // contributions matter, and treating them uniformly here lets
-    // them participate in the same blob as adjacent fluid.
-    for (let i = 0; i < this.n; i++) {
-      let fpx = 0, fpy = 0;       // pressure
-      let fvx = 0, fvy = 0;       // viscosity
-      let fcx = 0, fcy = 0;       // cohesion + spring/damper (within blob)
-      let frx = 0, fry = 0;       // inter-blob repulsion (per-particle, NOT redistributed)
-      let dT = 0; let neighCount = 0;
-      let sameGroupCount = 0;     // # same-blob neighbors (legacy, unused for force now)
-      const xi = this.x[i], yi = this.y[i];
-      const vxi = this.vx[i], vyi = this.vy[i];
-      const Pi = this.pressure[i];
-      const rhoi = this.density[i];
-      const Ti = this.temp[i];
-      const gi = this.groupId[i];
+    const springReach2 = this.springReach * this.springReach;
+    const interRatio = this.interDiffRatio;
+    const sumFrx = this.sumFrx, sumFry = this.sumFry;
+    const zoneDwell = this.zoneDwell;
 
-      const interRatio = this.interDiffRatio;
-      this.forNeighbors(i, (j) => {
-        if (j === i) return;
-        const dx = xi - this.x[j];
-        const dy = yi - this.y[j];
-        const r2 = dx*dx + dy*dy;
-        // Outer cutoff: beyond the repulsion's outer reach, no inter-blob
-        // interaction at all.
-        if (r2 >= repelOuter2 || r2 < 1e-6) return;
-        const r = Math.sqrt(r2);
-        const sameGroupJ = (this.groupId[j] === gi);
+    for (let i = 0; i < n; i++) {
+      let fpx = 0, fpy = 0;
+      let fvx = 0, fvy = 0;
+      let fcx = 0, fcy = 0;
+      let frx = 0, fry = 0;
+      let dTsum = 0, neighCount = 0;
+      const xi = px[i], yi = py[i];
+      const vxi = pvx[i], vyi = pvy[i];
+      const Pi = ppres[i];
+      const rhoi = pden[i];
+      const Ti = ptemp[i];
+      const gi = gid[i];
 
-        // ---- Inter-blob repulsion (activation barrier) ----
-        // Single radial force F(r) = peak · u² where u ramps from 0 at
-        // the outer reach to 1 at the merge threshold. Force is purely
-        // repulsive, accumulated to the BLOB so each mass translates as
-        // one body on contact. Two approaching blobs must do work
-        // ∫F·dr against this force to cross the threshold; if their
-        // relative KE is too small, they bounce. Once across, the
-        // union-find merges them and surface-tension forces (cohesion
-        // + pressure) take over.
-        if (!sameGroupJ) {
-          const tDelta = Math.abs(Ti - this.temp[j]);
-          const tBoost = 1.0 + tempRepel * tDelta;
-          const u = (repelOuter - r) / barrierWidth;   // 0 at outer, 1 at threshold
-          // Pool-zone barrier attenuation: the longer either particle
-          // has been lingering above the pool, the weaker the barrier
-          // between them. Pair-averaged dwell time gives a symmetric
-          // factor (Newton's 3rd law preserved).
-          const dwell = (this.zoneDwell[i] + this.zoneDwell[j]) * 0.5;
-          const dwellFactor = poolBarrierFloor + (1.0 - poolBarrierFloor) * Math.exp(-dwell / poolDwellTau);
-          // Pseudo-3D z modulation. Each blob has one z; deformation
-          // amount scales with blob size (large blobs span more z) and
-          // z-closeness, and is asymmetric: the front blob (higher z)
-          // feels less force (passes over), the back blob feels more
-          // (gets stretched). If the z separation is larger than the
-          // combined z-extent, the two blobs ignore each other entirely.
-          let zFactor = 1.0;
-          if (i >= nFixed && j >= nFixed) {
-            const zi = this.blobZ[gi];
-            const zj = this.blobZ[this.groupId[j]];
-            const zDiff = zi - zj;                      // positive: i is in front
-            const absZ = Math.abs(zDiff);
-            const sizeI = Math.max(1, this.cmn[gi]);
-            const sizeJ = Math.max(1, this.cmn[this.groupId[j]]);
-            const zReach = Math.min(0.55, (Math.sqrt(sizeI) + Math.sqrt(sizeJ)) * 0.07);
-            if (absZ >= zReach) {
-              zFactor = 0;
-            } else {
-              const fade = 1 - absZ / zReach;
-              // Asymmetric: i in front gets 1 − 0.5·zRel, i in back
-              // gets 1 + 0.5·zRel. Total per pair stays at 2·fade.
-              const zRel = zDiff / zReach;             // signed [-1, 1]
-              zFactor = fade * (1 - 0.5 * zRel);
+      const cxI = Math.max(0, Math.min(gridW - 1, ((xi / cellSize) | 0) + 2));
+      const cyI = Math.max(0, Math.min(gridH - 1, ((yi / cellSize) | 0) + 2));
+      for (let ddy = -1; ddy <= 1; ddy++) {
+        const ny = cyI + ddy;
+        if (ny < 0 || ny >= gridH) continue;
+        for (let ddx = -1; ddx <= 1; ddx++) {
+          const nx = cxI + ddx;
+          if (nx < 0 || nx >= gridW) continue;
+          let j = cellHead[ny * gridW + nx];
+          while (j !== -1) {
+            if (j !== i) {
+              const dx = xi - px[j];
+              const dy = yi - py[j];
+              const r2 = dx*dx + dy*dy;
+              if (r2 < repelOuter2 && r2 > 1e-6) {
+                const r = Math.sqrt(r2);
+                const sameGroupJ = (gid[j] === gi);
+
+                // Inter-blob repulsion
+                if (!sameGroupJ) {
+                  const tDelta = Math.abs(Ti - ptemp[j]);
+                  const tBoost = 1.0 + tempRepel * tDelta;
+                  const u = (repelOuter - r) / barrierWidth;
+                  const dwell = (zoneDwell[i] + zoneDwell[j]) * 0.5;
+                  const dwellFactor = poolBarrierFloor + (1.0 - poolBarrierFloor) * Math.exp(-dwell / poolDwellTau);
+                  let zFactor = 1.0;
+                  if (i >= nFixed && j >= nFixed) {
+                    const zi = bz[gi];
+                    const gj = gid[j];
+                    const zj = bz[gj];
+                    const zDiff = zi - zj;
+                    const absZ = Math.abs(zDiff);
+                    const sI = Math.max(1, cmn[gi]);
+                    const sJ = Math.max(1, cmn[gj]);
+                    const zReach = Math.min(0.55, (Math.sqrt(sI) + Math.sqrt(sJ)) * 0.07);
+                    if (absZ >= zReach) {
+                      zFactor = 0;
+                    } else {
+                      const fade = 1 - absZ / zReach;
+                      zFactor = fade * (1 - 0.5 * zDiff / zReach);
+                    }
+                  }
+                  const forceMag = repelPeak * tBoost * dwellFactor * zFactor * u * u;
+                  const force = forceMag / r;
+                  const fdx = force * dx, fdy = force * dy;
+                  frx += localFraction * fdx;
+                  fry += localFraction * fdy;
+                  sumFrx[gi] += (1 - localFraction) * fdx;
+                  sumFry[gi] += (1 - localFraction) * fdy;
+                }
+
+                // Standard SPH at r < h
+                if (r2 < h2) {
+                  let diffWeight;
+                  if (sameGroupJ) {
+                    const rhoj = pden[j];
+                    const pTerm = -m * (Pi + ppres[j]) / (2 * rhoj) * SPIKY_GRAD * (h - r) * (h - r) / r;
+                    fpx += pTerm * dx;
+                    fpy += pTerm * dy;
+                    const vTerm = visc * m / rhoj * VISC_LAP * (h - r);
+                    fvx += vTerm * (pvx[j] - vxi);
+                    fvy += vTerm * (pvy[j] - vyi);
+                    const q = r / h;
+                    let C;
+                    if (q < 0.5) C = 2 * (1-q)*(1-q)*(1-q) * q*q*q - 1.0/64.0;
+                    else         C = (1-q)*(1-q)*(1-q) * q*q*q;
+                    const cTerm = -cohScale * m * 380 * C / r;
+                    fcx += cTerm * dx;
+                    fcy += cTerm * dy;
+                    diffWeight = 1.0;
+                  } else {
+                    diffWeight = interRatio;
+                  }
+                  const wT = (h - r) / h;
+                  dTsum += (ptemp[j] - Ti) * wT * diffWeight;
+                  neighCount++;
+                }
+
+                // Long-reach spring (same-group only)
+                if (sameGroupJ && r2 < springReach2) {
+                  const dvx = vxi - pvx[j];
+                  const dvy = vyi - pvy[j];
+                  const vAxial = (dvx * dx + dvy * dy) / r;
+                  if (r > springRest) {
+                    const rawStretch = r - springRest;
+                    const stretch = rawStretch < springMaxStretch ? rawStretch : springMaxStretch;
+                    const sdMag = -springK * stretch * stretch / springMaxStretch - springDamp * vAxial;
+                    fcx += sdMag * dx / r;
+                    fcy += sdMag * dy / r;
+                  } else if (r < springMin) {
+                    const compress = springMin - r;
+                    const sdMag = springK * compress * compress / springMaxStretch - springDamp * vAxial;
+                    fcx += sdMag * dx / r;
+                    fcy += sdMag * dy / r;
+                  }
+                }
+              }
             }
-          }
-          const forceMag = repelPeak * tBoost * dwellFactor * zFactor * u * u; // vector magnitude
-          const force = forceMag / r;                                 // so force·(dx,dy) gives the vector
-          const fdx = force * dx, fdy = force * dy;
-          // Split between local (deformation) and per-blob distributed
-          // (rigid translation). Pure local would let contact particles
-          // get blasted clean out of the blob and disintegrate it; pure
-          // distributed gives a rigid bounce with no jiggle. A smallish
-          // local share gives the contact patch real compression while
-          // the rest of the blob comes along together.
-          frx += localFraction * fdx;
-          fry += localFraction * fdy;
-          this.sumFrx[gi] += (1 - localFraction) * fdx;
-          this.sumFry[gi] += (1 - localFraction) * fdy;
-        }
-
-        // ---- Standard SPH operations only at r < h ----
-        if (r2 < h2) {
-          let diffWeight;
-          if (sameGroupJ) {
-            sameGroupCount++;
-            const rhoj = this.density[j];
-            const pTerm = -m * (Pi + this.pressure[j]) / (2 * rhoj) * SPIKY_GRAD * (h - r) * (h - r) / r;
-            fpx += pTerm * dx;
-            fpy += pTerm * dy;
-            const vTerm = visc * m / rhoj * VISC_LAP * (h - r);
-            fvx += vTerm * (this.vx[j] - vxi);
-            fvy += vTerm * (this.vy[j] - vyi);
-            // Akinci cohesion (attractive in mid range)
-            const q = r / h;
-            let C;
-            if (q < 0.5) C = 2 * (1 - q) * (1 - q) * (1 - q) * q * q * q - 1.0/64.0;
-            else         C = (1 - q) * (1 - q) * (1 - q) * q * q * q;
-            const cTerm = -cohScale * m * 380 * C / r;
-            fcx += cTerm * dx;
-            fcy += cTerm * dy;
-            diffWeight = 1.0;
-          } else {
-            // Inter-blob force already applied above; nothing more here
-            diffWeight = interRatio;
-          }
-          // Heat diffusion (mass-aware weight)
-          const wT = (h - r) / h;
-          dT += (this.temp[j] - Ti) * wT * diffWeight;
-          neighCount++;
-        }
-
-        // ---- Long-reach spring (same-group only) ----
-        // Acts beyond the SPH kernel out to springReach so neighbors that
-        // get knocked past h by an impact still feel the spring's
-        // saturated peak force pulling them back into the blob. Below
-        // springMin the same quadratic ramps in reverse to push the pair
-        // apart (compression branch). Quadratic in stretch so small
-        // displacements barely register; large ones snap back hard.
-        if (sameGroupJ && r2 < springReach2) {
-          const dvx = vxi - this.vx[j];
-          const dvy = vyi - this.vy[j];
-          const vAxial = (dvx * dx + dvy * dy) / r;   // + when separating
-          if (r > springRest) {
-            const rawStretch = r - springRest;
-            const stretch = rawStretch < springMaxStretch ? rawStretch : springMaxStretch;
-            const sdMag = -springK * stretch * stretch / springMaxStretch - springDamp * vAxial;
-            fcx += sdMag * dx / r;
-            fcy += sdMag * dy / r;
-          } else if (r < springMin) {
-            const compress = springMin - r;
-            const sdMag = springK * compress * compress / springMaxStretch - springDamp * vAxial;
-            fcx += sdMag * dx / r;
-            fcy += sdMag * dy / r;
+            j = cellNextArr[j];
           }
         }
-      });
+      }
 
-      // Net effective gravity from temperature-dependent density ratio.
-      // Exponential rise factor — drops stay sinking through the lower
-      // half of their heating range, then flip and accelerate sharply.
+      // Buoyancy
       const tNorm = Math.max(0, Math.min(1, (Ti - this.tAmbient) / (1.0 - this.tAmbient)));
       const riseFactor = (Math.exp(buoK * tNorm) - 1) / buoDenom;
       const densRatio = this.coolDensityExcess - buoTotal * riseFactor;
@@ -1325,26 +1408,25 @@ class SPH {
 
       this.fx[i] = (fpx + fvx) / rhoi + fcx + frx;
       this.fy[i] = (fpy + fvy) / rhoi + fcy + effG + fry;
-      this.dT[i] = (neighCount > 0 ? dT / neighCount : 0) * (this.heatDiff * this.heatDiffScale);
+      this.dT[i] = (neighCount > 0 ? dTsum / neighCount : 0) * (this.heatDiff * this.heatDiffScale);
     }
 
-    // Per-blob redistribution: spread the 1−localFraction share of
-    // the inter-blob force across each blob's particles so contact
-    // impulses translate the blob as a whole. (The roundness/COM
-    // shape force is gone; pair springs handle blob coherence.)
+    // Per-blob redistribution (pre-allocated arrays instead of per-call Float64Array)
     {
       const K = this.MAX_BLOBS;
-      const fX = new Float64Array(K);
-      const fY = new Float64Array(K);
+      // Reuse sumRoundX/Y as temp scratch for per-blob averaged force
+      const fX = this.sumRoundX, fY = this.sumRoundY;
       for (let k = 0; k < K; k++) {
-        const cnt = this.cmn[k];
+        const cnt = cmn[k];
         if (cnt > 0) {
-          fX[k] = this.sumFrx[k] / cnt;
-          fY[k] = this.sumFry[k] / cnt;
+          fX[k] = sumFrx[k] / cnt;
+          fY[k] = sumFry[k] / cnt;
+        } else {
+          fX[k] = 0; fY[k] = 0;
         }
       }
-      for (let i = nFixed; i < this.n; i++) {
-        const g = this.groupId[i];
+      for (let i = nFixed; i < n; i++) {
+        const g = gid[i];
         this.fx[i] += fX[g];
         this.fy[i] += fY[g];
       }
@@ -1356,156 +1438,96 @@ class SPH {
     const stickyDt = this.stickyStrength * dt;
     const stickyPullDt = this.stickyPull * this.stickyStrength * dt;
     const invMass = 1.0 / this.mass;
-    for (let i = nFixed; i < this.n; i++) {
-      this.vx[i] += this.fx[i] * dt * invMass;
-      this.vy[i] += this.fy[i] * dt * invMass;
-      // Very light velocity damping (0.9995 per substep, ~14% loss per
-      // second of real time) so blobs ring for several seconds when
-      // jostled. The internal SPH viscosity term is still doing the
-      // work of damping particle-vs-particle relative motion within a
-      // blob; this term only handles bulk translation through the
-      // (un-modeled) surrounding fluid.
-      this.vx[i] *= 0.9995;
-      this.vy[i] *= 0.9995;
-      // Sticky bottom layer — drag + a slight downward pull for
-      // particles near the bottle floor. Both ramp from 0 at stickyTop
-      // to full at the floor. The pull augments cool-wax buoyancy so
-      // the resting pool stays anchored even when blobs in it warm up
-      // toward neutral buoyancy; it's small enough that hot blobs in
-      // the bulb zone still rise out of it without trouble.
-      if (this.y[i] > stickyTop) {
-        const t = Math.min(1, (this.y[i] - stickyTop) / this.stickyHeight);
+    for (let i = nFixed; i < n; i++) {
+      pvx[i] += this.fx[i] * dt * invMass;
+      pvy[i] += this.fy[i] * dt * invMass;
+      pvx[i] *= 0.9995;
+      pvy[i] *= 0.9995;
+      if (py[i] > stickyTop) {
+        const t = Math.min(1, (py[i] - stickyTop) / this.stickyHeight);
         const drag = Math.max(0, 1 - stickyDt * t);
-        this.vx[i] *= drag;
-        this.vy[i] *= drag;
-        this.vy[i] += stickyPullDt * t;   // negative-pull (downward) toward the floor
+        pvx[i] *= drag;
+        pvy[i] *= drag;
+        pvy[i] += stickyPullDt * t;
       }
-      // Clamp velocity (stability)
       const vmax = 600;
-      const vlen2 = this.vx[i]*this.vx[i] + this.vy[i]*this.vy[i];
+      const vlen2 = pvx[i]*pvx[i] + pvy[i]*pvy[i];
       if (vlen2 > vmax*vmax) {
         const s = vmax / Math.sqrt(vlen2);
-        this.vx[i] *= s; this.vy[i] *= s;
+        pvx[i] *= s; pvy[i] *= s;
       }
-      this.x[i] += this.vx[i] * dt;
-      this.y[i] += this.vy[i] * dt;
+      px[i] += pvx[i] * dt;
+      py[i] += pvy[i] * dt;
     }
 
-    // 4) Heat sources & diffusion
-    // Warm plate above the bulb. Vertical falloff (squared) means
-    // particles right above the bulb heat up fastest; horizontal
-    // falloff is gentler — the center is hottest but particles all
-    // the way out at the bottle wall still warm up (at `edgeFactor`
-    // of the center rate).
+    // 4) Heat sources & diffusion (noise terms pre-computed in stepFrame)
     const hr = this.heatRate * this.heatScale;
     const bulbY = SIM_H * 0.93;
     const bH = this.bulbHeight;
     const cxFluid = SIM_W * 0.5;
     const edgeF = this.edgeFactor;
-    // Advance simulation time and pre-compute slowly-evolving noise terms
     this.simTime += dt;
-    const T = this.simTime;
     const nAmt = this.heatNoise;
-    // The bulb noise is a sum of three slow spatial sine waves whose
-    // *phases* and *amplitudes* themselves drift on a much slower
-    // timescale. The result is an ever-shifting pattern of warm/cool
-    // patches across the plate that never quite repeats.
-    // Drift signals (very slow — full cycle in 30–90 seconds).
-    const d1 = T * 0.071, d2 = T * 0.103, d3 = T * 0.047;
-    // Phases wander: linear drift plus a slow sinusoidal wobble.
-    const ph1 = T * 0.22 + Math.sin(d1) * 2.4;
-    const ph2 = T * 0.18 + Math.sin(d2 + 1.7) * 2.8;
-    const ph3 = T * 0.31 + Math.sin(d3 + 0.5) * 3.2;
-    // Amplitudes breathe in and out (always >= 0).
-    const a1 = 0.30 + 0.30 * Math.sin(d1 * 1.3);
-    const a2 = 0.25 + 0.25 * Math.sin(d2 * 0.8 + 0.4);
-    const a3 = 0.20 + 0.20 * Math.sin(d3 * 1.5 + 1.2);
-    // Spatial frequencies — drift slowly. Tuned so each sine has a
-    // wavelength of roughly 80–200 px (a few "patches" across the
-    // bottle width), giving distinct local hot spots rather than one
-    // bottle-wide warm half.
-    const k1 = 0.045 + 0.012 * Math.sin(d2 * 0.7);
-    const k2 = 0.030 + 0.010 * Math.sin(d3 * 0.9 + 2.1);
-    const k3 = 0.060 + 0.018 * Math.sin(d1 * 0.5 + 0.8);
-    // Heat all particles, including the pinned bottom pool — the pool
-    // sits in the bulb zone and warms up just like any other wax in
-    // contact with the heat plate. It can't rise (integration skips it)
-    // but it does spread heat to fluid neighbors via diffusion.
-    for (let i = 0; i < this.n; i++) {
-      const distAbove = bulbY - this.y[i];        // >0 above the bulb
+    const ph1 = this._ph1, ph2 = this._ph2, ph3 = this._ph3;
+    const a1 = this._a1, a2 = this._a2, a3 = this._a3;
+    const k1 = this._k1, k2 = this._k2, k3 = this._k3;
+
+    for (let i = 0; i < n; i++) {
+      const distAbove = bulbY - py[i];
       if (distAbove > -10 && distAbove < bH) {
-        const v = 1 - Math.max(0, distAbove) / bH; // 1 at plate, 0 at top
-        const halfW = Math.max(20, bottleHalfWidth(this.y[i]));
-        const xNorm = Math.min(1, Math.abs(this.x[i] - cxFluid) / halfW);
-        // Horizontal: center=1, wall=edgeF (smooth, monotonic)
+        const v = 1 - Math.max(0, distAbove) / bH;
+        const halfW = Math.max(20, bottleHalfWidth(py[i]));
+        const xNorm = Math.min(1, Math.abs(px[i] - cxFluid) / halfW);
         const hFactor = 1 - (1 - edgeF) * xNorm * xNorm;
-        // Slow spatiotemporal noise — drifting phases & amplitudes give
-        // wandering hot patches on the plate. Clamped non-negative.
         let noiseMul = 1.0;
         if (nAmt > 0) {
-          const xi = this.x[i], yi = this.y[i];
           const sn = (
-            a1 * Math.sin(xi * k1 + ph1) +
-            a2 * Math.sin(xi * k2 - yi * 0.012 + ph2) +
-            a3 * Math.sin(xi * k3 + yi * 0.018 + ph3)
+            a1 * Math.sin(px[i] * k1 + ph1) +
+            a2 * Math.sin(px[i] * k2 - py[i] * 0.012 + ph2) +
+            a3 * Math.sin(px[i] * k3 + py[i] * 0.018 + ph3)
           );
           noiseMul = Math.max(0, 1 + nAmt * sn);
         }
-        this.temp[i] += hr * v * v * hFactor * noiseMul * dt;
+        ptemp[i] += hr * v * v * hFactor * noiseMul * dt;
       }
-      // Ambient cooling — wax loses heat to the surrounding liquid as
-      // it rises. Scaled by 1/√(N/N_ref): big blobs have a smaller
-      // surface-to-volume ratio so they cool MUCH slower, while small
-      // detached drops cool quickly. (No separate top-cooling region;
-      // the bulb is the only thermal source/sink besides ambient.)
-      const blobN = Math.max(1, this.cmn[this.groupId[i]]);
+      const blobN = Math.max(1, cmn[gid[i]]);
       const massFactor = Math.max(0.5, Math.sqrt(blobN / this.coolMassRef));
       const ambEff = this.ambientCool * this.ambientCoolScale;
-      this.temp[i] -= (ambEff / massFactor) * (this.temp[i] - this.tAmbient) * dt;
-      // Apply neighbor diffusion (weak, so blobs keep their identity)
-      this.temp[i] += this.dT[i] * dt;
-      // Clamp
-      if (this.temp[i] < 0) this.temp[i] = 0;
-      if (this.temp[i] > 1.5) this.temp[i] = 1.5;
+      ptemp[i] -= (ambEff / massFactor) * (ptemp[i] - this.tAmbient) * dt;
+      ptemp[i] += this.dT[i] * dt;
+      if (ptemp[i] < 0) ptemp[i] = 0;
+      if (ptemp[i] > 1.5) ptemp[i] = 1.5;
 
-      // Pool-zone dwell tracking: accumulates while in the zone
-      // (weighted by depth — deeper = faster accumulation), resets
-      // when the particle leaves. Drives the activation-barrier
-      // attenuation in the inter-blob force.
-      const yi_dwell = this.y[i];
-      if (yi_dwell > this.poolZoneTop) {
-        const z = Math.min(1, (yi_dwell - this.poolZoneTop) / (this.poolZoneFloor - this.poolZoneTop));
-        this.zoneDwell[i] += z * dt;
+      if (py[i] > this.poolZoneTop) {
+        const z = Math.min(1, (py[i] - this.poolZoneTop) / (this.poolZoneFloor - this.poolZoneTop));
+        zoneDwell[i] += z * dt;
       } else {
-        this.zoneDwell[i] = 0;
+        zoneDwell[i] = 0;
       }
     }
 
-    // 5) Boundary handling — bottle silhouette
-    // Bounce horizontally to keep particles inside the bottle and
-    // cap vertically at fluid top/bottom.
+    // 5) Boundary handling
     const fluidTop = SIM_H * 0.07;
     const fluidBot = SIM_H * 0.92;
-    for (let i = nFixed; i < this.n; i++) {
-      const yi = this.y[i];
-      if (yi < fluidTop) {
-        this.y[i] = fluidTop;
-        this.vy[i] = Math.abs(this.vy[i]) * 0.3;
-      } else if (yi > fluidBot) {
-        this.y[i] = fluidBot;
-        this.vy[i] = -Math.abs(this.vy[i]) * 0.3;
+    for (let i = nFixed; i < n; i++) {
+      if (py[i] < fluidTop) {
+        py[i] = fluidTop;
+        pvy[i] = Math.abs(pvy[i]) * 0.3;
+      } else if (py[i] > fluidBot) {
+        py[i] = fluidBot;
+        pvy[i] = -Math.abs(pvy[i]) * 0.3;
       }
-      const halfW = bottleHalfWidth(this.y[i]);
+      const halfW = bottleHalfWidth(py[i]);
       const cx = SIM_W * 0.5;
       const limit = halfW - 4;
       if (limit < 4) continue;
-      const off = this.x[i] - cx;
+      const off = px[i] - cx;
       if (off > limit) {
-        this.x[i] = cx + limit;
-        this.vx[i] = -Math.abs(this.vx[i]) * 0.3;
+        px[i] = cx + limit;
+        pvx[i] = -Math.abs(pvx[i]) * 0.3;
       } else if (off < -limit) {
-        this.x[i] = cx - limit;
-        this.vx[i] = Math.abs(this.vx[i]) * 0.3;
+        px[i] = cx - limit;
+        pvx[i] = Math.abs(pvx[i]) * 0.3;
       }
     }
   }
@@ -1864,7 +1886,8 @@ void main() {
       data[i*4 + 3] = sim.groupId[i];   // group ID for per-blob rendering
     }
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.maxParticles, 1, gl.RGBA, gl.FLOAT, data, 0);
+    // Upload only the active particle count, not the full maxParticles texture width
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, n, 1, gl.RGBA, gl.FLOAT, data, 0);
 
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.useProgram(this.program);
@@ -2065,16 +2088,28 @@ document.querySelectorAll(".preset").forEach((b) => {
 let last = performance.now();
 let frames = 0;
 let fpsTime = last;
+let paused = false;
+
+// Pause simulation when tab is hidden to save CPU/GPU
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    paused = true;
+  } else {
+    paused = false;
+    last = performance.now(); // reset dt so we don't get a huge jump
+  }
+});
+
 function frame(now) {
+  if (paused) { requestAnimationFrame(frame); return; }
   const rawDt = (now - last) / 1000;
   last = now;
   // Clamp per-frame dt and split into substeps for SPH stability.
-  // Multiply by sim.timeScale so the entire simulation (motion, heat,
-  // noise drift) all runs slower together — keeps physics consistent
-  // while letting the lamp breathe at lava-lamp pace.
   const dt = Math.min(0.033, rawDt) * sim.timeScale;
   const substeps = 5;
   const sub = dt / substeps;
+  // Per-frame work: groups, blob-z, centroids, noise (once, not per substep)
+  sim.stepFrame(dt);
   for (let i = 0; i < substeps; i++) sim.step(sub);
 
   params.time = now / 1000;
