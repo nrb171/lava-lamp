@@ -229,8 +229,8 @@
   </div>
 
   <div class="control">
-    <label>Heater height <span class="val" id="bulbVal">50</span></label>
-    <input type="range" id="bulb" min="20" max="260" step="1" value="50" />
+    <label>Heater height <span class="val" id="bulbVal">58</span></label>
+    <input type="range" id="bulb" min="20" max="260" step="1" value="58" />
   </div>
 
   <div class="control">
@@ -249,18 +249,18 @@
   </div>
 
   <div class="control">
-    <label>Cooling <span class="val" id="acoolVal">2.20</span></label>
-    <input type="range" id="acool" min="0" max="6.0" step="0.05" value="2.20" />
+    <label>Cooling <span class="val" id="acoolVal">1.00</span></label>
+    <input type="range" id="acool" min="0" max="6.0" step="0.05" value="1.00" />
   </div>
 
   <div class="control">
-    <label>Bounce <span class="val" id="stVal">2.20</span></label>
-    <input type="range" id="st" min="0" max="5.0" step="0.01" value="2.20" />
+    <label>Bounce <span class="val" id="stVal">1.50</span></label>
+    <input type="range" id="st" min="0" max="5.0" step="0.01" value="1.50" />
   </div>
 
   <div class="control">
-    <label>Phase separation <span class="val" id="trVal">1.2</span></label>
-    <input type="range" id="tr" min="0" max="15" step="0.1" value="1.2" />
+    <label>Phase separation <span class="val" id="trVal">0.05</span></label>
+    <input type="range" id="tr" min="0" max="15" step="0.1" value="0.05" />
   </div>
 
   <div class="control">
@@ -269,8 +269,8 @@
   </div>
 
   <div class="control">
-    <label>Spring strength <span class="val" id="springVal">6.00</span></label>
-    <input type="range" id="spring" min="0" max="10.0" step="0.05" value="6.00" />
+    <label>Spring strength <span class="val" id="springVal">7.00</span></label>
+    <input type="range" id="spring" min="0" max="10.0" step="0.05" value="7.00" />
   </div>
 
   <div class="control">
@@ -289,13 +289,13 @@
   </div>
 
   <div class="control">
-    <label>Internal pressure <span class="val" id="pressureVal">2.00</span></label>
-    <input type="range" id="pressure" min="0" max="3.0" step="0.05" value="2.00" />
+    <label>Internal pressure <span class="val" id="pressureVal">2.10</span></label>
+    <input type="range" id="pressure" min="0" max="3.0" step="0.05" value="2.10" />
   </div>
 
   <div class="control">
-    <label>Viscosity <span class="val" id="viscVal">0.90</span></label>
-    <input type="range" id="visc" min="0" max="6.0" step="0.05" value="0.90" />
+    <label>Viscosity <span class="val" id="viscVal">1.45</span></label>
+    <input type="range" id="visc" min="0" max="6.0" step="0.05" value="1.45" />
   </div>
 
   <div class="control">
@@ -359,17 +359,17 @@ class SPH {
     // Kernel and core fluid params
     this.h = 26;                  // smoothing radius (px)
     this.mass = 1.1;
-    this.gasK = 2400 * 2.00;      // pressure stiffness
+    this.gasK = 2400 * 2.10;      // pressure stiffness
     this.viscosity = 0.2 / 26;    // base kinematic viscosity
-    this.viscScale = 0.50;        // user multiplier
+    this.viscScale = 1.45;        // user multiplier
     this.cohesion = 0.55;
     this.surfaceTensionScale = 1.60;
 
     // Distinct masses ("blobs")
     this.MAX_BLOBS = 32;
-    this.surfaceTension = 2.20;    // user multiplier for inter-blob repulsion
+    this.surfaceTension = 1.50;    // user multiplier for inter-blob repulsion
     this.interRepel = 60;
-    this.tempRepelMult = 1.2;
+    this.tempRepelMult = 0.05;
     this.connectDist = this.h * 0.82;
 
     // Pair-wise spring binding
@@ -379,7 +379,7 @@ class SPH {
     this.springMaxStretch = this.h * 0.4;
     this.springMin = this.h * 0.4;
     this.springReach = this.h * 1.3;
-    this.springScale = 6.00 / 2000;
+    this.springScale = 7.00 / 2000;
 
     // Sticky bottom layer
     this.stickyHeight = 90;
@@ -392,8 +392,14 @@ class SPH {
     this.poolDwellTau = 3.0;
     this.poolBarrierFloor = 0.05;
 
-    // Pinned wall particles
+    // Pool/wall particles — anchored by a heavily-damped harmonic oscillator
+    // (no longer fully pinned). Each particle is pulled back to its home
+    // position (set in reset()) by a stiff spring; per-substep velocity is
+    // multiplied by wallDampFactor so motion stays small and well-controlled.
     this.MAX_FIXED = 60;
+    this.wallSpringK    = 1500;   // restoring stiffness toward home
+    this.wallDampFactor = 0.30;   // velocity retained per substep (heavy)
+    this.wallMaxDisplace = 4.0;   // hard clamp on displacement (sim px)
 
     // Cushion zone
     this.cushionRange = this.h * 1.35;
@@ -421,10 +427,10 @@ class SPH {
     this.heatDiffScale = 2.50;
     this.interDiffRatio = 0.03;
     this.ambientCool = 0.01;
-    this.ambientCoolScale = 2.20;
+    this.ambientCoolScale = 1.00;
     this.heatNoise = 0.50;
     this.simTime = 0;
-    this.bulbHeight = 50;
+    this.bulbHeight = 58;
     this.edgeFactor = 0.10;
 
     this.restDensity = 1;
@@ -446,6 +452,9 @@ class SPH {
     this.cap = n;
     this.x  = new Float32Array(n);
     this.y  = new Float32Array(n);
+    // Home (anchor) position for pool/wall particles; fluid particles ignore.
+    this.homeX = new Float32Array(n);
+    this.homeY = new Float32Array(n);
     this.vx = new Float32Array(n);
     this.vy = new Float32Array(n);
     this.fx = new Float32Array(n);
@@ -559,6 +568,11 @@ class SPH {
       }
     }
     this.nFixed = this.n;
+    // Snapshot anchor positions for the pool oscillator.
+    for (let i = 0; i < this.nFixed; i++) {
+      this.homeX[i] = this.x[i];
+      this.homeY[i] = this.y[i];
+    }
 
     // 2) Place fluid particles above the pool
     const targetSpacing = this.h * 0.55;
@@ -1043,6 +1057,9 @@ class SPH {
     const sumFrx = this.sumFrx, sumFry = this.sumFry;
     const zoneDwell = this.zoneDwell;
 
+    // Pool-spring smooth transition band: spring stiffness blends from 1.0×
+    // above y=550 to 0.4× below y=570 as both endpoints descend through it.
+    const POOL_LO = 550, POOL_HI = 570, POOL_INV = 1.0 / (POOL_HI - POOL_LO);
     for (let i = 0; i < n; i++) {
       let fpx = 0, fpy = 0;
       let fvx = 0, fvy = 0;
@@ -1050,6 +1067,10 @@ class SPH {
       let frx = 0, fry = 0;
       let dTsum = 0, neighCount = 0;
       const xi = px[i], yi = py[i];
+      // Per-i "poolness" (smoothstep on yi). Computed once outside the j-loop.
+      const _siRaw = (yi - POOL_LO) * POOL_INV;
+      const _si = _siRaw < 0 ? 0 : _siRaw > 1 ? 1 : _siRaw;
+      const poolI = _si * _si * (3 - 2 * _si);
       const vxi = pvx[i], vyi = pvy[i];
       const Pi = ppres[i];
       const rhoi = pden[i];
@@ -1143,8 +1164,12 @@ class SPH {
                   const dvx = vxi - pvx[j];
                   const dvy = vyi - pvy[j];
                   const vAxial = (dvx * dx + dvy * dy) / r;
-                  // Halve spring force when both particles are in the pool
-                  const effSpringK = (yi > 540 && py[j] > 540) ? springK * 0.5 : springK;
+                  // Smoothly attenuate spring force as BOTH particles enter the
+                  // pool zone. effSpringK glides 1.0× → 0.4× as poolI·poolJ → 1.
+                  const _sjRaw = (py[j] - POOL_LO) * POOL_INV;
+                  const _sj = _sjRaw < 0 ? 0 : _sjRaw > 1 ? 1 : _sjRaw;
+                  const poolJ = _sj * _sj * (3 - 2 * _sj);
+                  const effSpringK = springK * (1 - 0.6 * poolI * poolJ);
                   if (r > springRest) {
                     const rawStretch = r - springRest;
                     const stretch = rawStretch < springMaxStretch ? rawStretch : springMaxStretch;
@@ -1196,7 +1221,41 @@ class SPH {
       }
     }
 
-    // 3) Integrate (fluid only — walls are pinned)
+    // 3a) Integrate pool/wall particles via heavily-damped harmonic
+    // oscillator anchored at each particle's home position. Forces from the
+    // fluid are honored, but the spring + heavy velocity damping + hard
+    // clamp keep displacement to a few pixels.
+    {
+      const wallK    = this.wallSpringK;
+      const wallDamp = this.wallDampFactor;
+      const wallMaxD = this.wallMaxDisplace;
+      const wallMaxD2 = wallMaxD * wallMaxD;
+      const homeX = this.homeX, homeY = this.homeY;
+      const invMassW = 1.0 / this.mass;
+      for (let i = 0; i < nFixed; i++) {
+        const dxh = px[i] - homeX[i];
+        const dyh = py[i] - homeY[i];
+        const fxw = this.fx[i] - wallK * dxh;
+        const fyw = this.fy[i] - wallK * dyh;
+        pvx[i] = (pvx[i] + fxw * dt * invMassW) * wallDamp;
+        pvy[i] = (pvy[i] + fyw * dt * invMassW) * wallDamp;
+        px[i] += pvx[i] * dt;
+        py[i] += pvy[i] * dt;
+        // Hard clamp: never let a pool particle drift far from home.
+        const ndx = px[i] - homeX[i];
+        const ndy = py[i] - homeY[i];
+        const nd2 = ndx * ndx + ndy * ndy;
+        if (nd2 > wallMaxD2) {
+          const s = wallMaxD / Math.sqrt(nd2);
+          px[i] = homeX[i] + ndx * s;
+          py[i] = homeY[i] + ndy * s;
+          pvx[i] = 0;
+          pvy[i] = 0;
+        }
+      }
+    }
+
+    // 3b) Integrate fluid particles
     const fluidBotY = SIM_H * 0.92;
     const stickyTop = fluidBotY - this.stickyHeight;
     const stickyDt = this.stickyStrength * dt;
@@ -1331,10 +1390,12 @@ function fragmentShaderSource() {
 precision highp float;
 
 uniform sampler2D uParticles;
+uniform sampler2D uCellRange;   // RGBA32F: r=start, g=count per grid cell
 uniform int   uCount;
 uniform vec2  uSim;     // simulation domain (px)
 uniform vec2  uRes;     // canvas size (px)
-uniform float uH;       // smoothing radius (sim px)
+uniform float uH;       // smoothing radius (sim px) — also = cellSize
+uniform ivec2 uGridDim; // active grid (cells wide, cells tall)
 uniform vec3  uBg;
 uniform vec3  uCold;
 uniform vec3  uHot;
@@ -1425,18 +1486,33 @@ void main() {
   for (int g = 0; g < MAX_G; g++) { fields[g] = 0.0; wtemps[g] = 0.0; }
   float h2 = uH * uH;
 
-  for (int i = 0; i < 700; i++) {
-    if (i >= uCount) break;
-    vec4 part = texelFetch(uParticles, ivec2(i, 0), 0);
-    vec2 d = simPos - part.xy;
-    float r2 = dot(d, d);
-    if (r2 < h2) {
-      float w = 1.0 - r2 / h2;
-      float k = w * w * w;
-      int g = int(part.w + 0.5);
-      g = clamp(g, 0, MAX_G - 1);
-      fields[g] += k;
-      wtemps[g] += k * part.z;
+  // Spatial-grid lookup: only visit particles in the 3x3 cell neighborhood
+  // around this pixel. cellSize == uH, so any particle within the kernel
+  // radius is guaranteed to live in one of these 9 cells.
+  ivec2 cellHere = ivec2(floor(simPos / uH));
+  for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+      ivec2 c = cellHere + ivec2(dx, dy);
+      if (c.x < 0 || c.y < 0 || c.x >= uGridDim.x || c.y >= uGridDim.y) continue;
+      vec2 range = texelFetch(uCellRange, c, 0).rg;
+      int start = int(range.x);
+      int count = int(range.y);
+      // Inner bound is the global particle cap so the GLSL compiler is
+      // happy with a static loop bound; the early break is the real exit.
+      for (int j = 0; j < 700; j++) {
+        if (j >= count) break;
+        vec4 part = texelFetch(uParticles, ivec2(start + j, 0), 0);
+        vec2 d = simPos - part.xy;
+        float r2 = dot(d, d);
+        if (r2 < h2) {
+          float w = 1.0 - r2 / h2;
+          float k = w * w * w;
+          int g = int(part.w + 0.5);
+          g = clamp(g, 0, MAX_G - 1);
+          fields[g] += k;
+          wtemps[g] += k * part.z;
+        }
+      }
     }
   }
 
@@ -1699,7 +1775,9 @@ class MetaballRenderer {
     gl.enableVertexAttribArray(aPos);
     gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
-    // Particle texture (each texel: x, y, temperature, _)
+    // Particle texture (each texel: x, y, temperature, groupId)
+    // Particles are uploaded each frame in cell-sorted order so the
+    // shader can do an O(1) range lookup per cell.
     this.tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -1710,14 +1788,47 @@ class MetaballRenderer {
 
     this.pixData = new Float32Array(maxParticles * 4);
 
+    // -------- Spatial grid (CPU → shader) --------
+    // cellSize equals the kernel radius h_render = sim.h * renderScale.
+    // The smallest cellSize the UI permits is sim.h (=26) * renderScale_min
+    // (=0.7) ≈ 18.2, which gives ceil(380/18.2)=21 wide and ceil(700/18.2)=39
+    // tall. We allocate 32 × 48 with margin so the texture is fixed-size
+    // and re-uploads are just texSubImage updates.
+    this.MAX_GRID_W = 32;
+    this.MAX_GRID_H = 48;
+    const gridCells = this.MAX_GRID_W * this.MAX_GRID_H;
+
+    // Use RGBA32F (not RG32F): identical format to the particle texture,
+    // which we know samples correctly on this driver. We only fill R and
+    // G; B and A are unused. The 2x memory cost is trivial (~24 KB).
+    this.cellRangeTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.cellRangeTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F,
+                  this.MAX_GRID_W, this.MAX_GRID_H, 0,
+                  gl.RGBA, gl.FLOAT, null);
+
+    // Scratch buffers for the per-frame counting sort.
+    this.cellCount     = new Int32Array(gridCells);
+    this.cellStart     = new Int32Array(gridCells);
+    this.cellTmpOffset = new Int32Array(gridCells);
+    this.particleCell  = new Int32Array(maxParticles);
+    // 4 floats per cell to match RGBA32F; only .r and .g are populated.
+    this.cellRangeData = new Float32Array(gridCells * 4);
+
     // Uniforms
     this.uloc = (n) => gl.getUniformLocation(prog, n);
     this.u = {
       particles:   this.uloc("uParticles"),
+      cellRange:   this.uloc("uCellRange"),
       count:       this.uloc("uCount"),
       sim:         this.uloc("uSim"),
       res:         this.uloc("uRes"),
       h:           this.uloc("uH"),
+      gridDim:     this.uloc("uGridDim"),
       bg:          this.uloc("uBg"),
       cold:        this.uloc("uCold"),
       hot:         this.uloc("uHot"),
@@ -1732,27 +1843,96 @@ class MetaballRenderer {
   render(sim, params) {
     const gl = this.gl;
     const n = sim.n;
-    const data = this.pixData;
+
+    // -------- 1. Counting-sort particles into spatial grid cells --------
+    // cellSize == kernel radius the shader uses (uH). With this choice,
+    // every particle that can contribute to a pixel lives in the pixel's
+    // cell or one of the 8 neighbors → 3×3 cell sweep is exact.
+    const hRender = sim.h * (sim.renderScale || 1.0);
+    const cellSize = Math.max(hRender, 1.0);
+    const MAX_GW = this.MAX_GRID_W;
+    const MAX_GH = this.MAX_GRID_H;
+    const gridW = Math.min(MAX_GW, Math.max(1, Math.ceil(SIM_W / cellSize)));
+    const gridH = Math.min(MAX_GH, Math.max(1, Math.ceil(SIM_H / cellSize)));
+    const numCells = gridW * gridH;
+    const invCell = 1.0 / cellSize;
+
+    const cellCount = this.cellCount;
+    const cellStart = this.cellStart;
+    const tmpOffset = this.cellTmpOffset;
+    const partCell  = this.particleCell;
+
+    // (a) Count particles per active cell + record cell index per particle
+    for (let c = 0; c < numCells; c++) cellCount[c] = 0;
+    const sx = sim.x, sy = sim.y;
     for (let i = 0; i < n; i++) {
-      data[i*4    ] = sim.x[i];
-      data[i*4 + 1] = sim.y[i];
-      data[i*4 + 2] = sim.temp[i];
-      data[i*4 + 3] = sim.groupId[i];   // group ID for per-blob rendering
+      let cx = (sx[i] * invCell) | 0;
+      let cy = (sy[i] * invCell) | 0;
+      if (cx < 0) cx = 0; else if (cx >= gridW) cx = gridW - 1;
+      if (cy < 0) cy = 0; else if (cy >= gridH) cy = gridH - 1;
+      const c = cy * gridW + cx;
+      partCell[i] = c;
+      cellCount[c]++;
     }
+    // (b) Prefix sum → cellStart
+    let total = 0;
+    for (let c = 0; c < numCells; c++) {
+      cellStart[c] = total;
+      total += cellCount[c];
+      tmpOffset[c] = 0;
+    }
+    // (c) Scatter into cell-sorted particle data
+    const data = this.pixData;
+    const stemp = sim.temp, sgroup = sim.groupId;
+    for (let i = 0; i < n; i++) {
+      const c = partCell[i];
+      const dst = (cellStart[c] + tmpOffset[c]) << 2;  // ×4
+      data[dst    ] = sx[i];
+      data[dst + 1] = sy[i];
+      data[dst + 2] = stemp[i];
+      data[dst + 3] = sgroup[i];
+      tmpOffset[c]++;
+    }
+    // (d) Build cellRange texture (RGBA32F: r=start, g=count, b/a unused)
+    // — laid out with MAX_GRID_W stride, only active gridW × gridH region
+    // populated.
+    const rangeData = this.cellRangeData;
+    // Zero the rows we'll touch (cheaper than zeroing the whole array).
+    const rowStride = MAX_GW * 4;
+    const activeRowEnd = gridH * rowStride;
+    for (let i = 0; i < activeRowEnd; i++) rangeData[i] = 0;
+    for (let cy = 0; cy < gridH; cy++) {
+      const rowBase = cy * rowStride;
+      const cellRowBase = cy * gridW;
+      for (let cx = 0; cx < gridW; cx++) {
+        const t = rowBase + (cx << 2);
+        const c = cellRowBase + cx;
+        rangeData[t    ] = cellStart[c];
+        rangeData[t + 1] = cellCount[c];
+      }
+    }
+
+    // -------- 2. Upload textures (always reset active unit first) --------
+    gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
-    // Upload only the active particle count, not the full maxParticles texture width
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, n, 1, gl.RGBA, gl.FLOAT, data, 0);
 
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.cellRangeTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_GW, gridH, gl.RGBA, gl.FLOAT, rangeData, 0);
+
+    // -------- 3. Draw --------
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.useProgram(this.program);
     gl.bindVertexArray(this.vao);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.tex);
+    // Textures are already bound on units 0/1 from the upload above.
     gl.uniform1i(this.u.particles, 0);
+    if (this.u.cellRange) gl.uniform1i(this.u.cellRange, 1);
     gl.uniform1i(this.u.count, n);
     gl.uniform2f(this.u.sim, SIM_W, SIM_H);
     gl.uniform2f(this.u.res, this.canvas.width, this.canvas.height);
-    gl.uniform1f(this.u.h, sim.h * (sim.renderScale || 1.0));
+    gl.uniform1f(this.u.h, hRender);
+    if (this.u.gridDim) gl.uniform2i(this.u.gridDim, gridW, gridH);
     gl.uniform3fv(this.u.bg, params.bg);
     gl.uniform3fv(this.u.cold, params.cold);
     gl.uniform3fv(this.u.hot, params.hot);
@@ -1985,6 +2165,72 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
+
+// -------- Benchmark mode (?bench=<seconds>) --------
+// Records every rAF timestamp for the configured duration, then writes a
+// summary to document.title and an on-page panel. First 60 frames are
+// dropped as JIT warmup. Read progress externally via the tab title.
+(() => {
+  const benchSec = parseFloat(new URLSearchParams(location.search).get("bench"));
+  if (!benchSec || benchSec <= 0) return;
+  const WARMUP_FRAMES = 60;
+  const ts = [];   // rAF timestamps after warmup
+  let warm = 0;
+  let lastTitleSec = -1;
+  let benchStart = -1;
+  function pct(sortedArr, p) {
+    return sortedArr[Math.min(sortedArr.length - 1, Math.floor(sortedArr.length * p))];
+  }
+  function snapshotStats(timestamps) {
+    if (timestamps.length < 2) return null;
+    const ft = new Float64Array(timestamps.length - 1);
+    for (let i = 1; i < timestamps.length; i++) ft[i - 1] = timestamps[i] - timestamps[i - 1];
+    const sorted = Array.from(ft).sort((a, b) => a - b);
+    const sum = sorted.reduce((a, b) => a + b, 0);
+    const mean = sum / sorted.length;
+    return {
+      frames: ft.length,
+      sec: sum / 1000,
+      fps: ft.length / (sum / 1000),
+      mean, min: sorted[0], max: sorted[sorted.length - 1],
+      p50: pct(sorted, 0.50), p95: pct(sorted, 0.95), p99: pct(sorted, 0.99),
+    };
+  }
+  function fmt(s) {
+    return `frames=${s.frames} sec=${s.sec.toFixed(1)} fps=${s.fps.toFixed(1)} `
+      + `mean=${s.mean.toFixed(2)}ms p50=${s.p50.toFixed(2)} p95=${s.p95.toFixed(2)} `
+      + `p99=${s.p99.toFixed(2)} min=${s.min.toFixed(2)} max=${s.max.toFixed(2)} n=${sim.n}`;
+  }
+  function tick(now) {
+    if (warm < WARMUP_FRAMES) { warm++; requestAnimationFrame(tick); return; }
+    if (benchStart < 0) benchStart = now;
+    ts.push(now);
+    const elapsed = (now - benchStart) / 1000;
+    if (elapsed >= benchSec) {
+      const s = snapshotStats(ts);
+      const summary = "BENCH " + fmt(s);
+      document.title = summary;
+      const div = document.createElement("div");
+      div.id = "__benchPanel";
+      div.style.cssText = "position:fixed;top:10px;left:10px;right:10px;z-index:9999;"
+        + "background:#0f1f10;color:#a8ffa8;font:12px ui-monospace,monospace;"
+        + "padding:12px 14px;border:1px solid #5fbf60;border-radius:8px;"
+        + "white-space:pre-wrap;";
+      div.textContent = summary;
+      document.body.appendChild(div);
+      console.log(summary);
+      return;  // stop bench loop; main frame() loop continues
+    }
+    const sec = Math.floor(elapsed);
+    if (sec !== lastTitleSec) {
+      lastTitleSec = sec;
+      const s = snapshotStats(ts);
+      if (s) document.title = `bench t=${sec}/${benchSec}s ${fmt(s)}`;
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+})();
 </script>
 </body>
 </html>
