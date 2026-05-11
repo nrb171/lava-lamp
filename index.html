@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Lava Lamp — SPH Fluid Simulation</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
 <style>
   :root {
     --bg: #0a0612;
@@ -238,6 +239,10 @@
       <label>Hot wax</label>
       <input type="color" id="hotColor" value="#ffcf3a" />
     </div>
+    <div class="control">
+      <label>Compress</label>
+      <input type="color" id="compColor" value="#FFE0B0" />
+    </div>
   </div>
 
   <div class="control">
@@ -301,8 +306,29 @@
   </div>
 
   <div class="control">
-    <label>Spring strength <span class="val" id="springVal">7.00</span></label>
-    <input type="range" id="spring" min="0" max="10.0" step="0.05" value="7.00" />
+    <label>Spring strength <span class="val" id="springVal">6.00</span></label>
+    <input type="range" id="spring" min="0" max="10.0" step="0.05" value="6.00" />
+  </div>
+
+  <div class="control" style="margin-bottom:2px">
+    <label>Pool spring zone <span class="val" id="poolZoneVal">480–580</span></label>
+  </div>
+  <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px">
+    <canvas id="poolRampViz" width="200" height="60" style="border:1px solid rgba(255,255,255,0.15);border-radius:4px;flex-shrink:0"></canvas>
+    <div style="display:flex;flex-direction:column;gap:4px;flex:1;min-width:0">
+      <div class="control" style="margin:0">
+        <label style="font-size:10px">Top (Lo) <span class="val" id="poolLoVal">480</span></label>
+        <input type="range" id="poolLo" min="300" max="600" step="5" value="480" />
+      </div>
+      <div class="control" style="margin:0">
+        <label style="font-size:10px">Bottom (Hi) <span class="val" id="poolHiVal">580</span></label>
+        <input type="range" id="poolHi" min="350" max="650" step="5" value="580" />
+      </div>
+      <div class="control" style="margin:0">
+        <label style="font-size:10px">Atten <span class="val" id="poolAttenVal">0.50</span></label>
+        <input type="range" id="poolAtten" min="0" max="1.0" step="0.05" value="0.50" />
+      </div>
+    </div>
   </div>
 
   <div class="control">
@@ -321,8 +347,8 @@
   </div>
 
   <div class="control">
-    <label>Internal pressure <span class="val" id="pressureVal">2.10</span></label>
-    <input type="range" id="pressure" min="0" max="3.0" step="0.05" value="2.10" />
+    <label>Internal pressure <span class="val" id="pressureVal">2.60</span></label>
+    <input type="range" id="pressure" min="0" max="3.0" step="0.05" value="2.60" />
   </div>
 
   <div class="control">
@@ -333,6 +359,11 @@
   <div class="control">
     <label>Particle count <span class="val" id="countVal">160</span></label>
     <input type="range" id="count" min="60" max="600" step="10" value="160" />
+  </div>
+
+  <div class="control" style="display:flex;align-items:center;gap:6px">
+    <input type="checkbox" id="volAbsorb" checked />
+    <label for="volAbsorb" style="cursor:pointer">Volumetric absorption</label>
   </div>
 
   <button id="reset">Reset simulation</button>
@@ -391,7 +422,7 @@ class SPH {
     // Kernel and core fluid params
     this.h = 26;                  // smoothing radius (px)
     this.mass = 1.1;
-    this.gasK = 2400 * 2.10;      // pressure stiffness
+    this.gasK = 2400 * 2.60;      // pressure stiffness
     this.viscosity = 0.2 / 26;    // base kinematic viscosity
     this.viscScale = 1.45;        // user multiplier
     this.cohesion = 0.55;
@@ -411,7 +442,12 @@ class SPH {
     this.springMaxStretch = this.h * 0.4;
     this.springMin = this.h * 0.4;
     this.springReach = this.h * 1.3;
-    this.springScale = 7.00 / 2000;
+    this.springScale = 6.00 / 2000;
+
+    // Pool-zone spring attenuation band (y-space)
+    this.poolSpringLo = 480;   // spring starts fading here
+    this.poolSpringHi = 580;   // spring is at minimum here
+    this.poolSpringAtten = 0.5; // multiply spring by this in pool (0.5 = half)
 
     // Sticky bottom layer
     this.stickyHeight = 90;
@@ -516,6 +552,7 @@ class SPH {
     this.fx = new Float32Array(n);
     this.fy = new Float32Array(n);
     this.density  = new Float32Array(n);
+    this.compression = new Float32Array(n);  // per-particle compression ratio
     this.pressure = new Float32Array(n);
     this.temp = new Float32Array(n);
     this.dT   = new Float32Array(n);
@@ -1083,6 +1120,9 @@ class SPH {
       if (rho < this.restDensity) rho = this.restDensity;
       pden[i] = rho;
       ppres[i] = this.gasK * (rho - this.restDensity);
+      // Compression ratio: 0 at rest density, rises as particle is squeezed.
+      const cRaw = rho / this.restDensity - 1.0;
+      this.compression[i] = cRaw > 3.0 ? 3.0 : (cRaw > 0 ? cRaw : 0);
     }
 
     // Reset per-blob inter-blob force accumulators
@@ -1113,9 +1153,10 @@ class SPH {
     const sumFrx = this.sumFrx, sumFry = this.sumFry;
     const zoneDwell = this.zoneDwell;
 
-    // Pool-spring smooth transition band: spring stiffness blends from 1.0×
-    // above y=550 to 0.4× below y=570 as both endpoints descend through it.
-    const POOL_LO = 550, POOL_HI = 570, POOL_INV = 1.0 / (POOL_HI - POOL_LO);
+    // Pool-spring cosine ramp: spring stiffness blends from 1.0×
+    // above poolSpringLo to (1-atten)× below poolSpringHi.
+    const POOL_LO = this.poolSpringLo, POOL_HI = this.poolSpringHi, POOL_INV = 1.0 / (POOL_HI - POOL_LO);
+    const poolSpringAtten = this.poolSpringAtten;
     for (let i = 0; i < n; i++) {
       let fpx = 0, fpy = 0;
       let fvx = 0, fvy = 0;
@@ -1123,10 +1164,10 @@ class SPH {
       let frx = 0, fry = 0;
       let dTsum = 0, neighCount = 0;
       const xi = px[i], yi = py[i];
-      // Per-i "poolness" (smoothstep on yi). Computed once outside the j-loop.
+      // Per-i "poolness" (cosine ramp on yi). Computed once outside the j-loop.
       const _siRaw = (yi - POOL_LO) * POOL_INV;
       const _si = _siRaw < 0 ? 0 : _siRaw > 1 ? 1 : _siRaw;
-      const poolI = _si * _si * (3 - 2 * _si);
+      const poolI = 0.5 * (1 - Math.cos(Math.PI * _si));
       const vxi = pvx[i], vyi = pvy[i];
       const Pi = ppres[i];
       const rhoi = pden[i];
@@ -1221,11 +1262,11 @@ class SPH {
                   const dvy = vyi - pvy[j];
                   const vAxial = (dvx * dx + dvy * dy) / r;
                   // Smoothly attenuate spring force as BOTH particles enter the
-                  // pool zone. effSpringK glides 1.0× → 0.4× as poolI·poolJ → 1.
+                  // pool zone. effSpringK glides 1.0× → 0.5× as poolI·poolJ → 1.
                   const _sjRaw = (py[j] - POOL_LO) * POOL_INV;
                   const _sj = _sjRaw < 0 ? 0 : _sjRaw > 1 ? 1 : _sjRaw;
-                  const poolJ = _sj * _sj * (3 - 2 * _sj);
-                  const effSpringK = springK * (1 - 0.6 * poolI * poolJ);
+                  const poolJ = 0.5 * (1 - Math.cos(Math.PI * _sj));
+                  const effSpringK = springK * (1 - poolSpringAtten * poolI * poolJ);
                   if (r > springRest) {
                     const rawStretch = r - springRest;
                     const stretch = rawStretch < springMaxStretch ? rawStretch : springMaxStretch;
@@ -1558,6 +1599,10 @@ uniform float uTime;
 uniform float uBlobZ[32];
 uniform float uBlobSize[32];
 uniform int   uPoolGroupId;
+uniform vec3  uCompressColor;  // accent color for high-compression zones
+uniform sampler2D uColMass;   // 2D mass grid (NUM_COLS × NUM_ROWS), normalized 0-1
+uniform int   uNumCols;       // grid columns (50)
+uniform int   uNumRows;       // grid rows (30)
 
 out vec4 fragColor;
 
@@ -1633,11 +1678,12 @@ void main() {
   float cx = uSim.x * 0.5;
   float distFromCenter = abs(simPos.x - cx);
 
-  // -------- Per-blob metaball field & temperature ---------
+  // -------- Per-blob metaball field, temperature & compression ---------
   const int MAX_G = 32;
   float fields[MAX_G];
   float wtemps[MAX_G];
-  for (int g = 0; g < MAX_G; g++) { fields[g] = 0.0; wtemps[g] = 0.0; }
+  float wcomps[MAX_G];  // weighted compression per group
+  for (int g = 0; g < MAX_G; g++) { fields[g] = 0.0; wtemps[g] = 0.0; wcomps[g] = 0.0; }
   float h2 = uH * uH;
 
   // Spatial-grid lookup: only visit particles in the 3x3 cell neighborhood
@@ -1655,7 +1701,9 @@ void main() {
       // happy with a static loop bound; the early break is the real exit.
       for (int j = 0; j < 700; j++) {
         if (j >= count) break;
-        vec4 part = texelFetch(uParticles, ivec2(start + j, 0), 0);
+        int idx = start + j;
+        vec4 part = texelFetch(uParticles, ivec2(idx, 0), 0);
+        float comp = texelFetch(uParticles, ivec2(idx, 1), 0).r;  // compression from row 1
         vec2 d = simPos - part.xy;
         float r2 = dot(d, d);
         if (r2 < h2) {
@@ -1665,6 +1713,7 @@ void main() {
           g = clamp(g, 0, MAX_G - 1);
           fields[g] += k;
           wtemps[g] += k * part.z;
+          wcomps[g] += k * comp;
         }
       }
     }
@@ -1695,6 +1744,13 @@ void main() {
   if (frontDom >= 0) dom = frontDom;
   float field = fields[dom];
   float temp = field > 0.001 ? (wtemps[dom] / field) : 0.18;
+  // Average compression for the dominant blob at this pixel
+  float compAvg = field > 0.001 ? (wcomps[dom] / field) : 0.0;
+  // Smooth onset: ramp from 0 at comp=0.3 to 1 at comp=1.5
+  // Log scale: compresses high values so medium blobs are visible
+  // but large blobs don't blow out. Range: ~0 at rest → ~0.7 at heavy compression.
+  float compRaw = max(compAvg - 0.2, 0.0);  // dead zone below 0.2
+  float compIntensity = log(1.0 + compRaw * 3.0) / log(4.0);
 
   // -------- Bottle / fluid masks ---------
   float glassEdgeSoft = 1.5;
@@ -1717,12 +1773,23 @@ void main() {
   vec3 poolBlockColor = mix(uCold, uHot, 0.45) * mix(0.55, 1.15, pow(t, 1.4));
   fluidBg = mix(fluidBg, poolBlockColor, poolBlockMask);
 
+  // -------- (God rays placeholder — disabled, see git history) ---------
+
   // -------- Wax shading from temperature ---------
   float tempN = clamp((temp - 0.18) / 0.85, 0.0, 1.0);
   vec3 waxColor = mix(uCold, uHot, smoothstep(0.0, 1.0, tempN));
   float lightFromBelow = mix(0.55, 1.15, pow(t, 1.4));
   waxColor *= lightFromBelow;
   waxColor = pow(waxColor, vec3(0.95));
+
+  // -------- Compression: boost existing color ---------
+  // Under pressure, brighten and saturate the current wax color
+  // rather than injecting a foreign accent. This looks natural
+  // at any temperature — hot wax glows hotter, cool wax gets richer.
+  float compLuma = dot(waxColor, vec3(0.299, 0.587, 0.114));
+  vec3 compSaturated = waxColor / max(compLuma, 0.01) * compLuma;
+  // Boost: brighten by up to 40% and increase saturation
+  waxColor = mix(waxColor, waxColor * 1.4 + (waxColor - vec3(compLuma)) * 0.5, compIntensity * 0.6);
 
   // -------- Physically-based spherical refractivity ---------
   float blobSz = clamp(uBlobSize[dom], 0.0, 1.0);
@@ -1731,68 +1798,45 @@ void main() {
   float alpha = smoothstep(threshold - 0.18, threshold + 0.04, field);
 
   // shell: 1 at the metaball boundary, 0 deep inside
-  // This approximates cos(theta) for a sphere where theta is the
-  // angle between the view ray and the surface normal
   float centerness = smoothstep(threshold + 0.20, threshold + 0.55, field);
   float shell = 1.0 - centerness;
 
   // cosTheta: 1 at center (looking straight through), 0 at rim (glancing)
-  // This is our proxy for the dot(view, normal) on a sphere
   float cosTheta = centerness;
 
   // ---- Fresnel reflectance at the wax-fluid interface ----
-  // At the rim (glancing angles), more light reflects off the surface;
-  // at the center (normal incidence), light passes through.
-  // R0 for paraffin/fluid ≈ 0.001 — very little reflection at normal,
-  // but rises steeply at glancing angles (the characteristic rim gleam).
   float fresnel = fresnelSchlick(cosTheta);
 
-  // Edge darkening from Fresnel: the rim reflects surrounding (dark)
-  // fluid back at the viewer, darkening the silhouette edge.
-  // Scaled by blob size — small drops have less visible curvature.
-  float edgeDarken = 1.0 - fresnel * 0.6 * blobSz;
+  // ---- Pressure rim glow ----
+  // Under compression, the rim brightens with the wax's own color
+  // instead of going dark from Fresnel — like the wax is glowing hot.
+  float pressureRim = shell * compIntensity * 1.8;
+  waxColor += waxColor * pressureRim * 0.5;
+
+  // Edge darkening from Fresnel — reduced under compression.
+  float edgeDarken = 1.0 - fresnel * 0.6 * blobSz * (1.0 - compIntensity * 0.7);
   waxColor *= edgeDarken;
 
   // ---- Refraction-based specular highlight ----
-  // A physically-motivated highlight: light from the bulb below enters
-  // the sphere, refracts at the curved surface, and concentrates into
-  // a caustic bright spot offset toward the top. The Fresnel term
-  // modulates intensity (more light enters at normal incidence).
-  // Snell's law compresses the highlight — higher n = tighter caustic.
   float cosRefracted = snellRefract(cosTheta);
-  // The caustic concentration factor: ratio of solid angles maps to
-  // (cosTheta / cosRefracted), which is > 1 for n > 1 — light is
-  // compressed into a smaller cone inside the sphere.
   float causticConcentration = cosTheta / max(0.01, cosRefracted);
-  float specBase = pow(centerness, mix(5.0, 2.5, blobSz));
-  float specStrength = mix(0.08, 0.25, blobSz);
-  // Modulate by (1 - fresnel) since reflected light doesn't enter
+  // Under compression: specular intensifies
+  float compSpecBoost = 1.0 + compIntensity * 1.5;
+  float specBase = pow(centerness, mix(5.0, 2.5, blobSz) * (1.0 - compIntensity * 0.15));
+  float specStrength = mix(0.08, 0.25, blobSz) * compSpecBoost;
   float highlight = specBase * specStrength * (1.0 - fresnel) *
                     min(2.0, causticConcentration);
-  waxColor += vec3(1.0, 0.95, 0.85) * highlight;
+  // Specular tinted by the wax color itself — warm highlight on warm wax,
+  // cool highlight on cool wax.
+  vec3 specTint = mix(vec3(1.0, 0.95, 0.85), waxColor * 2.0 + vec3(0.3), compIntensity * 0.6);
+  waxColor += specTint * highlight;
 
-  // ---- Refraction-based translucency ----
-  // Light passing through the sphere is attenuated by path length.
-  // At the center the path is longest (most absorption → more opaque
-  // wax color); at the rim the path through wax is short but Fresnel
-  // reflection dominates. The net effect: hot wax glows through at
-  // the center where the bulb light enters, rim stays crisp.
-  //
-  // Effective optical path through a sphere: proportional to cosTheta
-  // (longest at center). Beer-Lambert-style absorption:
-  float opticalPath = cosTheta * mix(1.5, 2.5, blobSz);
-  float transmission = exp(-opticalPath * 0.4); // 0.4 = absorption coeff
-  // Core translucency: blend toward transparent at center for hot wax,
-  // letting the bulb glow show through. Modulated by temperature
-  // (hot wax is more fluid and translucent) and by transmission.
-  float coreTranslucency = mix(0.30, 0.55, blobSz);
-  alpha *= 1.0 - centerness * coreTranslucency * tempN * (1.0 - transmission * 0.5);
-
-  // ---- Fresnel rim boost ----
-  // At glancing angles, total internal reflection makes the silhouette
-  // edge crisper — more light bounces back from inside the sphere.
-  float fresnelBoost = fresnel * 0.20 * blobSz;
-  alpha = min(1.0, alpha + fresnelBoost * step(threshold, field));
+  // ---- Uniform translucency + pressure opacity ----
+  // Base 10% transparency, plus a soft center fade so the core
+  // of each blob feels translucent rather than a solid disc.
+  alpha *= 0.90;
+  alpha *= 1.0 - centerness * 0.30;
+  alpha *= 1.0 - compIntensity * 0.65;
 
   // Inner core detail
   float coreAlpha = smoothstep(threshold + 0.05, threshold + 0.55, field);
@@ -1805,11 +1849,7 @@ void main() {
     float otherTempN = clamp((otherTemp - 0.18) / 0.85, 0.0, 1.0);
     vec3 otherWax = mix(uCold, uHot, smoothstep(0.0, 1.0, otherTempN)) * lightFromBelow;
     float otherAlpha = smoothstep(threshold - 0.18, threshold + 0.04, otherFieldRaw);
-    float otherCenterness = smoothstep(threshold + 0.20, threshold + 0.55, otherFieldRaw);
-    // Apply Fresnel-based translucency to back blob too
-    float otherCosTheta = otherCenterness;
-    float otherFresnel = fresnelSchlick(otherCosTheta);
-    otherAlpha *= 1.0 - otherCenterness * 0.45 * otherTempN;
+    otherAlpha *= 0.90;
     fluidBg = mix(fluidBg, otherWax, otherAlpha);
   }
 
@@ -1929,7 +1969,9 @@ class MetaballRenderer {
     gl.enableVertexAttribArray(aPos);
     gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
-    // Particle texture (each texel: x, y, temperature, groupId)
+    // Particle texture (2 rows):
+    //   Row 0: (x, y, temperature, groupId) per particle
+    //   Row 1: (compression, 0, 0, 0) per particle
     // Particles are uploaded each frame in cell-sorted order so the
     // shader can do an O(1) range lookup per cell.
     this.tex = gl.createTexture();
@@ -1938,9 +1980,10 @@ class MetaballRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, maxParticles, 1, 0, gl.RGBA, gl.FLOAT, null);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, maxParticles, 2, 0, gl.RGBA, gl.FLOAT, null);
 
     this.pixData = new Float32Array(maxParticles * 4);
+    this.compData = new Float32Array(maxParticles * 4);  // row 1: compression
 
     // -------- Spatial grid (CPU → shader) --------
     // cellSize equals the kernel radius h_render = sim.h * renderScale.
@@ -1973,6 +2016,24 @@ class MetaballRenderer {
     // 4 floats per cell to match RGBA32F; only .r and .g are populated.
     this.cellRangeData = new Float32Array(gridCells * 4);
 
+    // -------- 2D mass grid (50 cols × 30 rows) --------
+    // Each cell accumulates wax mass at that (x, y) region.
+    // A mass-dependent horizontal blur simulates light scattering:
+    // dense regions stay sharp, sparse regions spread.
+    this.NUM_COLS = 50;
+    this.NUM_ROWS = 30;
+    this.colMassTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.colMassTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F,
+                  this.NUM_COLS, this.NUM_ROWS, 0, gl.RGBA, gl.FLOAT, null);
+    this.colMassData = new Float32Array(this.NUM_COLS * this.NUM_ROWS * 4);
+    // Smoothed 2D mass grid for temporal stability
+    this.colMassSmooth = new Float32Array(this.NUM_COLS * this.NUM_ROWS);
+
     // Uniforms
     this.uloc = (n) => gl.getUniformLocation(prog, n);
     this.u = {
@@ -1991,6 +2052,10 @@ class MetaballRenderer {
       blobZ:       this.uloc("uBlobZ"),
       blobSize:    this.uloc("uBlobSize"),
       poolGroupId: this.uloc("uPoolGroupId"),
+      compressColor: this.uloc("uCompressColor"),
+      colMass:       this.uloc("uColMass"),
+      numCols:       this.uloc("uNumCols"),
+      numRows:       this.uloc("uNumRows"),
     };
   }
 
@@ -2035,16 +2100,24 @@ class MetaballRenderer {
       total += cellCount[c];
       tmpOffset[c] = 0;
     }
-    // (c) Scatter into cell-sorted particle data
+    // (c) Scatter into cell-sorted particle data (row 0 + compression row 1)
     const data = this.pixData;
+    const compRow = this.compData;
     const stemp = sim.temp, sgroup = sim.groupId;
+    const scomp = sim.compression;
     for (let i = 0; i < n; i++) {
       const c = partCell[i];
-      const dst = (cellStart[c] + tmpOffset[c]) << 2;  // ×4
+      const slot = cellStart[c] + tmpOffset[c];
+      const dst = slot << 2;  // ×4
       data[dst    ] = sx[i];
       data[dst + 1] = sy[i];
       data[dst + 2] = stemp[i];
       data[dst + 3] = sgroup[i];
+      // Row 1: compression in R channel
+      compRow[dst    ] = scomp[i];
+      compRow[dst + 1] = 0;
+      compRow[dst + 2] = 0;
+      compRow[dst + 3] = 0;
       tmpOffset[c]++;
     }
     // (d) Build cellRange texture (RGBA32F: r=start, g=count, b/a unused)
@@ -2066,14 +2139,109 @@ class MetaballRenderer {
       }
     }
 
+    // -------- 1b. 2D mass grid for volumetric background modulation --------
+    const NC = this.NUM_COLS;
+    const NR = this.NUM_ROWS;
+    const colData = this.colMassData;
+    const colSmooth = this.colMassSmooth;
+    const volAbsorbOn = params.volAbsorb !== false;
+    if (!volAbsorbOn) {
+      // Skip all mass computation — zero the texture and jump ahead
+      colData.fill(0);
+    } else {
+    // Step 1: Bin particles into a 2D grid (NUM_COLS × NUM_ROWS).
+    const colW = SIM_W / NC;
+    const rowH = SIM_H / NR;
+    const gridSize = NC * NR;
+    const massRaw = new Float32Array(gridSize);   // scratch
+    const nFixed = sim.nFixed;
+    for (let i = nFixed; i < n; i++) {
+      const ci = (sx[i] / colW) | 0;
+      const ri = (sy[i] / rowH) | 0;
+      const c0 = ci < 0 ? 0 : ci >= NC ? NC - 1 : ci;
+      const r0 = ri < 0 ? 0 : ri >= NR ? NR - 1 : ri;
+      // Spread to ±1 in each axis (cross-shaped kernel)
+      const idx = r0 * NC + c0;
+      massRaw[idx] += 1.0;
+      // Vertical neighbors (±1 row)
+      if (r0 > 0)      massRaw[idx - NC] += 0.25;
+      if (r0 < NR - 1) massRaw[idx + NC] += 0.25;
+      // Horizontal neighbors (±1 col)
+      if (c0 > 0)      massRaw[idx - 1] += 0.25;
+      if (c0 < NC - 1) massRaw[idx + 1] += 0.25;
+    }
+
+    // Step 2: Mass-dependent horizontal blur.
+    // More mass at a cell → tighter kernel (less blur, sharper shadow).
+    // Less mass → wider kernel (more diffuse scattering).
+    const blurred = new Float32Array(gridSize);
+    const MAX_RADIUS = 4;   // max blur radius in cells (for sparse regions)
+    const MIN_RADIUS = 0;   // no blur for very dense regions
+    for (let r = 0; r < NR; r++) {
+      const rowOff = r * NC;
+      for (let c = 0; c < NC; c++) {
+        // Local mass determines blur radius: high mass → small radius
+        // Also look at ±1 row for vertical context ("a few levels behind it")
+        let localMass = massRaw[rowOff + c];
+        if (r > 0)      localMass += massRaw[rowOff - NC + c] * 0.5;
+        if (r < NR - 1) localMass += massRaw[rowOff + NC + c] * 0.5;
+        // Map mass to blur radius: 0 mass → MAX_RADIUS, high mass → MIN_RADIUS
+        const massFactor = Math.min(localMass / 6.0, 1.0);  // saturate at ~6 particles
+        const radius = Math.round(MAX_RADIUS * (1.0 - massFactor) + MIN_RADIUS * massFactor);
+        // Box blur with computed radius
+        let sum = 0, weight = 0;
+        for (let dc = -radius; dc <= radius; dc++) {
+          const cc = c + dc;
+          if (cc >= 0 && cc < NC) {
+            const w = 1.0 - Math.abs(dc) / (radius + 1);  // triangular weight
+            sum += massRaw[rowOff + cc] * w;
+            weight += w;
+          }
+        }
+        blurred[rowOff + c] = weight > 0 ? sum / weight : 0;
+      }
+    }
+
+    // Step 3: Temporal smoothing (EMA) and normalization
+    const smoothK = 0.15;
+    let maxMass = 1.0;
+    for (let k = 0; k < gridSize; k++) {
+      colSmooth[k] += (blurred[k] - colSmooth[k]) * smoothK;
+      if (colSmooth[k] > maxMass) maxMass = colSmooth[k];
+    }
+    // Pack into RGBA32F texture (R channel only).
+    // Texture layout: row 0 = bottom of lamp (high y in sim), row NR-1 = top.
+    // The shader maps t ∈ [0,1] (0=top, 1=bottom) → texV = 1-t.
+    const invMax = 1.0 / maxMass;
+    for (let r = 0; r < NR; r++) {
+      // Flip: sim row r (y increases downward) → texture row (NR-1-r)
+      const srcOff = r * NC;
+      const dstRow = (NR - 1 - r) * NC;
+      for (let c = 0; c < NC; c++) {
+        const dstIdx = (dstRow + c) << 2;
+        colData[dstIdx]     = colSmooth[srcOff + c] * invMax;
+        colData[dstIdx + 1] = 0;
+        colData[dstIdx + 2] = 0;
+        colData[dstIdx + 3] = 0;
+      }
+    }
+    } // end volAbsorb gate
+
     // -------- 2. Upload textures (always reset active unit first) --------
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, n, 1, gl.RGBA, gl.FLOAT, data, 0);
+    // Row 1: compression data
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 1, n, 1, gl.RGBA, gl.FLOAT, compRow, 0);
 
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.cellRangeTex);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_GW, gridH, gl.RGBA, gl.FLOAT, rangeData, 0);
+
+    // 2D mass grid texture on unit 2
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.colMassTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, NC, NR, gl.RGBA, gl.FLOAT, colData, 0);
 
     // -------- 3. Draw --------
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
@@ -2105,6 +2273,10 @@ class MetaballRenderer {
     // wall's groupId works; pass -1 if no pool.
     const poolGid = sim.nFixed > 0 ? sim.groupId[0] : -1;
     if (this.u.poolGroupId) gl.uniform1i(this.u.poolGroupId, poolGid);
+    if (this.u.compressColor) gl.uniform3fv(this.u.compressColor, params.compressColor);
+    if (this.u.colMass) gl.uniform1i(this.u.colMass, 2);
+    if (this.u.numCols) gl.uniform1i(this.u.numCols, this.NUM_COLS);
+    if (this.u.numRows) gl.uniform1i(this.u.numRows, this.NUM_ROWS);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
 }
@@ -2134,8 +2306,10 @@ const params = {
   bg:   hexToRgb("#2a0d3e"),
   cold: hexToRgb("#9a0f1a"),
   hot:  hexToRgb("#ffcf3a"),
+  compressColor: hexToRgb("#FFE0B0"),
   glow: 0.55,
   time: 0,
+  volAbsorb: true,
 };
 
 // --- UI ---
@@ -2144,6 +2318,8 @@ const $ = (id) => document.getElementById(id);
 $("bgColor").oninput   = (e) => params.bg   = hexToRgb(e.target.value);
 $("coldColor").oninput = (e) => params.cold = hexToRgb(e.target.value);
 $("hotColor").oninput  = (e) => params.hot  = hexToRgb(e.target.value);
+$("compColor").oninput = (e) => params.compressColor = hexToRgb(e.target.value);
+$("volAbsorb").onchange = (e) => params.volAbsorb = e.target.checked;
 
 $("glow").oninput = (e) => {
   params.glow = parseFloat(e.target.value);
@@ -2202,6 +2378,92 @@ $("spring").oninput = (e) => {
   sim.springScale = v / 2000;
   $("springVal").textContent = v.toFixed(2);
 };
+// ---- Pool spring zone visualization ----
+function drawPoolRamp() {
+  const cvs = $("poolRampViz");
+  const ctx = cvs.getContext("2d");
+  const W = cvs.width, H = cvs.height;
+  ctx.clearRect(0, 0, W, H);
+
+  const lo = sim.poolSpringLo;
+  const hi = sim.poolSpringHi;
+  const atten = sim.poolSpringAtten;
+  // Map y-space [200..650] → canvas x [0..W]
+  const Y_MIN = 200, Y_MAX = 650;
+  const toX = (y) => ((y - Y_MIN) / (Y_MAX - Y_MIN)) * W;
+
+  // Background gradient showing bulb regions
+  const bg = ctx.createLinearGradient(0, 0, W, 0);
+  bg.addColorStop(0, "rgba(255,200,50,0.08)");   // hot zone (top)
+  bg.addColorStop(0.6, "rgba(150,20,30,0.12)");  // mid
+  bg.addColorStop(1, "rgba(150,20,30,0.20)");    // pool zone (bottom)
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Draw the cosine ramp
+  ctx.beginPath();
+  const padY = 6;
+  for (let px = 0; px < W; px++) {
+    const y = Y_MIN + (px / W) * (Y_MAX - Y_MIN);
+    let raw = (y - lo) / (hi - lo);
+    raw = raw < 0 ? 0 : raw > 1 ? 1 : raw;
+    const pool = 0.5 * (1 - Math.cos(Math.PI * raw));
+    const springMult = 1.0 - atten * pool;
+    const canvasY = padY + (1 - springMult) * (H - 2 * padY);
+    if (px === 0) ctx.moveTo(px, canvasY);
+    else ctx.lineTo(px, canvasY);
+  }
+  ctx.strokeStyle = "#FFE0B0";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Labels
+  ctx.font = "9px monospace";
+  ctx.fillStyle = "rgba(255,255,255,0.6)";
+  ctx.textAlign = "center";
+  ctx.fillText("1.0×", 14, padY + 3);
+  ctx.fillText((1 - atten).toFixed(1) + "×", 14, H - padY + 2);
+
+  // Zone markers
+  const xLo = toX(lo), xHi = toX(hi);
+  ctx.strokeStyle = "rgba(255,255,255,0.3)";
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath(); ctx.moveTo(xLo, 0); ctx.lineTo(xLo, H); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(xHi, 0); ctx.lineTo(xHi, H); ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.fillStyle = "rgba(255,255,255,0.45)";
+  ctx.font = "8px sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText("Lo", xLo + 2, H - 2);
+  ctx.textAlign = "right";
+  ctx.fillText("Hi", xHi - 2, H - 2);
+}
+
+$("poolLo").oninput = (e) => {
+  const v = parseInt(e.target.value);
+  sim.poolSpringLo = v;
+  $("poolLoVal").textContent = v;
+  $("poolZoneVal").textContent = v + "–" + sim.poolSpringHi;
+  drawPoolRamp();
+};
+$("poolHi").oninput = (e) => {
+  const v = parseInt(e.target.value);
+  sim.poolSpringHi = v;
+  $("poolHiVal").textContent = v;
+  $("poolZoneVal").textContent = sim.poolSpringLo + "–" + v;
+  drawPoolRamp();
+};
+$("poolAtten").oninput = (e) => {
+  const v = parseFloat(e.target.value);
+  sim.poolSpringAtten = v;
+  $("poolAttenVal").textContent = v.toFixed(2);
+  drawPoolRamp();
+};
+// Initial draw
+requestAnimationFrame(drawPoolRamp);
+
 $("sticky").oninput = (e) => {
   sim.stickyStrength = parseFloat(e.target.value);
   $("stickyVal").textContent = sim.stickyStrength.toFixed(2);
@@ -2262,10 +2524,10 @@ window.addEventListener("keydown", (e) => {
 
 // Presets
 const PRESETS = {
-  classic: { bg: "#2a0d3e", cold: "#9a0f1a", hot: "#ffcf3a" },
-  cosmic:  { bg: "#0d0a2e", cold: "#5e1ab8", hot: "#f068ff" },
-  ocean:   { bg: "#031421", cold: "#0a4f8a", hot: "#5be3ff" },
-  forest:  { bg: "#0d1f12", cold: "#1f5f2a", hot: "#c9ff5b" },
+  classic: { bg: "#2a0d3e", cold: "#9a0f1a", hot: "#ffcf3a", comp: "#FFE0B0" },
+  cosmic:  { bg: "#0d0a2e", cold: "#5e1ab8", hot: "#f068ff", comp: "#E8C0FF" },
+  ocean:   { bg: "#031421", cold: "#0a4f8a", hot: "#5be3ff", comp: "#A0D8EF" },
+  forest:  { bg: "#0d1f12", cold: "#1f5f2a", hot: "#c9ff5b", comp: "#E0F0A0" },
 };
 document.querySelectorAll(".preset").forEach((b) => {
   b.onclick = () => {
@@ -2274,6 +2536,7 @@ document.querySelectorAll(".preset").forEach((b) => {
     $("bgColor").value = p.bg;     params.bg   = hexToRgb(p.bg);
     $("coldColor").value = p.cold; params.cold = hexToRgb(p.cold);
     $("hotColor").value = p.hot;   params.hot  = hexToRgb(p.hot);
+    if (p.comp) { $("compColor").value = p.comp; params.compressColor = hexToRgb(p.comp); }
   };
 });
 

@@ -24,6 +24,10 @@ uniform float uTime;
 uniform float uBlobZ[32];
 uniform float uBlobSize[32];
 uniform int   uPoolGroupId;
+uniform vec3  uCompressColor;  // accent color for high-compression zones
+uniform sampler2D uColMass;   // 2D mass grid (NUM_COLS × NUM_ROWS), normalized 0-1
+uniform int   uNumCols;       // grid columns (50)
+uniform int   uNumRows;       // grid rows (30)
 
 out vec4 fragColor;
 
@@ -99,16 +103,18 @@ void main() {
   float cx = uSim.x * 0.5;
   float distFromCenter = abs(simPos.x - cx);
 
-  // -------- Per-blob metaball field & temperature ---------
+  // -------- Per-blob metaball field, temperature & compression ---------
   const int MAX_G = 32;
   float fields[MAX_G];
   float wtemps[MAX_G];
-  for (int g = 0; g < MAX_G; g++) { fields[g] = 0.0; wtemps[g] = 0.0; }
+  float wcomps[MAX_G];  // weighted compression per group
+  for (int g = 0; g < MAX_G; g++) { fields[g] = 0.0; wtemps[g] = 0.0; wcomps[g] = 0.0; }
   float h2 = uH * uH;
 
   for (int i = 0; i < 700; i++) {
     if (i >= uCount) break;
     vec4 part = texelFetch(uParticles, ivec2(i, 0), 0);
+    float comp = texelFetch(uParticles, ivec2(i, 1), 0).r;  // compression from row 1
     vec2 d = simPos - part.xy;
     float r2 = dot(d, d);
     if (r2 < h2) {
@@ -118,6 +124,7 @@ void main() {
       g = clamp(g, 0, MAX_G - 1);
       fields[g] += k;
       wtemps[g] += k * part.z;
+      wcomps[g] += k * comp;
     }
   }
 
@@ -146,6 +153,14 @@ void main() {
   if (frontDom >= 0) dom = frontDom;
   float field = fields[dom];
   float temp = field > 0.001 ? (wtemps[dom] / field) : 0.18;
+  // Average compression for the dominant blob at this pixel
+  float compAvg = field > 0.001 ? (wcomps[dom] / field) : 0.0;
+  // Smooth onset: ramp from 0 at comp=0.3 to 1 at comp=1.5
+  // so only genuinely compressed regions light up
+  // Log scale: compresses high values so medium blobs are visible
+  // but large blobs don't blow out. Range: ~0 at rest → ~0.7 at heavy compression.
+  float compRaw = max(compAvg - 0.2, 0.0);  // dead zone below 0.2
+  float compIntensity = log(1.0 + compRaw * 3.0) / log(4.0);
 
   // -------- Bottle / fluid masks ---------
   float glassEdgeSoft = 1.5;
@@ -168,12 +183,23 @@ void main() {
   vec3 poolBlockColor = mix(uCold, uHot, 0.45) * mix(0.55, 1.15, pow(t, 1.4));
   fluidBg = mix(fluidBg, poolBlockColor, poolBlockMask);
 
+  // -------- (God rays placeholder — disabled, see git history) ---------
+
   // -------- Wax shading from temperature ---------
   float tempN = clamp((temp - 0.18) / 0.85, 0.0, 1.0);
   vec3 waxColor = mix(uCold, uHot, smoothstep(0.0, 1.0, tempN));
   float lightFromBelow = mix(0.55, 1.15, pow(t, 1.4));
   waxColor *= lightFromBelow;
   waxColor = pow(waxColor, vec3(0.95));
+
+  // -------- Compression: boost existing color ---------
+  // Under pressure, brighten and saturate the current wax color
+  // rather than injecting a foreign accent. This looks natural
+  // at any temperature — hot wax glows hotter, cool wax gets richer.
+  float compLuma = dot(waxColor, vec3(0.299, 0.587, 0.114));
+  vec3 compSaturated = waxColor / max(compLuma, 0.01) * compLuma; // normalize then re-apply
+  // Boost: brighten by up to 40% and increase saturation
+  waxColor = mix(waxColor, waxColor * 1.4 + (waxColor - vec3(compLuma)) * 0.5, compIntensity * 0.6);
 
   // -------- Physically-based spherical refractivity ---------
   float blobSz = clamp(uBlobSize[dom], 0.0, 1.0);
@@ -182,68 +208,45 @@ void main() {
   float alpha = smoothstep(threshold - 0.18, threshold + 0.04, field);
 
   // shell: 1 at the metaball boundary, 0 deep inside
-  // This approximates cos(theta) for a sphere where theta is the
-  // angle between the view ray and the surface normal
   float centerness = smoothstep(threshold + 0.20, threshold + 0.55, field);
   float shell = 1.0 - centerness;
 
   // cosTheta: 1 at center (looking straight through), 0 at rim (glancing)
-  // This is our proxy for the dot(view, normal) on a sphere
   float cosTheta = centerness;
 
   // ---- Fresnel reflectance at the wax-fluid interface ----
-  // At the rim (glancing angles), more light reflects off the surface;
-  // at the center (normal incidence), light passes through.
-  // R0 for paraffin/fluid ≈ 0.001 — very little reflection at normal,
-  // but rises steeply at glancing angles (the characteristic rim gleam).
   float fresnel = fresnelSchlick(cosTheta);
 
-  // Edge darkening from Fresnel: the rim reflects surrounding (dark)
-  // fluid back at the viewer, darkening the silhouette edge.
-  // Scaled by blob size — small drops have less visible curvature.
-  float edgeDarken = 1.0 - fresnel * 0.6 * blobSz;
+  // ---- Pressure rim glow ----
+  // Under compression, the rim brightens with the wax's own color
+  // instead of going dark from Fresnel — like the wax is glowing hot.
+  float pressureRim = shell * compIntensity * 1.8;
+  waxColor += waxColor * pressureRim * 0.5;
+
+  // Edge darkening from Fresnel — reduced under compression.
+  float edgeDarken = 1.0 - fresnel * 0.6 * blobSz * (1.0 - compIntensity * 0.7);
   waxColor *= edgeDarken;
 
   // ---- Refraction-based specular highlight ----
-  // A physically-motivated highlight: light from the bulb below enters
-  // the sphere, refracts at the curved surface, and concentrates into
-  // a caustic bright spot offset toward the top. The Fresnel term
-  // modulates intensity (more light enters at normal incidence).
-  // Snell's law compresses the highlight — higher n = tighter caustic.
   float cosRefracted = snellRefract(cosTheta);
-  // The caustic concentration factor: ratio of solid angles maps to
-  // (cosTheta / cosRefracted), which is > 1 for n > 1 — light is
-  // compressed into a smaller cone inside the sphere.
   float causticConcentration = cosTheta / max(0.01, cosRefracted);
-  float specBase = pow(centerness, mix(5.0, 2.5, blobSz));
-  float specStrength = mix(0.08, 0.25, blobSz);
-  // Modulate by (1 - fresnel) since reflected light doesn't enter
+  // Under compression: specular intensifies
+  float compSpecBoost = 1.0 + compIntensity * 1.5;
+  float specBase = pow(centerness, mix(5.0, 2.5, blobSz) * (1.0 - compIntensity * 0.15));
+  float specStrength = mix(0.08, 0.25, blobSz) * compSpecBoost;
   float highlight = specBase * specStrength * (1.0 - fresnel) *
                     min(2.0, causticConcentration);
-  waxColor += vec3(1.0, 0.95, 0.85) * highlight;
+  // Specular tinted by the wax color itself — warm highlight on warm wax,
+  // cool highlight on cool wax.
+  vec3 specTint = mix(vec3(1.0, 0.95, 0.85), waxColor * 2.0 + vec3(0.3), compIntensity * 0.6);
+  waxColor += specTint * highlight;
 
-  // ---- Refraction-based translucency ----
-  // Light passing through the sphere is attenuated by path length.
-  // At the center the path is longest (most absorption → more opaque
-  // wax color); at the rim the path through wax is short but Fresnel
-  // reflection dominates. The net effect: hot wax glows through at
-  // the center where the bulb light enters, rim stays crisp.
-  //
-  // Effective optical path through a sphere: proportional to cosTheta
-  // (longest at center). Beer-Lambert-style absorption:
-  float opticalPath = cosTheta * mix(1.5, 2.5, blobSz);
-  float transmission = exp(-opticalPath * 0.4); // 0.4 = absorption coeff
-  // Core translucency: blend toward transparent at center for hot wax,
-  // letting the bulb glow show through. Modulated by temperature
-  // (hot wax is more fluid and translucent) and by transmission.
-  float coreTranslucency = mix(0.30, 0.55, blobSz);
-  alpha *= 1.0 - centerness * coreTranslucency * tempN * (1.0 - transmission * 0.5);
-
-  // ---- Fresnel rim boost ----
-  // At glancing angles, total internal reflection makes the silhouette
-  // edge crisper — more light bounces back from inside the sphere.
-  float fresnelBoost = fresnel * 0.20 * blobSz;
-  alpha = min(1.0, alpha + fresnelBoost * step(threshold, field));
+  // ---- Uniform translucency + pressure opacity ----
+  // Base 10% transparency, plus a soft center fade so the core
+  // of each blob feels translucent rather than a solid disc.
+  alpha *= 0.90;
+  alpha *= 1.0 - centerness * 0.30;
+  alpha *= 1.0 - compIntensity * 0.65;
 
   // Inner core detail
   float coreAlpha = smoothstep(threshold + 0.05, threshold + 0.55, field);
@@ -256,11 +259,7 @@ void main() {
     float otherTempN = clamp((otherTemp - 0.18) / 0.85, 0.0, 1.0);
     vec3 otherWax = mix(uCold, uHot, smoothstep(0.0, 1.0, otherTempN)) * lightFromBelow;
     float otherAlpha = smoothstep(threshold - 0.18, threshold + 0.04, otherFieldRaw);
-    float otherCenterness = smoothstep(threshold + 0.20, threshold + 0.55, otherFieldRaw);
-    // Apply Fresnel-based translucency to back blob too
-    float otherCosTheta = otherCenterness;
-    float otherFresnel = fresnelSchlick(otherCosTheta);
-    otherAlpha *= 1.0 - otherCenterness * 0.45 * otherTempN;
+    otherAlpha *= 0.90;
     fluidBg = mix(fluidBg, otherWax, otherAlpha);
   }
 

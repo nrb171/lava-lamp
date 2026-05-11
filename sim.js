@@ -45,7 +45,7 @@ class SPH {
     // Kernel and core fluid params
     this.h = 26;                  // smoothing radius (px)
     this.mass = 1.1;
-    this.gasK = 2400 * 2.00;      // pressure stiffness
+    this.gasK = 2400 * 2.60;      // pressure stiffness
     this.viscosity = 0.2 / 26;    // base kinematic viscosity
     this.viscScale = 0.50;        // user multiplier
     this.cohesion = 0.55;
@@ -55,7 +55,7 @@ class SPH {
     this.MAX_BLOBS = 32;
     this.surfaceTension = 2.20;    // user multiplier for inter-blob repulsion
     this.interRepel = 60;
-    this.tempRepelMult = 1.2;
+    this.tempRepelMult = 0.05;
     this.connectDist = this.h * 0.82;
 
     // Pair-wise spring binding
@@ -66,6 +66,11 @@ class SPH {
     this.springMin = this.h * 0.4;
     this.springReach = this.h * 1.3;
     this.springScale = 6.00 / 2000;
+
+    // Pool-zone spring attenuation band (y-space)
+    this.poolSpringLo = 480;   // spring starts fading here
+    this.poolSpringHi = 580;   // spring is at minimum here
+    this.poolSpringAtten = 0.5; // multiply spring by this in pool (0.5 = half)
 
     // Sticky bottom layer
     this.stickyHeight = 90;
@@ -107,7 +112,7 @@ class SPH {
     this.heatDiffScale = 2.50;
     this.interDiffRatio = 0.03;
     this.ambientCool = 0.01;
-    this.ambientCoolScale = 2.20;
+    this.ambientCoolScale = 1.00;
     this.heatNoise = 0.50;
     this.simTime = 0;
     this.bulbHeight = 50;
@@ -137,6 +142,7 @@ class SPH {
     this.fx = new Float32Array(n);
     this.fy = new Float32Array(n);
     this.density  = new Float32Array(n);
+    this.compression = new Float32Array(n);  // per-particle compression ratio (0 = rest, >0 = squeezed)
     this.pressure = new Float32Array(n);
     this.temp = new Float32Array(n);
     this.dT   = new Float32Array(n);
@@ -699,6 +705,10 @@ class SPH {
       if (rho < this.restDensity) rho = this.restDensity;
       pden[i] = rho;
       ppres[i] = this.gasK * (rho - this.restDensity);
+      // Compression ratio: 0 at rest density, rises as particle is squeezed.
+      // Capped at 3.0 to keep shader values sane.
+      const cRaw = rho / this.restDensity - 1.0;
+      this.compression[i] = cRaw > 3.0 ? 3.0 : (cRaw > 0 ? cRaw : 0);
     }
 
     // Reset per-blob inter-blob force accumulators
@@ -728,6 +738,8 @@ class SPH {
     const interRatio = this.interDiffRatio;
     const sumFrx = this.sumFrx, sumFry = this.sumFry;
     const zoneDwell = this.zoneDwell;
+    const POOL_LO = this.poolSpringLo, POOL_HI = this.poolSpringHi, POOL_INV = 1.0 / (POOL_HI - POOL_LO);
+    const poolSpringAtten = this.poolSpringAtten;
 
     for (let i = 0; i < n; i++) {
       let fpx = 0, fpy = 0;
@@ -741,6 +753,10 @@ class SPH {
       const rhoi = pden[i];
       const Ti = ptemp[i];
       const gi = gid[i];
+      // Per-particle pool ramp for spring attenuation
+      const _siRaw = (yi - POOL_LO) * POOL_INV;
+      const _si = _siRaw < 0 ? 0 : _siRaw > 1 ? 1 : _siRaw;
+      const poolI = 0.5 * (1 - Math.cos(Math.PI * _si));
 
       const cxI = Math.max(0, Math.min(gridW - 1, ((xi / cellSize) | 0) + 2));
       const cyI = Math.max(0, Math.min(gridH - 1, ((yi / cellSize) | 0) + 2));
@@ -829,8 +845,11 @@ class SPH {
                   const dvx = vxi - pvx[j];
                   const dvy = vyi - pvy[j];
                   const vAxial = (dvx * dx + dvy * dy) / r;
-                  // Halve spring force when both particles are in the pool
-                  const effSpringK = (yi > 540 && py[j] > 540) ? springK * 0.5 : springK;
+                  // Per-particle cosine ramp: full spring above POOL_LO, half at POOL_HI
+                  const _sjRaw = (py[j] - POOL_LO) * POOL_INV;
+                  const _sj = _sjRaw < 0 ? 0 : _sjRaw > 1 ? 1 : _sjRaw;
+                  const poolJ = 0.5 * (1 - Math.cos(Math.PI * _sj));
+                  const effSpringK = springK * (1 - poolSpringAtten * poolI * poolJ);
                   if (r > springRest) {
                     const rawStretch = r - springRest;
                     const stretch = rawStretch < springMaxStretch ? rawStretch : springMaxStretch;
