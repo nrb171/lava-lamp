@@ -38,7 +38,36 @@
     width: 380px;
     height: 700px;
     border-radius: 28px;
+    /* prevent the browser from translating drag gestures into scroll/zoom */
+    touch-action: none;
+    cursor: grab;
   }
+  canvas#lava.grabbing { cursor: grabbing; }
+
+  /* Soft Gaussian-looking halo that appears at the cursor while a
+     grab is active. No hard outline — the gradient mirrors the
+     weight falloff the simulation actually uses. */
+  .grab-ring {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 120px;
+    height: 120px;
+    border-radius: 50%;
+    pointer-events: none;
+    transform: translate(-50%, -50%);
+    background:
+      radial-gradient(circle,
+        rgba(255,255,255,0.18) 0%,
+        rgba(255,255,255,0.10) 30%,
+        rgba(255,255,255,0.04) 60%,
+        rgba(255,255,255,0.00) 90%);
+    opacity: 0;
+    transition: opacity 0.15s ease-out;
+    mix-blend-mode: screen;
+    filter: blur(2px);
+  }
+  .grab-ring.active { opacity: 1; }
   .controls {
     background: var(--panel);
     border: 1px solid var(--panel-border);
@@ -181,7 +210,10 @@
   <button id="toggleFs" title="Fullscreen (F)" aria-label="Fullscreen">&#x26F6;</button>
 </div>
 
-<div class="stage"><canvas id="lava" width="760" height="1400"></canvas></div>
+<div class="stage">
+  <canvas id="lava" width="760" height="1400"></canvas>
+  <div id="grabRing" class="grab-ring"></div>
+</div>
 
 <div class="controls">
   <h1>Lava Lamp</h1>
@@ -404,6 +436,30 @@ class SPH {
     // Cushion zone
     this.cushionRange = this.h * 1.35;
     this.cushionStrength = 1.50;
+
+    // Mouse "grab" — when the user clicks and holds, fluid particles
+    // near the cursor are pulled toward an (offset-preserved) target
+    // with a per-particle Gaussian-weighted spring + damping. The
+    // weight falls off smoothly with distance from the click point,
+    // so the centre of the cluster is tugged firmly while the fringes
+    // are only nudged. A separately-smoothed "soft target" lags a bit
+    // behind the raw cursor, giving the whole interaction a draggy
+    // feel rather than snapping rigidly to the mouse.
+    this.grab = {
+      active: false,
+      tx: 0,  ty: 0,         // raw target (cursor) position, sim coords
+      stx: 0, sty: 0,        // smoothed target — what the spring pulls to
+      tvx: 0, tvy: 0,        // low-pass cursor velocity, sim px/s
+      springK: 90,           // spring stiffness (acc / sim px), per-particle scaled by w
+      damp: 14,              // PURE friction toward zero (1/s) — higher = more drag
+      vCouple: 0.30,         // 0..1 — how much cursor velocity transfers to grabbed particles
+      targetSmoothK: 9,      // how fast stx,sty chase tx,ty (1/s); lower = more drag
+      radius: 40,            // outer pickup cutoff (sim px) — hard zero past this
+      sigma: 22,             // Gaussian std-dev for the weight falloff
+      weightThresh: 0.02,    // ignore particles whose weight is below this
+      maxParticles: 100,     // safety cap on how many to grab at once
+      particles: [],         // [{idx, offX, offY, w}]
+    };
 
     // Time scale
     this.timeScale = 1.0;
@@ -1368,6 +1424,104 @@ class SPH {
       }
     }
   }
+
+  // --- Mouse "grab" interaction ---------------------------------
+  // Pull captured particles toward a *smoothed* target (which lags
+  // behind the raw cursor for drag-feel). Each particle carries a
+  // Gaussian weight `w` baked in at pickup time — far-edge particles
+  // are gently nudged; central ones are tugged firmly. Called once
+  // per sub-step after step(), so the impulse stacks with the regular
+  // SPH integration and the result is clamped by the next step()'s
+  // boundary pass.
+  applyGrab(dt) {
+    const g = this.grab;
+    if (!g.active || g.particles.length === 0) return;
+    // 1) Drive the smoothed target toward the raw cursor. The longer
+    //    the time constant, the more lag the user feels.
+    const sBlend = 1.0 - Math.exp(-g.targetSmoothK * dt);
+    g.stx += (g.tx - g.stx) * sBlend;
+    g.sty += (g.ty - g.sty) * sBlend;
+
+    const stx = g.stx, sty = g.sty;
+    const tvx = g.tvx, tvy = g.tvy;
+    const springK = g.springK;
+    const damp = g.damp;
+    const vCouple = g.vCouple;
+    const nFixed = this.nFixed;
+    const px = this.x, py = this.y;
+    const pvx = this.vx, pvy = this.vy;
+    const list = g.particles;
+    for (let p = 0; p < list.length; p++) {
+      const rec = list[p];
+      const i = rec.idx;
+      if (i < nFixed || i >= this.n) continue;
+      const w = rec.w;
+      const dx = (stx + rec.offX) - px[i];
+      const dy = (sty + rec.offY) - py[i];
+      // Weighted spring pull toward the smoothed target.
+      const k = w * springK;
+      pvx[i] += k * dx * dt;
+      pvy[i] += k * dy * dt;
+      // Pure viscous damping toward zero — scaled by weight so far-edge
+      // particles barely feel it. This is what makes the grab "draggy":
+      // grabbed particles lose their own SPH momentum as they're held.
+      const decay = Math.exp(-damp * dt * w);
+      pvx[i] *= decay;
+      pvy[i] *= decay;
+      // Add a small fraction of the cursor's velocity back — so a quick
+      // flick still imparts momentum, but the dominant feel is drag.
+      const inject = (1.0 - decay) * vCouple;
+      pvx[i] += tvx * inject;
+      pvy[i] += tvy * inject;
+    }
+  }
+
+  // Pick up fluid particles near (sx, sy). Each captured particle keeps
+  // its offset from the click point (so the cluster keeps its shape
+  // while being dragged) and a Gaussian weight that smoothly fades the
+  // grab effect from centre to edge.
+  beginGrab(sx, sy) {
+    const g = this.grab;
+    const r2 = g.radius * g.radius;
+    const inv2s2 = 1.0 / (2.0 * g.sigma * g.sigma);
+    const thresh = g.weightThresh;
+    const list = [];
+    const cap = g.maxParticles;
+    for (let i = this.nFixed; i < this.n && list.length < cap; i++) {
+      const dx = this.x[i] - sx;
+      const dy = this.y[i] - sy;
+      const d2 = dx * dx + dy * dy;
+      if (d2 >= r2) continue;
+      const w = Math.exp(-d2 * inv2s2);
+      if (w < thresh) continue;
+      list.push({ idx: i, offX: dx, offY: dy, w });
+    }
+    g.particles = list;
+    g.tx = sx;  g.ty = sy;
+    g.stx = sx; g.sty = sy;        // start smoothed target at the click point
+    g.tvx = 0;  g.tvy = 0;
+    g.active = list.length > 0;
+    return g.active;
+  }
+
+  // Update the cursor target; newVx/newVy are the raw cursor velocity
+  // in sim px/s (caller supplies — easy to compute from dt). We
+  // additionally low-pass filter that here so jittery hand motion
+  // doesn't translate into pixel-scale velocity spikes.
+  updateGrab(sx, sy, newVx, newVy) {
+    const g = this.grab;
+    if (!g.active) return;
+    g.tx = sx; g.ty = sy;
+    const blend = 0.3;             // a touch heavier filter than before
+    g.tvx = g.tvx * (1 - blend) + newVx * blend;
+    g.tvy = g.tvy * (1 - blend) + newVy * blend;
+  }
+
+  endGrab() {
+    this.grab.active = false;
+    this.grab.particles.length = 0;
+    this.grab.tvx = 0; this.grab.tvy = 0;
+  }
 }
 
 // UMD export — works as both Node module and browser script
@@ -2123,6 +2277,85 @@ document.querySelectorAll(".preset").forEach((b) => {
   };
 });
 
+// --- Mouse / touch "grab" interaction ---
+// Clicking and holding inside the lava lamp captures the fluid particles
+// nearest to the cursor. While the pointer is held down, those particles
+// follow the cursor via a spring + damping force (see sim.applyGrab),
+// which composes with the regular SPH physics — gravity, pressure,
+// surface tension, etc. all still apply.
+(() => {
+  const grabRing = $("grabRing");
+  let pointerId = null;
+  let lastEventTime = 0;
+  let lastSimX = 0, lastSimY = 0;
+  // We use the canvas getBoundingClientRect each event so the mapping
+  // works under fullscreen scaling, devicePixelRatio, and panel toggles.
+  function clientToSim(ev) {
+    const rect = canvas.getBoundingClientRect();
+    const sx = (ev.clientX - rect.left) * (SIM_W / rect.width);
+    const sy = (ev.clientY - rect.top)  * (SIM_H / rect.height);
+    return { sx, sy, rect };
+  }
+  function placeRing(rect, sx, sy, visible) {
+    // grab-ring is absolutely positioned inside .stage (same offset
+    // parent as the canvas). Convert sim coords back to CSS pixels
+    // relative to the stage by using the canvas offset within the stage.
+    const stage = canvas.parentElement;
+    const stageRect = stage.getBoundingClientRect();
+    const cssX = (rect.left - stageRect.left) + sx * (rect.width  / SIM_W);
+    const cssY = (rect.top  - stageRect.top ) + sy * (rect.height / SIM_H);
+    const cssDiameter = 2 * sim.grab.radius * (rect.width / SIM_W);
+    grabRing.style.width  = cssDiameter + "px";
+    grabRing.style.height = cssDiameter + "px";
+    grabRing.style.left = cssX + "px";
+    grabRing.style.top  = cssY + "px";
+    grabRing.classList.toggle("active", !!visible);
+  }
+
+  canvas.addEventListener("pointerdown", (ev) => {
+    // Ignore secondary buttons (right-click etc.)
+    if (ev.button !== 0 && ev.pointerType === "mouse") return;
+    const { sx, sy, rect } = clientToSim(ev);
+    const grabbed = sim.beginGrab(sx, sy);
+    if (!grabbed) return; // empty space — let the click do nothing
+    pointerId = ev.pointerId;
+    canvas.setPointerCapture(pointerId);
+    canvas.classList.add("grabbing");
+    lastEventTime = performance.now();
+    lastSimX = sx; lastSimY = sy;
+    placeRing(rect, sx, sy, true);
+    ev.preventDefault();
+  });
+
+  canvas.addEventListener("pointermove", (ev) => {
+    if (pointerId === null || ev.pointerId !== pointerId) return;
+    const now = performance.now();
+    const dt = Math.max(0.001, (now - lastEventTime) / 1000);
+    const { sx, sy, rect } = clientToSim(ev);
+    const vx = (sx - lastSimX) / dt;
+    const vy = (sy - lastSimY) / dt;
+    sim.updateGrab(sx, sy, vx, vy);
+    lastEventTime = now;
+    lastSimX = sx; lastSimY = sy;
+    placeRing(rect, sx, sy, true);
+  });
+
+  function releaseGrab() {
+    if (pointerId !== null) {
+      try { canvas.releasePointerCapture(pointerId); } catch (_) {}
+    }
+    pointerId = null;
+    canvas.classList.remove("grabbing");
+    grabRing.classList.remove("active");
+    sim.endGrab();
+  }
+  canvas.addEventListener("pointerup",     releaseGrab);
+  canvas.addEventListener("pointercancel", releaseGrab);
+  // If the mouse leaves while not actually capturing (e.g. user
+  // released outside the window), make sure we clean up.
+  window.addEventListener("blur", releaseGrab);
+})();
+
 // --- Main loop ---
 let last = performance.now();
 let frames = 0;
@@ -2149,7 +2382,10 @@ function frame(now) {
   const sub = dt / substeps;
   // Per-frame work: groups, blob-z, centroids, noise (once, not per substep)
   sim.stepFrame(dt);
-  for (let i = 0; i < substeps; i++) sim.step(sub);
+  for (let i = 0; i < substeps; i++) {
+    sim.step(sub);
+    sim.applyGrab(sub);
+  }
 
   params.time = now / 1000;
   renderer.render(sim, params);
