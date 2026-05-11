@@ -286,8 +286,8 @@
   </div>
 
   <div class="control">
-    <label>Cooling <span class="val" id="acoolVal">1.00</span></label>
-    <input type="range" id="acool" min="0" max="6.0" step="0.05" value="1.00" />
+    <label>Cooling <span class="val" id="acoolVal">1.10</span></label>
+    <input type="range" id="acool" min="0" max="6.0" step="0.05" value="1.10" />
   </div>
 
   <div class="control">
@@ -519,11 +519,11 @@ class SPH {
     this.heatDiffScale = 5.00;
     this.interDiffRatio = 0.03;
     this.ambientCool = 0.01;
-    this.ambientCoolScale = 1.00;
+    this.ambientCoolScale = 1.10;
     this.heatNoise = 0.50;
     this.simTime = 0;
     this.bulbHeight = 58;
-    this.edgeFactor = 0.10;
+    this.edgeFactor = 0.80;
 
     this.restDensity = 1;
 
@@ -1786,7 +1786,7 @@ void main() {
     vec3 rayColor = mix(uHot, vec3(1.0, 0.97, 0.90), 0.3);
     // Envelope: strong in lower-mid bulb, gentler fade toward top
     float envelope = smoothstep(0.93, 0.65, t) * smoothstep(0.02, 0.15, t);
-    float glowScale = uGlow / 0.55;  // normalized so default glow=0.55 → 1.0
+    float glowScale = uGlow / 0.38;  // normalized so default glow=0.55 → 1.0
     fluidBg += rayColor * light * envelope * 0.80 * glowScale;
 
     // Darken where light is blocked (1 - light = shadow)
@@ -2207,7 +2207,7 @@ class MetaballRenderer {
       const edgeT = Math.min(distFromCenter / poolHalf, 1.0);
       // Remap edgeT so brightness stays high until close to the edge
       const edgeFalloff = edgeT * edgeT * edgeT;  // cubic — stays bright longer, drops fast at edge
-      const poolBrightness = Math.max(0, 1.0 - edgeFalloff) * (params.glow / 0.55);
+      const poolBrightness = Math.max(0, 1.0 - edgeFalloff) * (params.glow / 0.38);
       // Rows below pool surface: full brightness (pool glow handled by shader)
       for (let r = NR - 1; r > poolRow; r--) {
         lightField[r * NC + c] = poolBrightness;

@@ -196,7 +196,7 @@ void main() {
     vec3 rayColor = mix(uHot, vec3(1.0, 0.97, 0.90), 0.3);
     // Envelope: strong in lower-mid bulb, gentler fade toward top
     float envelope = smoothstep(0.93, 0.65, t) * smoothstep(0.02, 0.15, t);
-    float glowScale = uGlow / 0.55;  // normalized so default glow=0.55 → 1.0
+    float glowScale = uGlow / 0.38;  // normalized so default glow=0.38 → 1.0
     fluidBg += rayColor * light * envelope * 0.80 * glowScale;
 
     // Darken where light is blocked (1 - light = shadow)

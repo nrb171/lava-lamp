@@ -112,11 +112,11 @@ class SPH {
     this.heatDiffScale = 5.00;
     this.interDiffRatio = 0.03;
     this.ambientCool = 0.01;
-    this.ambientCoolScale = 1.00;
+    this.ambientCoolScale = 1.10;
     this.heatNoise = 0.50;
     this.simTime = 0;
     this.bulbHeight = 50;
-    this.edgeFactor = 0.10;
+    this.edgeFactor = 0.80;
 
     this.restDensity = 1;
 
