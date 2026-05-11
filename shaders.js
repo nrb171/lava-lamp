@@ -183,7 +183,26 @@ void main() {
   vec3 poolBlockColor = mix(uCold, uHot, 0.45) * mix(0.55, 1.15, pow(t, 1.4));
   fluidBg = mix(fluidBg, poolBlockColor, poolBlockMask);
 
-  // -------- (God rays placeholder — disabled, see git history) ---------
+  // -------- Volumetric light from below ---------
+  // The texture holds per-column light intensity: bright where light from
+  // the pool passes through unobstructed, dark where wax blocks it.
+  // Horizontally blurred on CPU with mass-dependent kernel for refraction.
+  if (uNumCols > 0 && uNumRows > 0) {
+    float colU = simPos.x / uSim.x;
+    float colV = 1.0 - t;   // texV: 0=top of lamp, 1=bottom
+    float light = texture(uColMass, vec2(colU, colV)).r;
+
+    // God ray: additive warm glow scaled by bulb glow slider
+    vec3 rayColor = mix(uHot, vec3(1.0, 0.97, 0.90), 0.3);
+    // Envelope: strong in lower-mid bulb, gentler fade toward top
+    float envelope = smoothstep(0.93, 0.65, t) * smoothstep(0.02, 0.15, t);
+    float glowScale = uGlow / 0.55;  // normalized so default glow=0.55 → 1.0
+    fluidBg += rayColor * light * envelope * 0.80 * glowScale;
+
+    // Darken where light is blocked (1 - light = shadow)
+    float shadow = (1.0 - light) * envelope * 0.45 * glowScale;
+    fluidBg *= 1.0 - shadow;
+  }
 
   // -------- Wax shading from temperature ---------
   float tempN = clamp((temp - 0.18) / 0.85, 0.0, 1.0);
@@ -244,9 +263,9 @@ void main() {
   // ---- Uniform translucency + pressure opacity ----
   // Base 10% transparency, plus a soft center fade so the core
   // of each blob feels translucent rather than a solid disc.
-  alpha *= 0.90;
+  alpha *= 0.82;
   alpha *= 1.0 - centerness * 0.30;
-  alpha *= 1.0 - compIntensity * 0.65;
+  alpha *= max(1.0 - compIntensity * 0.65, 0.40);  // clip at 60% transparency
 
   // Inner core detail
   float coreAlpha = smoothstep(threshold + 0.05, threshold + 0.55, field);

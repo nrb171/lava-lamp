@@ -44,16 +44,16 @@ class SPH {
 
     // Kernel and core fluid params
     this.h = 26;                  // smoothing radius (px)
-    this.mass = 1.1;
-    this.gasK = 2400 * 2.60;      // pressure stiffness
+    this.mass = 0.9;
+    this.gasK = 2400 * 3.00;      // pressure stiffness
     this.viscosity = 0.2 / 26;    // base kinematic viscosity
-    this.viscScale = 0.50;        // user multiplier
+    this.viscScale = 1.00;        // user multiplier
     this.cohesion = 0.55;
     this.surfaceTensionScale = 1.60;
 
     // Distinct masses ("blobs")
     this.MAX_BLOBS = 32;
-    this.surfaceTension = 2.20;    // user multiplier for inter-blob repulsion
+    this.surfaceTension = 1.00;    // user multiplier for inter-blob repulsion
     this.interRepel = 60;
     this.tempRepelMult = 0.05;
     this.connectDist = this.h * 0.82;
@@ -70,7 +70,7 @@ class SPH {
     // Pool-zone spring attenuation band (y-space)
     this.poolSpringLo = 480;   // spring starts fading here
     this.poolSpringHi = 580;   // spring is at minimum here
-    this.poolSpringAtten = 0.5; // multiply spring by this in pool (0.5 = half)
+    this.poolSpringAtten = 0.6; // multiply spring by this in pool (0.6 = 60%)
 
     // Sticky bottom layer
     this.stickyHeight = 90;
@@ -106,10 +106,10 @@ class SPH {
 
     // Heat
     this.tAmbient = 0.18;
-    this.heatScale = 1.40;
+    this.heatScale = 3.00;
     this.heatRate = 0.05;
     this.heatDiff = 0.05;
-    this.heatDiffScale = 2.50;
+    this.heatDiffScale = 5.00;
     this.interDiffRatio = 0.03;
     this.ambientCool = 0.01;
     this.ambientCoolScale = 1.00;

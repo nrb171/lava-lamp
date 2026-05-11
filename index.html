@@ -246,8 +246,8 @@
   </div>
 
   <div class="control">
-    <label>Bulb glow <span class="val" id="glowVal">0.55</span></label>
-    <input type="range" id="glow" min="0" max="1" step="0.01" value="0.55" />
+    <label>Bulb glow <span class="val" id="glowVal">0.38</span></label>
+    <input type="range" id="glow" min="0" max="1" step="0.01" value="0.38" />
   </div>
 
   <div class="control">
@@ -261,8 +261,8 @@
   </div>
 
   <div class="control">
-    <label>Heat <span class="val" id="heatVal">1.40</span></label>
-    <input type="range" id="heat" min="0.05" max="4.0" step="0.01" value="1.40" />
+    <label>Heat <span class="val" id="heatVal">3.00</span></label>
+    <input type="range" id="heat" min="0.05" max="4.0" step="0.01" value="3.00" />
   </div>
 
   <div class="control">
@@ -271,13 +271,13 @@
   </div>
 
   <div class="control">
-    <label>Heater spread <span class="val" id="edgeVal">0.10</span></label>
-    <input type="range" id="edge" min="0" max="1.0" step="0.01" value="0.10" />
+    <label>Heater spread <span class="val" id="edgeVal">0.80</span></label>
+    <input type="range" id="edge" min="0" max="1.0" step="0.01" value="0.80" />
   </div>
 
   <div class="control">
-    <label>Heat mixing <span class="val" id="diffVal">2.50</span></label>
-    <input type="range" id="diff" min="0" max="6.0" step="0.05" value="2.50" />
+    <label>Heat mixing <span class="val" id="diffVal">5.00</span></label>
+    <input type="range" id="diff" min="0" max="6.0" step="0.05" value="5.00" />
   </div>
 
   <div class="control">
@@ -291,8 +291,8 @@
   </div>
 
   <div class="control">
-    <label>Bounce <span class="val" id="stVal">1.50</span></label>
-    <input type="range" id="st" min="0" max="5.0" step="0.01" value="1.50" />
+    <label>Bounce <span class="val" id="stVal">1.00</span></label>
+    <input type="range" id="st" min="0" max="5.0" step="0.01" value="1.00" />
   </div>
 
   <div class="control">
@@ -325,8 +325,8 @@
         <input type="range" id="poolHi" min="350" max="650" step="5" value="580" />
       </div>
       <div class="control" style="margin:0">
-        <label style="font-size:10px">Atten <span class="val" id="poolAttenVal">0.50</span></label>
-        <input type="range" id="poolAtten" min="0" max="1.0" step="0.05" value="0.50" />
+        <label style="font-size:10px">Atten <span class="val" id="poolAttenVal">0.60</span></label>
+        <input type="range" id="poolAtten" min="0" max="1.0" step="0.05" value="0.60" />
       </div>
     </div>
   </div>
@@ -342,18 +342,18 @@
   </div>
 
   <div class="control">
-    <label>Mass <span class="val" id="massVal">1.10</span></label>
-    <input type="range" id="mass" min="0.5" max="10.0" step="0.1" value="1.10" />
+    <label>Mass <span class="val" id="massVal">0.90</span></label>
+    <input type="range" id="mass" min="0.5" max="10.0" step="0.1" value="0.90" />
   </div>
 
   <div class="control">
-    <label>Internal pressure <span class="val" id="pressureVal">2.60</span></label>
-    <input type="range" id="pressure" min="0" max="3.0" step="0.05" value="2.60" />
+    <label>Internal pressure <span class="val" id="pressureVal">3.00</span></label>
+    <input type="range" id="pressure" min="0" max="4.0" step="0.05" value="3.00" />
   </div>
 
   <div class="control">
-    <label>Viscosity <span class="val" id="viscVal">1.45</span></label>
-    <input type="range" id="visc" min="0" max="6.0" step="0.05" value="1.45" />
+    <label>Viscosity <span class="val" id="viscVal">1.00</span></label>
+    <input type="range" id="visc" min="0" max="6.0" step="0.05" value="1.00" />
   </div>
 
   <div class="control">
@@ -421,16 +421,16 @@ class SPH {
 
     // Kernel and core fluid params
     this.h = 26;                  // smoothing radius (px)
-    this.mass = 1.1;
-    this.gasK = 2400 * 2.60;      // pressure stiffness
+    this.mass = 0.9;
+    this.gasK = 2400 * 3.00;      // pressure stiffness
     this.viscosity = 0.2 / 26;    // base kinematic viscosity
-    this.viscScale = 1.45;        // user multiplier
+    this.viscScale = 1.00;        // user multiplier
     this.cohesion = 0.55;
     this.surfaceTensionScale = 1.60;
 
     // Distinct masses ("blobs")
     this.MAX_BLOBS = 32;
-    this.surfaceTension = 1.50;    // user multiplier for inter-blob repulsion
+    this.surfaceTension = 1.00;    // user multiplier for inter-blob repulsion
     this.interRepel = 60;
     this.tempRepelMult = 0.05;
     this.connectDist = this.h * 0.82;
@@ -447,7 +447,7 @@ class SPH {
     // Pool-zone spring attenuation band (y-space)
     this.poolSpringLo = 480;   // spring starts fading here
     this.poolSpringHi = 580;   // spring is at minimum here
-    this.poolSpringAtten = 0.5; // multiply spring by this in pool (0.5 = half)
+    this.poolSpringAtten = 0.6; // multiply spring by this in pool (0.6 = 60%)
 
     // Sticky bottom layer
     this.stickyHeight = 90;
@@ -513,10 +513,10 @@ class SPH {
 
     // Heat
     this.tAmbient = 0.18;
-    this.heatScale = 1.40;
+    this.heatScale = 3.00;
     this.heatRate = 0.05;
     this.heatDiff = 0.05;
-    this.heatDiffScale = 2.50;
+    this.heatDiffScale = 5.00;
     this.interDiffRatio = 0.03;
     this.ambientCool = 0.01;
     this.ambientCoolScale = 1.00;
@@ -1773,7 +1773,26 @@ void main() {
   vec3 poolBlockColor = mix(uCold, uHot, 0.45) * mix(0.55, 1.15, pow(t, 1.4));
   fluidBg = mix(fluidBg, poolBlockColor, poolBlockMask);
 
-  // -------- (God rays placeholder — disabled, see git history) ---------
+  // -------- Volumetric light from below ---------
+  // The texture holds per-column light intensity: bright where light from
+  // the pool passes through unobstructed, dark where wax blocks it.
+  // Horizontally blurred on CPU with mass-dependent kernel for refraction.
+  if (uNumCols > 0 && uNumRows > 0) {
+    float colU = simPos.x / uSim.x;
+    float colV = 1.0 - t;   // texV: 0=top of lamp, 1=bottom
+    float light = texture(uColMass, vec2(colU, colV)).r;
+
+    // God ray: additive warm glow scaled by bulb glow slider
+    vec3 rayColor = mix(uHot, vec3(1.0, 0.97, 0.90), 0.3);
+    // Envelope: strong in lower-mid bulb, gentler fade toward top
+    float envelope = smoothstep(0.93, 0.65, t) * smoothstep(0.02, 0.15, t);
+    float glowScale = uGlow / 0.55;  // normalized so default glow=0.55 → 1.0
+    fluidBg += rayColor * light * envelope * 0.80 * glowScale;
+
+    // Darken where light is blocked (1 - light = shadow)
+    float shadow = (1.0 - light) * envelope * 0.45 * glowScale;
+    fluidBg *= 1.0 - shadow;
+  }
 
   // -------- Wax shading from temperature ---------
   float tempN = clamp((temp - 0.18) / 0.85, 0.0, 1.0);
@@ -1834,9 +1853,9 @@ void main() {
   // ---- Uniform translucency + pressure opacity ----
   // Base 10% transparency, plus a soft center fade so the core
   // of each blob feels translucent rather than a solid disc.
-  alpha *= 0.90;
+  alpha *= 0.82;
   alpha *= 1.0 - centerness * 0.30;
-  alpha *= 1.0 - compIntensity * 0.65;
+  alpha *= max(1.0 - compIntensity * 0.65, 0.40);  // clip at 60% transparency
 
   // Inner core detail
   float coreAlpha = smoothstep(threshold + 0.05, threshold + 0.55, field);
@@ -2020,12 +2039,15 @@ class MetaballRenderer {
     // Each cell accumulates wax mass at that (x, y) region.
     // A mass-dependent horizontal blur simulates light scattering:
     // dense regions stay sharp, sparse regions spread.
-    this.NUM_COLS = 50;
-    this.NUM_ROWS = 30;
+    this.NUM_COLS = 100;
+    this.NUM_ROWS = 60;
+    // Enable float texture linear filtering if available; fall back to NEAREST
+    const floatLinear = gl.getExtension('OES_texture_float_linear');
+    const colMassFilter = floatLinear ? gl.LINEAR : gl.NEAREST;
     this.colMassTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.colMassTex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, colMassFilter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, colMassFilter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F,
@@ -2153,73 +2175,161 @@ class MetaballRenderer {
     const colW = SIM_W / NC;
     const rowH = SIM_H / NR;
     const gridSize = NC * NR;
-    const massRaw = new Float32Array(gridSize);   // scratch
+    const massRaw = new Float32Array(gridSize);
     const nFixed = sim.nFixed;
     for (let i = nFixed; i < n; i++) {
       const ci = (sx[i] / colW) | 0;
       const ri = (sy[i] / rowH) | 0;
       const c0 = ci < 0 ? 0 : ci >= NC ? NC - 1 : ci;
       const r0 = ri < 0 ? 0 : ri >= NR ? NR - 1 : ri;
-      // Spread to ±1 in each axis (cross-shaped kernel)
       const idx = r0 * NC + c0;
       massRaw[idx] += 1.0;
-      // Vertical neighbors (±1 row)
       if (r0 > 0)      massRaw[idx - NC] += 0.25;
       if (r0 < NR - 1) massRaw[idx + NC] += 0.25;
-      // Horizontal neighbors (±1 col)
       if (c0 > 0)      massRaw[idx - 1] += 0.25;
       if (c0 < NC - 1) massRaw[idx + 1] += 0.25;
     }
 
-    // Step 2: Mass-dependent horizontal blur.
-    // More mass at a cell → tighter kernel (less blur, sharper shadow).
-    // Less mass → wider kernel (more diffuse scattering).
-    const blurred = new Float32Array(gridSize);
-    const MAX_RADIUS = 4;   // max blur radius in cells (for sparse regions)
-    const MIN_RADIUS = 0;   // no blur for very dense regions
+    // Step 2: Per-column light transport (bottom → top).
+    // Light starts just above the pool surface and walks upward.
+    // Pool particles would absorb everything, so we begin the transport
+    // at the pool boundary row and ignore mass below it.
+    // Pool surface is at t ≈ 0.85 → sim y ≈ 0.85 * SIM_H.
+    const lightField = new Float32Array(gridSize);
+    const ABSORB_RATE = 0.18;  // absorption per unit mass (tuned for ~160 particles)
+    const poolRow = Math.floor(0.82 * NR);  // row index of pool surface
+    for (let c = 0; c < NC; c++) {
+      // Pool base brightness: based on bottle width at pool surface.
+      // Use a wider falloff so light reaches close to the bottle edge.
+      const cx = (c + 0.5) * colW;
+      const poolHalf = bottleHalfFrac(0.85) * SIM_W;
+      const distFromCenter = Math.abs(cx - SIM_W * 0.5);
+      const edgeT = Math.min(distFromCenter / poolHalf, 1.0);
+      // Remap edgeT so brightness stays high until close to the edge
+      const edgeFalloff = edgeT * edgeT * edgeT;  // cubic — stays bright longer, drops fast at edge
+      const poolBrightness = Math.max(0, 1.0 - edgeFalloff) * (params.glow / 0.55);
+      // Rows below pool surface: full brightness (pool glow handled by shader)
+      for (let r = NR - 1; r > poolRow; r--) {
+        lightField[r * NC + c] = poolBrightness;
+      }
+      // Walk upward from pool surface, attenuating by mass
+      let light = poolBrightness;
+      for (let r = poolRow; r >= 0; r--) {
+        const m = massRaw[r * NC + c];
+        light *= Math.exp(-m * ABSORB_RATE);
+        lightField[r * NC + c] = light;
+      }
+    }
+
+    // Step 3: Vertical convolution for blur-kernel field.
+    // For each cell, sum mass in the same column over LOOK_BELOW rows
+    // below it. This determines how much horizontal smoothing to apply.
+    const LOOK_BELOW = 10;
+    const massBelow = new Float32Array(gridSize);
+    for (let c = 0; c < NC; c++) {
+      // Running sum with a sliding window (bottom to top)
+      let runSum = 0;
+      // Seed: sum the bottom LOOK_BELOW rows
+      for (let r = NR - 1; r >= Math.max(0, NR - LOOK_BELOW); r--) {
+        runSum += massRaw[r * NC + c];
+      }
+      massBelow[(NR - 1) * NC + c] = runSum;
+      // Slide upward
+      for (let r = NR - 2; r >= 0; r--) {
+        // Add the row that just entered the window (r itself)
+        // The window covers rows [r .. r+LOOK_BELOW-1]
+        runSum += massRaw[r * NC + c];
+        // Remove the row that fell out (r + LOOK_BELOW)
+        if (r + LOOK_BELOW < NR) {
+          runSum -= massRaw[(r + LOOK_BELOW) * NC + c];
+        }
+        massBelow[r * NC + c] = runSum;
+      }
+    }
+
+    // Step 4: Mass-dependent horizontal blur of the light field.
+    // High massBelow → narrow blur (shadow stays sharp).
+    // Low massBelow → wide blur (light scatters/refracts).
+    const lightBlurred = new Float32Array(gridSize);
+    const MAX_RADIUS = 24;
+    const MIN_RADIUS = 0;
     for (let r = 0; r < NR; r++) {
       const rowOff = r * NC;
       for (let c = 0; c < NC; c++) {
-        // Local mass determines blur radius: high mass → small radius
-        // Also look at ±1 row for vertical context ("a few levels behind it")
-        let localMass = massRaw[rowOff + c];
-        if (r > 0)      localMass += massRaw[rowOff - NC + c] * 0.5;
-        if (r < NR - 1) localMass += massRaw[rowOff + NC + c] * 0.5;
-        // Map mass to blur radius: 0 mass → MAX_RADIUS, high mass → MIN_RADIUS
-        const massFactor = Math.min(localMass / 6.0, 1.0);  // saturate at ~6 particles
+        const mb = massBelow[rowOff + c];
+        const massFactor = Math.min(mb / 10.0, 1.0);
         const radius = Math.round(MAX_RADIUS * (1.0 - massFactor) + MIN_RADIUS * massFactor);
-        // Box blur with computed radius
+        if (radius === 0) {
+          lightBlurred[rowOff + c] = lightField[rowOff + c];
+          continue;
+        }
         let sum = 0, weight = 0;
         for (let dc = -radius; dc <= radius; dc++) {
           const cc = c + dc;
           if (cc >= 0 && cc < NC) {
-            const w = 1.0 - Math.abs(dc) / (radius + 1);  // triangular weight
-            sum += massRaw[rowOff + cc] * w;
+            const w = 1.0 - Math.abs(dc) / (radius + 1);
+            sum += lightField[rowOff + cc] * w;
             weight += w;
           }
         }
-        blurred[rowOff + c] = weight > 0 ? sum / weight : 0;
+        lightBlurred[rowOff + c] = weight > 0 ? sum / weight : 0;
       }
     }
 
-    // Step 3: Temporal smoothing (EMA) and normalization
-    const smoothK = 0.15;
-    let maxMass = 1.0;
-    for (let k = 0; k < gridSize; k++) {
-      colSmooth[k] += (blurred[k] - colSmooth[k]) * smoothK;
-      if (colSmooth[k] > maxMass) maxMass = colSmooth[k];
-    }
-    // Pack into RGBA32F texture (R channel only).
-    // Texture layout: row 0 = bottom of lamp (high y in sim), row NR-1 = top.
-    // The shader maps t ∈ [0,1] (0=top, 1=bottom) → texV = 1-t.
-    const invMax = 1.0 / maxMass;
+    // Step 5: Universal spatial blur — smooth the entire light field
+    // with a fixed-radius Gaussian-ish kernel so small mass changes
+    // don't cause the light to jump around.
+    const SMOOTH_R = 4;  // fixed blur radius (in grid cells)
+    const lightSmoothed = new Float32Array(gridSize);
     for (let r = 0; r < NR; r++) {
-      // Flip: sim row r (y increases downward) → texture row (NR-1-r)
+      const rowOff = r * NC;
+      for (let c = 0; c < NC; c++) {
+        let sum = 0, wt = 0;
+        for (let dc = -SMOOTH_R; dc <= SMOOTH_R; dc++) {
+          const cc = c + dc;
+          if (cc >= 0 && cc < NC) {
+            const w = 1.0 - Math.abs(dc) / (SMOOTH_R + 1);
+            sum += lightBlurred[rowOff + cc] * w;
+            wt += w;
+          }
+        }
+        lightSmoothed[rowOff + c] = wt > 0 ? sum / wt : 0;
+      }
+    }
+    // Also blur vertically with same kernel
+    const lightFinal = new Float32Array(gridSize);
+    for (let c = 0; c < NC; c++) {
+      for (let r = 0; r < NR; r++) {
+        let sum = 0, wt = 0;
+        for (let dr = -SMOOTH_R; dr <= SMOOTH_R; dr++) {
+          const rr = r + dr;
+          if (rr >= 0 && rr < NR) {
+            const w = 1.0 - Math.abs(dr) / (SMOOTH_R + 1);
+            sum += lightSmoothed[rr * NC + c] * w;
+            wt += w;
+          }
+        }
+        lightFinal[r * NC + c] = wt > 0 ? sum / wt : 0;
+      }
+    }
+
+    // Step 6: Temporal smoothing (EMA) — no normalization needed,
+    // light values are already 0-1 from the transport.
+    const smoothK = 0.15;
+    for (let k = 0; k < gridSize; k++) {
+      colSmooth[k] += (lightFinal[k] - colSmooth[k]) * smoothK;
+    }
+    // Pack into RGBA32F texture.
+    // R = light intensity (0 = fully blocked, 1 = full pool brightness).
+    // Texture row 0 = sim bottom (pool), row NR-1 = sim top.
+    for (let r = 0; r < NR; r++) {
       const srcOff = r * NC;
+      // Flip: sim row r (y down) → texture row (NR-1-r) so texV=0 is top
       const dstRow = (NR - 1 - r) * NC;
       for (let c = 0; c < NC; c++) {
         const dstIdx = (dstRow + c) << 2;
-        colData[dstIdx]     = colSmooth[srcOff + c] * invMax;
+        const light = Math.min(colSmooth[srcOff + c], 1.0);
+        colData[dstIdx]     = light;
         colData[dstIdx + 1] = 0;
         colData[dstIdx + 2] = 0;
         colData[dstIdx + 3] = 0;
@@ -2274,9 +2384,9 @@ class MetaballRenderer {
     const poolGid = sim.nFixed > 0 ? sim.groupId[0] : -1;
     if (this.u.poolGroupId) gl.uniform1i(this.u.poolGroupId, poolGid);
     if (this.u.compressColor) gl.uniform3fv(this.u.compressColor, params.compressColor);
-    if (this.u.colMass) gl.uniform1i(this.u.colMass, 2);
-    if (this.u.numCols) gl.uniform1i(this.u.numCols, this.NUM_COLS);
-    if (this.u.numRows) gl.uniform1i(this.u.numRows, this.NUM_ROWS);
+    if (this.u.colMass) { gl.uniform1i(this.u.colMass, 2); }
+    if (this.u.numCols) gl.uniform1i(this.u.numCols, params.volAbsorb !== false ? this.NUM_COLS : 0);
+    if (this.u.numRows) gl.uniform1i(this.u.numRows, params.volAbsorb !== false ? this.NUM_ROWS : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
 }
@@ -2307,7 +2417,7 @@ const params = {
   cold: hexToRgb("#9a0f1a"),
   hot:  hexToRgb("#ffcf3a"),
   compressColor: hexToRgb("#FFE0B0"),
-  glow: 0.55,
+  glow: 0.38,
   time: 0,
   volAbsorb: true,
 };
