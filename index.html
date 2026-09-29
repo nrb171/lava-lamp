@@ -683,6 +683,9 @@ class MetaballRenderer {
     this.WALL_AVG_TAU = 25;          // seconds
     this.bdData = new Float32Array(GW * 4);
     this.wallRowBlur = makeTriBlur(this.WCOLS, 48);
+    this.MAX_SPOTS = 12;
+    this.spotData = new Float32Array(this.MAX_SPOTS * 4);
+    this.spotFade = new Map();          // blob id → 0..1, eases spots in/out
     this.backdropTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.backdropTex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, colMassFilter);
@@ -709,6 +712,8 @@ class MetaballRenderer {
       blobSize:    this.uloc("uBlobSize"),
       colMass:       this.uloc("uColMass"),
       backdrop:      this.uloc("uBackdrop"),
+      spots:         this.uloc("uSpots"),
+      spotCount:     this.uloc("uSpotCount"),
       viewM:         this.uloc("uViewM"),
       wallOn:        this.uloc("uWall"),
       poolId:        this.uloc("uPoolId"),
@@ -1155,6 +1160,50 @@ class MetaballRenderer {
     }
   }
 
+  // ---- Focused spots: each blob is a lens imaging the bulb ----------
+  // A wax blob of radius a in the liquid is a weak converging lens,
+  // f ≈ n_rel·a / (2(n_rel − 1)) ≈ 8a. The bulb (a disc, radius BULB_R, a
+  // distance u below/behind the blob) is imaged at v = 1/(1/f − 1/u). The
+  // light the blob intercepts lands on the wall — w beyond the blob along
+  // the bulb→blob ray — as a sharp-edged disc: the defocus circle
+  // a·|1 − w/v| or the bulb's image BULB_R·w/u, whichever is larger. Its
+  // brightness is that intercepted power spread over the disc, relative to
+  // the plain bulb light there. Only blobs in the back half (z < 0) throw
+  // light onto the wall behind. Returns spots in sim coordinates.
+  computeSpots(sim, maxSpots) {
+    const D = this.WALL_DIST, cx = SIM_W * 0.5;
+    const Sy = SIM_H * 0.965, BULB_R = 25;
+    const NREL = 1.43 / 1.34;
+    const V0 = sim.mass / sim.restDensity;
+    const gid0 = sim.nFixed > 0 ? sim.groupId[0] : -1;
+    const out = [];
+    for (let g = 1; g < sim.MAX_BLOBS; g++) {
+      const N = sim.cmn[g];
+      if (N < 3 || g === gid0 || g === sim._poolBlobId) continue;
+      const zN = sim.blobZ[g] - 0.5;
+      if (zN >= -0.02) continue;
+      const Rloc = bottleHalfFrac(Math.min(0.95, Math.max(0.05, sim.cmy[g] / SIM_H))) * SIM_W;
+      const z = -zN * 2 * 0.8 * Rloc;                  // depth behind the mid-plane
+      const bx = sim.cmx[g] - cx, by = sim.cmy[g] - Sy;
+      const u = Math.sqrt(bx * bx + by * by + z * z);   // bulb → blob
+      const k = D / z;                                   // ray parameter to the wall
+      const wx = cx + bx * k, wy = Sy + by * k;
+      if (wy < -80 || wy > SIM_H + 80 || wx < -VIEW_M - 80 || wx > SIM_W + VIEW_M + 80) continue;
+      const w = u * (k - 1);                             // blob → wall
+      const a = Math.sqrt(N * V0 / Math.PI);
+      const f = NREL * a / (2 * (NREL - 1));
+      let rDef;
+      if (u > f) { const v = 1 / (1 / f - 1 / u); rDef = a * Math.abs(1 - w / v); }
+      else { const vv = 1 / (1 / u - 1 / f); rDef = a * (1 + w / vv); }   // diverging
+      const r = Math.max(rDef, BULB_R * w / u, 4);
+      // intercepted power over the disc, relative to plain bulb light there
+      const gain = Math.min(12, (a * (u + w) / (u * r)) ** 2);
+      out.push({ x: wx, y: wy, r, gain, g });
+    }
+    out.sort((p, q) => q.gain - p.gain);
+    return out.slice(0, maxSpots);
+  }
+
   // Half-float scene target plus a bloom pyramid (½, ¼, … of the canvas).
   ensureTargets(w, h) {
     const gl = this.gl;
@@ -1515,7 +1564,6 @@ class MetaballRenderer {
             this.bdRef = cnt && sum > 0 ? sum / cnt : 1;
           }
           this.traceBackdrop(colSmooth, this.waxFrac, glowN, false, 1 / Math.max(glowN, 1e-3));
-          this.projectBlobs(sim, sx, sy, glowN);
           this.bdPrevL.set(this.bdCurL); this.bdPrevW.set(this.bdCurW);
           // Only light above the lamp's running-average (default) wall light
           // is drawn; negative where wax takes light away (the shader clamps
@@ -1529,8 +1577,8 @@ class MetaballRenderer {
           const tau = this._bdAge < 20 ? 2 : this.WALL_AVG_TAU;
           const alpha = Math.min(1, every / 60 / tau);
           for (let k = 0; k < this.bdCurL.length; k++) {
-            const vL = this.bdRawL[k] / this.bdRef + this.projL[k];
-            const vW = this.bdRawW[k] / this.bdRef + this.projW[k];
+            const vL = this.bdRawL[k] / this.bdRef;
+            const vW = this.bdRawW[k] / this.bdRef;
             if (!this.bdAvgInit) { aL[k] = vL; aW[k] = vW; }
             else { aL[k] += (vL - aL[k]) * alpha; aW[k] += (vW - aW[k]) * alpha; }
             this.bdCurL[k] = vL - aL[k];
@@ -1716,6 +1764,28 @@ class MetaballRenderer {
     }
     if (this.u.colMass) { gl.uniform1i(this.u.colMass, 2); }
     if (this.u.backdrop) gl.uniform1i(this.u.backdrop, 3);
+    if (this.u.spots) {
+      // Spots follow their blobs every frame; each fades in/out over ~0.3 s
+      // so blobs appearing, merging or crossing the mid-plane don't pop.
+      const spots = params.wall !== false ? this.computeSpots(sim, this.MAX_SPOTS) : [];
+      const seen = new Set();
+      for (const sp of spots) seen.add(sp.g);
+      for (const [g, a] of this.spotFade) if (!seen.has(g)) {
+        const na = a - dt / 0.3; if (na <= 0) this.spotFade.delete(g); else this.spotFade.set(g, na);
+      }
+      let n = 0;
+      const glowN = params.glow / 0.38;
+      for (const sp of spots) {
+        const a = Math.min(1, (this.spotFade.get(sp.g) || 0) + dt / 0.3);
+        this.spotFade.set(sp.g, a);
+        const o = n * 4;
+        this.spotData[o] = sp.x; this.spotData[o + 1] = sp.y;
+        this.spotData[o + 2] = sp.r; this.spotData[o + 3] = sp.gain * a * glowN;
+        n++;
+      }
+      gl.uniform4fv(this.u.spots, this.spotData);
+      gl.uniform1i(this.u.spotCount, n);
+    }
     if (this.u.wallOn) gl.uniform1f(this.u.wallOn,
       params.wall !== false && params.caustics !== false && params.volAbsorb !== false ? 1 : 0);
     if (this.u.poolId) gl.uniform1f(this.u.poolId, poolGid);

@@ -159,6 +159,8 @@ uniform vec4  uGhostMix;
 uniform sampler2D uColMass;   // 2D mass grid (NUM_COLS × NUM_ROWS), normalized 0-1
 uniform sampler2D uBackdrop;  // wall behind the lamp: R = liquid light, G = wax light
 uniform float uWall;          // 1 = draw the lit wall
+uniform vec4  uSpots[12];     // focused spots on the wall: (x, y, radius, gain), sim px
+uniform int   uSpotCount;
 uniform int   uNumCols;       // grid columns (50)
 uniform int   uNumRows;       // grid rows (30)
 
@@ -598,7 +600,22 @@ void main() {
     // light shows purple, extra light through / from wax shows amber, and
     // light taken away just leaves the wall dark (clamping the mixed colour
     // per channel would leave odd hues, e.g. green from amber − purple).
-    frameOut = WALL_ALBEDO * 0.16 * (max(bd.r, 0.0) * lampL * lTint + max(bd.g, 0.0) * waxL);
+    frameOut = WALL_ALBEDO * 0.10 * (max(bd.r, 0.0) * lampL * lTint + max(bd.g, 0.0) * waxL);
+    // Focused spots (each blob imaging the bulb): hard-edged discs, uniform
+    // inside like a defocused lens image. Light through wax is amber.
+    // Edge ≈ 1.5 canvas px.
+    float pxSim = (uSim.x + 2.0 * uViewM) / uRes.x;
+    vec3 spotCol = lampL * mix(uCold, uHot, 0.7);
+    for (int i = 0; i < 12; i++) {
+      if (i >= uSpotCount) break;
+      vec4 sp = uSpots[i];
+      float d = length(simPos - sp.xy);
+      float disc = 1.0 - smoothstep(sp.z - 1.5 * pxSim, sp.z + 1.5 * pxSim, d);
+      // plain bulb light at this wall point (point source on a flat wall)
+      vec2 rel = sp.xy - vec2(uSim.x * 0.5, uSim.y * 0.965);
+      float Ebulb = pow(200.0 / sqrt(dot(rel, rel) + 200.0 * 200.0), 3.0);
+      frameOut += WALL_ALBEDO * 0.05 * sp.w * Ebulb * disc * spotCol;
+    }
   }
 
   vec3 col;
