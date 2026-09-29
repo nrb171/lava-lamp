@@ -36,7 +36,8 @@
   }
   canvas#lava {
     display: block;
-    width: 380px;
+    /* lamp (380) plus 130 of wall on each side, 700 tall (sim px) */
+    width: 640px;
     height: 700px;
     border-radius: 28px;
     /* prevent the browser from translating drag gestures into scroll/zoom */
@@ -159,7 +160,7 @@
   @media (max-width: 760px) {
     body { padding: 12px; gap: 16px; }
     /* keep the sim's 380:700 aspect so the lamp isn't stretched */
-    canvas#lava { width: min(320px, calc(100vw - 24px)); height: auto; aspect-ratio: 380 / 700; }
+    canvas#lava { width: min(400px, calc(100vw - 24px)); height: auto; aspect-ratio: 640 / 700; }
     .controls { width: 100%; max-width: 320px; }
     /* backdrop blur is expensive on phones; the panel sits on plain black */
     .controls { backdrop-filter: none; -webkit-backdrop-filter: none; }
@@ -201,8 +202,8 @@
   /* Fullscreen: scale the canvas to fill the viewport, keep aspect ratio */
   :fullscreen canvas#lava,
   :-webkit-full-screen canvas#lava {
-    height: min(94vh, calc(94vw * 700 / 380));
-    width:  min(94vw, calc(94vh * 380 / 700));
+    height: min(94vh, calc(94vw * 700 / 640));
+    width:  min(94vw, calc(94vh * 640 / 700));
   }
   :fullscreen body,
   :-webkit-full-screen body {
@@ -661,22 +662,27 @@ class MetaballRenderer {
     this.capF1 = new Float32Array(G);  this.wallF1 = new Float32Array(this.NUM_ROWS * 2);
     // Backdrop wall behind the lamp (see traceBackdrop): liquid-light and
     // wax-light irradiance on the wall, per grid cell of the canvas.
-    this.WALL_DIST = 300;                              // wall plane behind the axis (sim px)
-    this.bdRawL = new Float32Array(G); this.bdRawW = new Float32Array(G);
-    this.bdTmp = new Float32Array(G);
-    this.bdPrevL = new Float32Array(G); this.bdCurL = new Float32Array(G);
-    this.bdPrevW = new Float32Array(G); this.bdCurW = new Float32Array(G);
-    this.bdF1L = new Float32Array(G);   this.bdF1W = new Float32Array(G);
-    this.bdL = new Float32Array(G);     this.bdW = new Float32Array(G);
+    this.WALL_DIST = 200;                              // wall plane behind the axis (sim px): lamp near a wall
+    // The wall grid covers the whole view (lamp + margins), same cell width.
+    this.WCOLS = Math.round(VIEW_W / (SIM_W / this.NUM_COLS));
+    const GW = this.WCOLS * this.NUM_ROWS;
+    this.bdRawL = new Float32Array(GW); this.bdRawW = new Float32Array(GW);
+    this.bdTmp = new Float32Array(GW);
+    this.projL = new Float32Array(GW);  this.projW = new Float32Array(GW);
+    this.projPhi = new Float32Array(GW);
+    this.bdPrevL = new Float32Array(GW); this.bdCurL = new Float32Array(GW);
+    this.bdPrevW = new Float32Array(GW); this.bdCurW = new Float32Array(GW);
+    this.bdF1L = new Float32Array(GW);   this.bdF1W = new Float32Array(GW);
+    this.bdL = new Float32Array(GW);     this.bdW = new Float32Array(GW);
     this.bdRef = null;
-    this.bdData = new Float32Array(G * 4);
+    this.bdData = new Float32Array(GW * 4);
     this.backdropTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.backdropTex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, colMassFilter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, colMassFilter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, this.NUM_COLS, this.NUM_ROWS, 0, gl.RGBA, gl.FLOAT, null);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, this.WCOLS, this.NUM_ROWS, 0, gl.RGBA, gl.FLOAT, null);
 
     // Uniforms
     this.uloc = (n) => gl.getUniformLocation(prog, n);
@@ -696,6 +702,7 @@ class MetaballRenderer {
       blobSize:    this.uloc("uBlobSize"),
       colMass:       this.uloc("uColMass"),
       backdrop:      this.uloc("uBackdrop"),
+      viewM:         this.uloc("uViewM"),
       wallOn:        this.uloc("uWall"),
       poolId:        this.uloc("uPoolId"),
       lens:          this.uloc("uLens"),
@@ -945,6 +952,7 @@ class MetaballRenderer {
     const NC = this.NUM_COLS, NR = this.NUM_ROWS;
     const colW = SIM_W / NC, rowH = SIM_H / NR;
     const cx = SIM_W * 0.5, D = this.WALL_DIST;
+    const NW = this.WCOLS, wColW = VIEW_W / NW;            // wall grid, view coords
     const L = this.bdRawL, W = this.bdRawW, T = this.bdTmp;
     L.fill(0); W.fill(0);
     const NS = 20, NZ = 2, NA = 12, ETA = 1.34;
@@ -958,13 +966,15 @@ class MetaballRenderer {
     // positions bound a beam; its power spreads evenly between where the two
     // rays land (narrow = focused = bright), so the wall light is smooth
     // instead of a comb of single-ray hits.
+    // xa, xb in sim x; the wall grid starts at −VIEW_M
     const tube = (grid, base, xa, xb, e) => {
+      xa += VIEW_M; xb += VIEW_M;
       if (xa > xb) { const q = xa; xa = xb; xb = q; }
-      if (xb - xa < colW) { const m = 0.5 * (xa + xb); xa = m - 0.5 * colW; xb = m + 0.5 * colW; }
+      if (xb - xa < wColW) { const m = 0.5 * (xa + xb); xa = m - 0.5 * wColW; xb = m + 0.5 * wColW; }
       const len = xb - xa;
-      const c0 = Math.max(0, Math.floor(xa / colW)), c1 = Math.min(NC - 1, Math.floor(xb / colW));
+      const c0 = Math.max(0, Math.floor(xa / wColW)), c1 = Math.min(NW - 1, Math.floor(xb / wColW));
       for (let c = c0; c <= c1; c++) {
-        const ov = Math.min(xb, (c + 1) * colW) - Math.max(xa, c * colW);
+        const ov = Math.min(xb, (c + 1) * wColW) - Math.max(xa, c * wColW);
         if (ov > 0) grid[base + c] += e * ov / len;
       }
     };
@@ -977,7 +987,7 @@ class MetaballRenderer {
       if (t < 0.05 || t > 0.95) continue;
       const R = bottleHalfFrac(t) * SIM_W;
       if (R < 3) continue;
-      const base = r * NC;
+      const base = r * NC, wbase = r * NW;
       const beer = Math.exp(-Math.max(0.88 - t, 0) * 2.2);
       const inPool = t > 0.885;
       // per-source emission (liquid scatter, lit wax), with volume element
@@ -1026,8 +1036,8 @@ class MetaballRenderer {
             const xa = XW[is], xb = XW[is + 1];
             if (xa !== xa || xb !== xb || Math.abs(xa - xb) > 20 * colW) continue;
             const eL = 0.5 * (EL[is] + EL[is + 1]), eW = 0.5 * (EW[is] + EW[is + 1]);
-            if (eL > 0) tube(L, base, xa, xb, eL);
-            if (eW > 0) tube(W, base, xa, xb, eW);
+            if (eL > 0) tube(L, wbase, xa, xb, eL);
+            if (eW > 0) tube(W, wbase, xa, xb, eW);
           }
         }
       }
@@ -1041,15 +1051,91 @@ class MetaballRenderer {
     for (const G of [L, W]) {
       T.fill(0);
       for (let r = 0; r < NR; r++) {
-        const src = r * NC;
+        const src = r * NW;
         for (let d = -K; d <= K; d++) {
           const rr = r + d; if (rr < 0 || rr >= NR) continue;
           const w = ker[d + K]; if (w < 1e-4) continue;
-          const dst = rr * NC;
-          for (let c = 0; c < NC; c++) T[dst + c] += G[src + c] * w;
+          const dst = rr * NW;
+          for (let c = 0; c < NW; c++) T[dst + c] += G[src + c] * w;
         }
       }
       G.set(T);
+    }
+  }
+
+  // ---- Blob images projected onto the wall by the bulb -------------
+  // The bulb under the base is a compact source, so each blob in the back
+  // half of the globe (depth z < 0 — the same depth the renderer uses to
+  // layer blobs) throws a magnified image of itself onto the wall: a point
+  // p goes to  S + (p − S)·D/|z|  (S = bulb, D = wall distance). Images
+  // rise faster than the blobs and grow up the wall as blobs leave the
+  // pool. The bulb's finite size softens their edges (penumbra ∝ (1−s)/s).
+  // Wax is a weak converging lens (f ≈ 8 × blob radius, comparable to the
+  // distance to the wall), so its image is brighter than the surrounding
+  // liquid-filtered light and takes the wax's colour.
+  projectBlobs(sim, px, py, glow) {
+    const NR = this.NUM_ROWS, NW = this.WCOLS;
+    const rowH = SIM_H / NR, wColW = VIEW_W / NW, cellA = wColW * rowH;
+    const D = this.WALL_DIST, cx = SIM_W * 0.5;
+    const Sx = cx, Sy = SIM_H * 0.965;                  // bulb
+    const BULB_R = 25, LENS_GAIN = 2.2, K_BULB = 0.9;   // bulb ≈ ⅛ of the globe's radius
+    const V0 = sim.mass / sim.restDensity;
+    const pr0 = Math.sqrt(V0 / Math.PI);
+    const phiW = this.projPhi, pL = this.projL, pW = this.projW;
+    phiW.fill(0);
+    const gid = sim.groupId, bz = sim.blobZ;
+    const skipA = sim.nFixed > 0 ? gid[0] : -1, skipB = sim._poolBlobId;
+    for (let i = sim.nFixed; i < sim.n; i++) {
+      const g = gid[i];
+      if (g === skipA || g === skipB) continue;
+      const zN = bz[g] - 0.5;                            // < 0 : back half
+      if (zN >= -0.02) continue;
+      const Rloc = bottleHalfFrac(Math.min(0.95, Math.max(0.05, sim.cmy[g] / SIM_H))) * SIM_W;
+      const z = -zN * 2 * 0.8 * Rloc;                   // |z| behind the mid-plane
+      const sSc = Math.min(0.7, Math.max(0.18, z / D));
+      const mag = 1 / sSc;
+      const wx = Sx + (px[i] - Sx) * mag + VIEW_M, wy = Sy + (py[i] - Sy) * mag;
+      const rp = pr0 * mag, pen = BULB_R * (1 - sSc) / sSc;
+      const Rk = 1.3 * Math.sqrt(rp * rp + pen * pen), Rk2 = Rk * Rk;
+      if (wy + Rk < 0 || wy - Rk > SIM_H || wx + Rk < 0 || wx - Rk > VIEW_W) continue;
+      const c0 = Math.max(0, Math.floor((wx - Rk) / wColW)), c1 = Math.min(NW - 1, Math.floor((wx + Rk) / wColW));
+      const r0 = Math.max(0, Math.floor((wy - Rk) / rowH)), r1 = Math.min(NR - 1, Math.floor((wy + Rk) / rowH));
+      // normalisation of the kernel, then deposit projected area V0·mag²
+      let wsum = 0;
+      for (let r = r0; r <= r1; r++) {
+        const dy = (r + 0.5) * rowH - wy;
+        for (let c = c0; c <= c1; c++) {
+          const dx = (c + 0.5) * wColW - wx;
+          const q = 1 - (dx * dx + dy * dy) / Rk2;
+          if (q > 0) wsum += q * q;
+        }
+      }
+      if (wsum <= 0) continue;
+      const amp = V0 * mag * mag / (cellA * wsum);
+      for (let r = r0; r <= r1; r++) {
+        const dy = (r + 0.5) * rowH - wy;
+        for (let c = c0; c <= c1; c++) {
+          const dx = (c + 0.5) * wColW - wx;
+          const q = 1 - (dx * dx + dy * dy) / Rk2;
+          if (q > 0) phiW[r * NW + c] += q * q * amp;
+        }
+      }
+    }
+    // Direct bulb light on the wall: point source, flat wall → E ∝ (D/r)³;
+    // the base blocks it below the bulb. Split into light through liquid
+    // and light through (projected) wax.
+    for (let r = 0; r < NR; r++) {
+      const y = (r + 0.5) * rowH, dy = y - Sy;
+      const above = Math.min(1, Math.max(0, (Sy - y) / (0.08 * SIM_H)));
+      for (let c = 0; c < NW; c++) {
+        const x = (c + 0.5) * wColW - VIEW_M, dx = x - Sx;
+        const rr = Math.sqrt(dx * dx + dy * dy + D * D);
+        const E = K_BULB * glow * above * (D / rr) ** 3;
+        const k = r * NW + c;
+        const cov = 1 - Math.exp(-phiW[k]);
+        pL[k] = E * (1 - cov);
+        pW[k] = E * cov * LENS_GAIN;
+      }
     }
   }
 
@@ -1395,19 +1481,21 @@ class MetaballRenderer {
             // normalise: mean wall light beside an empty lamp, glow 1
             this.traceBackdrop(colSmooth, this.waxFrac, 1.0, true);
             let sum = 0, cnt = 0;
+            const NW = this.WCOLS, wColW = VIEW_W / NW;
             for (let r = Math.floor(0.1 * NR); r < Math.floor(0.6 * NR); r++) {
               const hwc = bottleHalfFrac((r + 0.5) / NR) * SIM_W;
-              for (let c = 0; c < NC; c++) {
-                if (Math.abs((c + 0.5) * colW - SIM_W / 2) > hwc) { sum += this.bdRawL[r * NC + c]; cnt++; }
+              for (let c = 0; c < NW; c++) {
+                if (Math.abs((c + 0.5) * wColW - VIEW_M - SIM_W / 2) > hwc) { sum += this.bdRawL[r * NW + c]; cnt++; }
               }
             }
             this.bdRef = cnt && sum > 0 ? sum / cnt : 1;
           }
           this.traceBackdrop(colSmooth, this.waxFrac, glowN, false);
+          this.projectBlobs(sim, sx, sy, glowN);
           this.bdPrevL.set(this.bdCurL); this.bdPrevW.set(this.bdCurW);
-          for (let k = 0; k < gridSize; k++) {
-            this.bdCurL[k] = this.bdRawL[k] / this.bdRef;
-            this.bdCurW[k] = this.bdRawW[k] / this.bdRef;
+          for (let k = 0; k < this.bdCurL.length; k++) {
+            this.bdCurL[k] = this.bdRawL[k] / this.bdRef + this.projL[k];
+            this.bdCurW[k] = this.bdRawW[k] / this.bdRef + this.projW[k];
           }
         }
       }
@@ -1433,7 +1521,7 @@ class MetaballRenderer {
         const pairs = [[this.bdPrevL, this.bdCurL, this.bdF1L, this.bdL],
                        [this.bdPrevW, this.bdCurW, this.bdF1W, this.bdW]];
         for (const [pv, cv, f1b, out] of pairs) {
-          for (let k = 0; k < gridSize; k++) {
+          for (let k = 0; k < out.length; k++) {
             const v = pv[k] + (cv[k] - pv[k]) * u;
             f1b[k] += (v - f1b[k]) * A;
             out[k] += (f1b[k] - out[k]) * A;
@@ -1516,9 +1604,18 @@ class MetaballRenderer {
         colData[dstIdx + 1] = causticsOn ? this.causticSmooth[srcOff + c] : 0;
         colData[dstIdx + 2] = causticsOn ? this.wallSmooth[r * 2 + (c < NC / 2 ? 0 : 1)] : 0;
         colData[dstIdx + 3] = 0;
-        const bi = dstIdx;
-        this.bdData[bi]     = this.bdL[srcOff + c];
-        this.bdData[bi + 1] = this.bdW[srcOff + c];
+      }
+    }
+    // wall grid (view width), flipped the same way
+    {
+      const NW = this.WCOLS;
+      for (let r = 0; r < NR; r++) {
+        const src = r * NW, dst = (NR - 1 - r) * NW;
+        for (let c = 0; c < NW; c++) {
+          const o = (dst + c) << 2;
+          this.bdData[o]     = this.bdL[src + c];
+          this.bdData[o + 1] = this.bdW[src + c];
+        }
       }
     }
     } // end volAbsorb gate
@@ -1540,7 +1637,7 @@ class MetaballRenderer {
     // light on the wall behind the lamp, unit 3
     gl.activeTexture(gl.TEXTURE3);
     gl.bindTexture(gl.TEXTURE_2D, this.backdropTex);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, NC, NR, gl.RGBA, gl.FLOAT, this.bdData, 0);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.WCOLS, NR, gl.RGBA, gl.FLOAT, this.bdData, 0);
 
     // -------- 3. Draw --------
     const useHdr = this.hdr && params.hdr !== false;
@@ -1559,6 +1656,7 @@ class MetaballRenderer {
     gl.uniform1i(this.u.particles, 0);
     if (this.u.cellRange) gl.uniform1i(this.u.cellRange, 1);
     gl.uniform2f(this.u.sim, SIM_W, SIM_H);
+    if (this.u.viewM) gl.uniform1f(this.u.viewM, VIEW_M);
     gl.uniform2f(this.u.res, this.canvas.width, this.canvas.height);
     gl.uniform1f(this.u.h, hRender);
     if (this.u.gridDim) gl.uniform2i(this.u.gridDim, gridW, gridH);
@@ -1592,6 +1690,11 @@ class MetaballRenderer {
   }
 }
 
+// The canvas shows the lamp plus a strip of the wall behind it on each
+// side: sim x ∈ [−VIEW_M, SIM_W + VIEW_M].
+const VIEW_M = 130;
+const VIEW_W = SIM_W + 2 * VIEW_M;
+
 // ----------------- App glue ----------------------------------
 const canvas = document.getElementById("lava");
 
@@ -1601,7 +1704,7 @@ const canvas = document.getElementById("lava");
 // doesn't shade a 760×1400 buffer. MAX_PIXELS caps big fullscreen windows.
 // The quality scale adapts to measured frame time unless ?scale=<0.3-1>
 // pins it (handy for benchmarking).
-const MAX_PIXELS = 760 * 1400;
+const MAX_PIXELS = 1280 * 1400;   // wall pixels are cheap (no particle gather)
 const MIN_SCALE = 0.45;
 const pinnedScale = parseFloat(new URLSearchParams(location.search).get("scale"));
 let renderScale = pinnedScale > 0 ? Math.min(1, Math.max(0.3, pinnedScale)) : 1.0;
@@ -1910,7 +2013,7 @@ document.querySelectorAll(".preset").forEach((b) => {
   }
   function clientToSim(ev) {
     const rect = canvas.getBoundingClientRect();
-    const ax = (ev.clientX - rect.left) * (SIM_W / rect.width);
+    const ax = (ev.clientX - rect.left) * (VIEW_W / rect.width) - VIEW_M;
     const sy = (ev.clientY - rect.top)  * (SIM_H / rect.height);
     // ringX: apparent (on-screen) position for the halo
     return { sx: lensToSim(ax, sy), sy, rect, ringX: ax };
@@ -1921,9 +2024,9 @@ document.querySelectorAll(".preset").forEach((b) => {
     // relative to the stage by using the canvas offset within the stage.
     const stage = canvas.parentElement;
     const stageRect = stage.getBoundingClientRect();
-    const cssX = (rect.left - stageRect.left) + sx * (rect.width  / SIM_W);
+    const cssX = (rect.left - stageRect.left) + (sx + VIEW_M) * (rect.width / VIEW_W);
     const cssY = (rect.top  - stageRect.top ) + sy * (rect.height / SIM_H);
-    const cssDiameter = 2 * sim.grab.radius * (rect.width / SIM_W);
+    const cssDiameter = 2 * sim.grab.radius * (rect.width / VIEW_W);
     grabRing.style.width  = cssDiameter + "px";
     grabRing.style.height = cssDiameter + "px";
     grabRing.style.left = cssX + "px";

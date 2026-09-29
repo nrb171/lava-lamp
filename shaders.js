@@ -133,6 +133,7 @@ precision highp float;
 uniform sampler2D uParticles;   // cell-sorted: (x, y, temp, groupId + compression/4)
 uniform sampler2D uCellRange;   // RGBA32F: r=start, g=count per grid cell
 uniform vec2  uSim;     // simulation domain (px)
+uniform float uViewM;   // wall margin shown on each side of the lamp (sim px)
 uniform vec2  uRes;     // canvas size (px)
 uniform float uH;       // smoothing radius (sim px) — also = cellSize
 uniform ivec2 uGridDim; // active grid (cells wide, cells tall)
@@ -227,7 +228,9 @@ float hash(vec2 p) {
 
 void main() {
   vec2 pix = gl_FragCoord.xy;
-  vec2 simPos = vec2(pix.x, uRes.y - pix.y) * (uSim / uRes);
+  // canvas spans sim x ∈ [−uViewM, uSim.x + uViewM]
+  vec2 simPos = vec2(pix.x * (uSim.x + 2.0 * uViewM) / uRes.x - uViewM,
+                     (uRes.y - pix.y) * uSim.y / uRes.y);
 
   float t = simPos.y / uSim.y;
   float halfFrac = bottleHalfFrac(t);
@@ -583,8 +586,8 @@ void main() {
   // light the lamp throws onto it (traced on the CPU), so its colour is the
   // lamp's light — liquid-filtered lamp light and the wax's own glow.
   vec3 frameOut = vec3(0.0);
-  if (uWall > 0.5 && t >= 0.05 && t <= 0.95) {
-    vec2 bd = texture(uBackdrop, vec2(simPos.x / uSim.x, 1.0 - t)).rg;
+  if (uWall > 0.5) {
+    vec2 bd = texture(uBackdrop, vec2((simPos.x + uViewM) / (uSim.x + 2.0 * uViewM), 1.0 - t)).rg;
     vec3 lampL = LIN(vec3(1.0, 0.86, 0.66));
     vec3 lTint = uBg / max(max(uBg.r, uBg.g), max(uBg.b, 1e-4));
     vec3 waxL = mix(uCold, uHot, 0.6);
@@ -593,9 +596,10 @@ void main() {
   }
 
   vec3 col;
-  if (t < 0.05) {
+  bool inCapX = distFromCenter < uSim.x * 0.5;   // cap / base are the lamp's width
+  if (t < 0.05 && inCapX) {
     col = topCapCol;
-  } else if (t > 0.95) {
+  } else if (t > 0.95 && inCapX) {
     col = botCapCol;
   } else {
     col = mix(frameOut, inside, insideGlass);
