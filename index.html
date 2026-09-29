@@ -508,9 +508,9 @@ class MetaballRenderer {
     this.hdr = !!(gl.getExtension("EXT_color_buffer_half_float") ||
                   gl.getExtension("EXT_color_buffer_float"));
     this.exposure = 0.8;
-    this.bloomStrength = 0.45;
-    this.bloomThreshold = 0.7;
-    this.bloomKnee = 0.4;
+    this.bloomStrength = 0.06;     // k: fraction of light in the glare halo
+    this.bloomThreshold = 0.0;     // physical glare: no threshold
+    this.bloomKnee = 0.0;
     if (this.hdr) {
       this.downProg = link(POST_VS, BLOOM_DOWN_FS);
       this.upProg = link(POST_VS, BLOOM_UP_FS);
@@ -518,7 +518,7 @@ class MetaballRenderer {
       const L = (p, names) => Object.fromEntries(names.map(n => [n, gl.getUniformLocation(p, n)]));
       this.downU = L(this.downProg, ["uSrc", "uTexel", "uPrefilter", "uThreshold", "uKnee"]);
       this.upU = L(this.upProg, ["uSrc", "uTexel"]);
-      this.compU = L(this.compProg, ["uScene", "uBloom", "uBloomStrength", "uRes", "uTime", "uExposure"]);
+      this.compU = L(this.compProg, ["uScene", "uBloom", "uBloomStrength", "uBloomNorm", "uRes", "uTime", "uExposure"]);
       this.targets = null;       // allocated to the canvas size on first render
       // Verify the driver really can render to RGBA16F; else fall back.
       try { this.ensureTargets(4, 4); } catch (e) { this.hdr = false; }
@@ -649,6 +649,12 @@ class MetaballRenderer {
     this.wallE        = new Float32Array(this.NUM_ROWS * 2);   // [row*2 + side]
     this.wallSmooth   = new Float32Array(this.NUM_ROWS * 2);
     this.causticRef   = null;                          // no-wax normalisation
+    // last two traces (caustic field, wall irradiance) for interpolation
+    this.capPrev  = new Float32Array(G); this.capCur  = new Float32Array(G);
+    this.wallPrev = new Float32Array(this.NUM_ROWS * 2);
+    this.wallCur  = new Float32Array(this.NUM_ROWS * 2);
+    // two-stage (critically damped) temporal filter state
+    this.capF1 = new Float32Array(G);  this.wallF1 = new Float32Array(this.NUM_ROWS * 2);
 
     // Uniforms
     this.uloc = (n) => gl.getUniformLocation(prog, n);
@@ -696,7 +702,7 @@ class MetaballRenderer {
   // difference (traced − straight) is the caustic: where lensing and wall
   // reflections concentrate light (+) or pull it away (−). Plain shadowing
   // is already the volumetric R channel, so this only adds the redirection.
-  traceCaustics(sim, massRaw, glow, noWax) {
+  traceCaustics(sim, massRaw, glow, noWax, px, py) {
     const NC = this.NUM_COLS, NR = this.NUM_ROWS;
     const colW = SIM_W / NC, rowH = SIM_H / NR;
     const cx = SIM_W * 0.5;
@@ -706,7 +712,44 @@ class MetaballRenderer {
     const V0 = sim.mass / sim.restDensity;                   // area per particle
     // massRaw spreads each particle over 2 units (1 + 4 × 0.25)
     const fracPerUnit = 0.5 * V0 / (colW * rowH);
-    for (let k = 0; k < phi.length; k++) phi[k] = noWax ? 0 : Math.min(1, massRaw[k] * fracPerUnit);
+    // Wax volume fraction from the particles. Each particle stands for
+    // V0 ≈ 244 px² of wax, far more than one 3.8 × 11.7 px cell, so it is
+    // spread with a smooth kernel about its own size (radius KR), normalised
+    // to conserve wax. The field — and every lens gradient read from it —
+    // then changes smoothly as particles move, instead of flickering as they
+    // cross cell boundaries.
+    const phiRaw = this._phiRaw || (this._phiRaw = new Float32Array(NC * NR));
+    phiRaw.fill(0);
+    if (!noWax) {
+      const KR = 14, KR2 = KR * KR, cellA = colW * rowH;
+      const wbuf = this._kw || (this._kw = new Float32Array(64));
+      const ibuf = this._ki || (this._ki = new Int32Array(64));
+      for (let i = sim.nFixed; i < sim.n; i++) {
+        const X = px[i], Y = py[i];
+        const c0 = Math.max(0, Math.floor((X - KR) / colW)), c1 = Math.min(NC - 1, Math.floor((X + KR) / colW));
+        const r0 = Math.max(0, Math.floor((Y - KR) / rowH)), r1 = Math.min(NR - 1, Math.floor((Y + KR) / rowH));
+        let m = 0, wsum = 0;
+        for (let rr = r0; rr <= r1; rr++) {
+          const dy = (rr + 0.5) * rowH - Y;
+          for (let cc = c0; cc <= c1 && m < 64; cc++) {
+            const dx = (cc + 0.5) * colW - X;
+            const q = 1 - (dx * dx + dy * dy) / KR2;
+            if (q <= 0) continue;
+            const w = q * q;
+            wbuf[m] = w; ibuf[m] = rr * NC + cc; m++; wsum += w;
+          }
+        }
+        if (wsum <= 0) continue;
+        const scale = V0 / (cellA * wsum);
+        for (let k = 0; k < m; k++) phiRaw[ibuf[k]] += wbuf[k] * scale;
+      }
+    }
+    // Coverage, not a hard clamp: for randomly overlapping bits of wax the
+    // chance a line of sight is blocked is 1 − e^(−φraw). A hard min(1, ·)
+    // has a kink whose position jitters with the particles, and the lens
+    // gradient read from it — amplified by the long lever arm up the lamp —
+    // made the caustics flicker.
+    for (let k = 0; k < phi.length; k++) phi[k] = 1 - Math.exp(-phiRaw[k]);
     fT.fill(0); fS.fill(0); wallE.fill(0);
 
     const N_REL = 1.43 / 1.34, LENS = (N_REL - 1) * rowH;
@@ -714,7 +757,7 @@ class MetaballRenderer {
     const poolRow = Math.floor(0.82 * NR);
     const ySrc = (poolRow + 1) * rowH;
     const srcHalf = hw(ySrc) * 0.97;
-    const NX = 40, NA = 14;
+    const NX = 16, NA = 40;   // many angles: a broad source's caustics overlap and soften
     // Per-row wall radius / slope and per-cell transmittance, computed once
     // per trace instead of per ray step.
     if (!this._rowW) { this._rowW = new Float32Array(NR); this._rowS = new Float32Array(NR); }
@@ -724,8 +767,17 @@ class MetaballRenderer {
       rowWall[r] = hw(y);
       rowSlope[r] = (hw(y + 0.5 * rowH) - hw(y - 0.5 * rowH)) / rowH;
     }
+    // Absorption from the same continuous field (massRaw units: 2 per
+    // particle-area of wax, see fracPerUnit).
     const trans = this._trans || (this._trans = new Float32Array(NC * NR));
-    for (let k = 0; k < trans.length; k++) trans[k] = Math.exp(-massRaw[k] * ABSORB);
+    for (let k = 0; k < trans.length; k++) trans[k] = Math.exp(-(phiRaw[k] / fracPerUnit) * ABSORB);
+    // linear interpolation of a row-major grid at x within row r
+    const lerpRow = (grid, base, x) => {
+      const g = x / colW - 0.5;
+      let c0 = Math.floor(g), f = g - c0;
+      if (c0 < 0) { c0 = 0; f = 0; } else if (c0 >= NC - 1) { c0 = NC - 2; f = 1; }
+      return grid[base + c0] * (1 - f) + grid[base + c0 + 1] * f;
+    };
     // Per angle family, every ray's state at every row (for ray tubes)
     if (!this._rt || this._rt.NX !== NX) {
       this._rt = { NX, x: new Float32Array(NX * NR), P: new Float32Array(NX * NR),
@@ -733,7 +785,6 @@ class MetaballRenderer {
                    Ps: new Float32Array(NX * NR) };
     }
     const RT = this._rt;
-    const cellOf = (x) => Math.min(NC - 1, Math.max(0, (x / colW) | 0));
     const splat = (grid, r, x, e) => {
       const g = x / colW - 0.5, c0 = Math.floor(g), f = g - c0;
       if (c0 >= 0 && c0 < NC) grid[r * NC + c0] += e * (1 - f);
@@ -743,8 +794,9 @@ class MetaballRenderer {
     // narrow tube = focused light, wide tube = spread-out light.
     const tube = (grid, r, xa, xb, e) => {
       if (xa > xb) { const t = xa; xa = xb; xb = t; }
+      // focused tubes keep a minimum width of one cell (no switch to a point)
+      if (xb - xa < colW) { const m = 0.5 * (xa + xb); xa = m - 0.5 * colW; xb = m + 0.5 * colW; }
       const len = xb - xa;
-      if (len < colW * 0.5) { splat(grid, r, 0.5 * (xa + xb), e); return; }
       const c0 = Math.max(0, Math.floor(xa / colW)), c1 = Math.min(NC - 1, Math.floor(xb / colW));
       for (let c = c0; c <= c1; c++) {
         const ov = Math.min(xb, (c + 1) * colW) - Math.max(xa, c * colW);
@@ -765,11 +817,11 @@ class MetaballRenderer {
         for (let r = poolRow; r >= 0; r--) {
           const W = rowWall[r], o = ix * NR + r;
           if (P > 1e-7) {
-            const c = cellOf(x), base = r * NC;
-            const cl = Math.max(0, c - 2), cr = Math.min(NC - 1, c + 2);
-            slope += LENS * (phi[base + cr] - phi[base + cl]) / ((cr - cl) * colW);
+            const base = r * NC;
+            slope += LENS * (lerpRow(phi, base, x + 2 * colW) - lerpRow(phi, base, x - 2 * colW)) / (4 * colW);
             if (slope > 3) slope = 3; else if (slope < -3) slope = -3;
-            P *= trans[base + c];
+            P *= lerpRow(trans, base, x);
+            const xPrev = x;
             x += slope * rowH;
             if (Math.abs(x - cx) > W && bounces < 6) {
               const side = x > cx ? 1 : 0, sgn = side ? 1 : -1;
@@ -780,14 +832,26 @@ class MetaballRenderer {
               const Nx = sgn * nl, Ny = -dhw * nl;
               const ci = dx * Nx + dy * Ny;
               if (ci > 0) {
-                wallE[r * 2 + side] += P;                    // light striking the glass
+                // Where in this row the ray actually meets the wall (s = 0 at
+                // the start of the step, 1 at the end). Reflecting there and
+                // continuing for the rest of the step keeps paths continuous
+                // as rays drift across the wall, instead of snapping a row.
+                const d0 = Math.abs(xPrev - cx), d1 = Math.abs(x - cx);
+                const s = d1 > d0 ? Math.min(1, Math.max(0, (W - d0) / (d1 - d0))) : 0;
+                // Light striking the glass, split between the two nearest rows
+                // by the exact hit height (row coordinate rr, centre = r + 0.5).
+                const rr = r + 1 - s - 0.5;
+                const r0 = Math.floor(rr), fr = rr - r0;
+                if (r0 >= 0 && r0 < NR) wallE[r0 * 2 + side] += P * (1 - fr);
+                if (r0 + 1 >= 0 && r0 + 1 < NR) wallE[(r0 + 1) * 2 + side] += P * fr;
                 const R = fresnelR(ci, 1.34, 1.0) * 0.96;
                 const rx = dx - 2 * ci * Nx;
                 let ry = dy - 2 * ci * Ny;
                 if (ry > -0.05) ry = -0.05;                  // keep marching upward
                 slope = rx / -ry;
                 P *= R;
-                x = cx + sgn * (2 * W - Math.abs(x - cx));   // back inside
+                x = cx + sgn * W + slope * (1 - s) * rowH;   // rest of the step, reflected
+                if (Math.abs(x - cx) > W) x = cx + sgn * (W - 0.5);
                 bounces++;
               }
             }
@@ -796,7 +860,7 @@ class MetaballRenderer {
           RT.x[o] = x; RT.P[o] = P; RT.b[o] = bounces;
           // straight twin: no lensing, lost at the wall
           if (Ps > 1e-7) {
-            Ps *= trans[r * NC + cellOf(xs)];
+            Ps *= lerpRow(trans, r * NC, xs);
             xs += slope0 * rowH;
             if (Math.abs(xs - cx) > W) Ps = 0;
           }
@@ -809,11 +873,21 @@ class MetaballRenderer {
           const o0 = ix * NR + r, o1 = o0 + NR;
           const P0 = RT.P[o0], P1 = RT.P[o1];
           if (P0 > 0 || P1 > 0) {
-            if (P0 > 0 && P1 > 0 && RT.b[o0] === RT.b[o1]) {
-              tube(fT, r, RT.x[o0], RT.x[o1], 0.5 * (P0 + P1));
-            } else {                                         // tube torn by a wall
-              if (P0 > 0) splat(fT, r, RT.x[o0], 0.5 * P0);
-              if (P1 > 0) splat(fT, r, RT.x[o1], 0.5 * P1);
+            // Neighbours stay a tube even across a reflection fold as long as
+            // they are close (they always are right at the fold); only a
+            // genuinely torn tube falls back to point splats.
+            // A very wide "tube" means the neighbours were torn apart (e.g. one
+            // side of a fold); blend smoothly from tube to two point splats
+            // between 4 and 8 cells wide rather than switching.
+            let wSplat = 1;
+            if (P0 > 0 && P1 > 0) {
+              const span = Math.abs(RT.x[o0] - RT.x[o1]) / colW;
+              wSplat = span <= 4 ? 0 : span >= 8 ? 1 : (span - 4) / 4;
+              if (wSplat < 1) tube(fT, r, RT.x[o0], RT.x[o1], 0.5 * (P0 + P1) * (1 - wSplat));
+            }
+            if (wSplat > 0) {
+              if (P0 > 0) splat(fT, r, RT.x[o0], 0.5 * P0 * wSplat);
+              if (P1 > 0) splat(fT, r, RT.x[o1], 0.5 * P1 * wSplat);
             }
           }
           const S0 = RT.Ps[o0], S1 = RT.Ps[o1];
@@ -883,7 +957,7 @@ class MetaballRenderer {
       gl.viewport(0, 0, dst.w, dst.h);
       gl.bindTexture(gl.TEXTURE_2D, src.tex);
       gl.uniform2f(this.downU.uTexel, 1 / src.w, 1 / src.h);
-      gl.uniform1f(this.downU.uPrefilter, i === 0 ? 1 : 0);
+      gl.uniform1f(this.downU.uPrefilter, i === 0 && this.bloomThreshold > 0 ? 1 : 0);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
       src = dst;
     }
@@ -912,6 +986,7 @@ class MetaballRenderer {
     gl.uniform1i(this.compU.uScene, 0);
     gl.uniform1i(this.compU.uBloom, 1);
     gl.uniform1f(this.compU.uBloomStrength, params.bloom !== false ? this.bloomStrength : 0);
+    gl.uniform1f(this.compU.uBloomNorm, 1 / T.mips.length);
     gl.uniform2f(this.compU.uRes, this.canvas.width, this.canvas.height);
     gl.uniform1f(this.compU.uTime, params.time);
     gl.uniform1f(this.compU.uExposure, this.exposure);
@@ -1141,7 +1216,7 @@ class MetaballRenderer {
       if (!this.causticRef) {
         // Normalise against an empty lamp at the reference glow, so the
         // numbers are "fraction of clear-lamp light".
-        this.traceCaustics(sim, massRaw, 1.0, true);
+        this.traceCaustics(sim, massRaw, 1.0, true, sx, sy);
         // f: brightest clear-lamp fluence; e: mean irradiance on lit glass
         let fMax = 0, eSum = 0, eN = 0;
         for (const v of this.fStraight) fMax = Math.max(fMax, v);
@@ -1149,23 +1224,42 @@ class MetaballRenderer {
         this.causticRef = { f: fMax || 1, e: eN ? eSum / eN : 1 };
       }
       const glowN = params.glow / 0.38;
-      // Caustics change slowly and are temporally smoothed: trace every
-      // other frame, or every 4th once adaptive quality has kicked in.
-      this._causticTick = (this._causticTick || 0) + 1;
+      // Trace every `every` frames and ease linearly from the previous trace
+      // to the newest over the frames in between (a couple of frames of
+      // latency, but the caustics move every frame instead of stepping).
       const every = (params.quality !== undefined && params.quality < 0.8) ? 4 : 2;
-      if (this._causticTick % every === 0) {
-      this.traceCaustics(sim, massRaw, glowN, false);
-      const cr = this.causticRaw, ref = this.causticRef;
-      for (let k = 0; k < gridSize; k++) cr[k] = (this.fTrace[k] - this.fStraight[k]) / ref.f;
-      // Smooth out the discreteness of the ray families (triangle blur,
-      // 3 cells across, 1 row vertically), then temporal EMA.
-      const ct = this.lightSmoothed;              // scratch; recomputed below
-      for (let r = 0; r < NR; r++) this.rowBlur(cr, r * NC, 1, 3, ct);
-      for (let c = 0; c < NC; c++) this.colBlur(ct, c, NC, 3, cr);
-      const cs = this.causticSmooth;
-      for (let k = 0; k < gridSize; k++) cs[k] += (cr[k] - cs[k]) * 0.45;
-      const ws = this.wallSmooth;
-      for (let k = 0; k < ws.length; k++) ws[k] += (this.wallE[k] / ref.e - ws[k]) * 0.45;
+      this._causticTick = (this._causticTick || 0) + 1;
+      const phase = this._causticTick % every;
+      if (phase === 0) {
+        this.traceCaustics(sim, massRaw, glowN, false, sx, sy);
+        const cr = this.causticRaw, ref = this.causticRef;
+        for (let k = 0; k < gridSize; k++) cr[k] = (this.fTrace[k] - this.fStraight[k]) / ref.f;
+        // smooth out the discreteness of the ray families
+        const ct = this.lightSmoothed;              // scratch; recomputed below
+        for (let r = 0; r < NR; r++) this.rowBlur(cr, r * NC, 1, 3, ct);
+        for (let c = 0; c < NC; c++) this.colBlur(ct, c, NC, 3, cr);
+        // shift: prev ← what's currently displayed, cur ← new trace
+        this.capPrev.set(this.capCur); this.capCur.set(cr);
+        this.wallPrev.set(this.wallCur);
+        for (let k = 0; k < this.wallCur.length; k++) this.wallCur[k] = this.wallE[k] / ref.e;
+      }
+      // Linear interpolation between traces, then a critically damped
+      // two-stage low-pass (≈45 ms per stage) — like a camera or eye
+      // integrating over a frame, which is why real caustics look flowing.
+      // Sharp caustic cusps sweeping across cells otherwise read as flicker.
+      const u = (phase + 1) / every;
+      const A = 0.3;
+      const cs = this.causticSmooth, cp = this.capPrev, cc = this.capCur, f1 = this.capF1;
+      for (let k = 0; k < gridSize; k++) {
+        const v = cp[k] + (cc[k] - cp[k]) * u;
+        f1[k] += (v - f1[k]) * A;
+        cs[k] += (f1[k] - cs[k]) * A;
+      }
+      const ws = this.wallSmooth, wp = this.wallPrev, wc = this.wallCur, g1 = this.wallF1;
+      for (let k = 0; k < ws.length; k++) {
+        const v = wp[k] + (wc[k] - wp[k]) * u;
+        g1[k] += (v - g1[k]) * A;
+        ws[k] += (g1[k] - ws[k]) * A;
       }
     }
 
