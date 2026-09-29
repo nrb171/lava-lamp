@@ -7,6 +7,118 @@ const VERTEX_SHADER = `#version 300 es
 in vec2 a_pos;
 void main(){ gl_Position = vec4(a_pos, 0.0, 1.0); }`;
 
+// ---------------- HDR pipeline ----------------
+// The scene is shaded in linear light ("scene-referred": values above 1
+// are fine, e.g. the glowing pool). Display happens in one place: exposure
+// → filmic curve → sRGB. The curve is the ACES fit (Narkowicz 2015), with
+// a toe that deepens darks and a shoulder that rolls off highlights. It is
+// applied to the brightest channel and the colour scaled to match, so
+// saturated wax stays saturated instead of bleaching toward white.
+const FINISH_GLSL = `
+uniform float uExposure;
+vec3 acesFit(vec3 x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+float acesFit1(float x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+vec3 linearToSrgb(vec3 c) {
+  c = clamp(c, 0.0, 1.0);
+  return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
+}
+float finishHash(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+vec3 finishColor(vec3 hdr, vec2 pix, vec2 res, float time) {
+  // lens vignette (optical falloff happens in linear light)
+  vec2 ndc = (pix / res) - 0.5;
+  float vig = 1.0 - smoothstep(0.45, 0.95, length(ndc) * 1.2);
+  hdr *= mix(0.6, 1.0, vig) * uExposure;
+  // hue-preserving filmic curve, with a little per-channel mixed in so the
+  // very brightest highlights still desaturate slightly, like film
+  float m = max(max(hdr.r, hdr.g), hdr.b);
+  vec3 huePres = m > 1e-5 ? hdr * (acesFit1(m) / m) : vec3(0.0);
+  vec3 mapped = mix(huePres, acesFit(hdr), 0.1);
+  vec3 outc = linearToSrgb(mapped);
+  // dither / film grain after encoding (also hides 8-bit banding)
+  outc += (finishHash(pix + time * 0.01) - 0.5) * (1.5 / 255.0);
+  return outc;
+}
+`;
+
+// Fullscreen pass vertex shader with UVs, for the post chain.
+const POST_VS = `#version 300 es
+in vec2 a_pos;
+out vec2 vUv;
+void main(){ vUv = a_pos * 0.5 + 0.5; gl_Position = vec4(a_pos, 0.0, 1.0); }`;
+
+// Bloom: optical glare from bright sources (lens / eye scattering). Mobile-
+// friendly "dual filter" pyramid (Bjørge, SIGGRAPH 2015): each level is
+// half the size of the last; the first downsample keeps only light above a
+// soft threshold.
+const BLOOM_DOWN_FS = `#version 300 es
+precision highp float;
+uniform sampler2D uSrc;
+uniform vec2 uTexel;        // 1 / source size
+uniform float uPrefilter;   // 1 on the first pass
+uniform float uThreshold;
+uniform float uKnee;
+in vec2 vUv;
+out vec4 o;
+vec3 prefilter(vec3 c) {
+  float br = max(c.r, max(c.g, c.b));
+  float rq = clamp(br - uThreshold + uKnee, 0.0, 2.0 * uKnee);
+  rq = rq * rq / (4.0 * uKnee + 1e-4);
+  return c * (max(rq, br - uThreshold) / max(br, 1e-4));
+}
+void main() {
+  vec2 h = uTexel;
+  vec3 c = texture(uSrc, vUv).rgb * 4.0;
+  c += texture(uSrc, vUv - h).rgb;
+  c += texture(uSrc, vUv + h).rgb;
+  c += texture(uSrc, vUv + vec2(h.x, -h.y)).rgb;
+  c += texture(uSrc, vUv - vec2(h.x, -h.y)).rgb;
+  c *= 0.125;
+  if (uPrefilter > 0.5) c = prefilter(min(c, vec3(32.0)));
+  o = vec4(c, 1.0);
+}`;
+
+const BLOOM_UP_FS = `#version 300 es
+precision highp float;
+uniform sampler2D uSrc;
+uniform vec2 uTexel;        // 1 / source (smaller) size
+in vec2 vUv;
+out vec4 o;
+void main() {
+  vec2 h = uTexel;
+  vec3 c = texture(uSrc, vUv + vec2(-2.0 * h.x, 0.0)).rgb;
+  c += texture(uSrc, vUv + vec2(-h.x,  h.y)).rgb * 2.0;
+  c += texture(uSrc, vUv + vec2(0.0,  2.0 * h.y)).rgb;
+  c += texture(uSrc, vUv + vec2( h.x,  h.y)).rgb * 2.0;
+  c += texture(uSrc, vUv + vec2( 2.0 * h.x, 0.0)).rgb;
+  c += texture(uSrc, vUv + vec2( h.x, -h.y)).rgb * 2.0;
+  c += texture(uSrc, vUv + vec2(0.0, -2.0 * h.y)).rgb;
+  c += texture(uSrc, vUv + vec2(-h.x, -h.y)).rgb * 2.0;
+  o = vec4(c / 12.0, 1.0);
+}`;
+
+const COMPOSITE_FS = `#version 300 es
+precision highp float;
+uniform sampler2D uScene;
+uniform sampler2D uBloom;
+uniform float uBloomStrength;
+uniform vec2 uRes;
+uniform float uTime;
+in vec2 vUv;
+out vec4 o;
+${FINISH_GLSL}
+void main() {
+  vec3 hdr = texture(uScene, vUv).rgb + texture(uBloom, vUv).rgb * uBloomStrength;
+  o = vec4(finishColor(hdr, gl_FragCoord.xy, uRes, uTime), 1.0);
+}`;
+
 function fragmentShaderSource() {
   return `#version 300 es
 precision highp float;
@@ -31,6 +143,10 @@ uniform float uBlobSize[36];
 uniform float uPoolId;        // pool's group id, or -1
 uniform float uLens;          // 1 = view the interior through the cylindrical glass lens
 uniform float uCaustics;      // 1 = draw caustics (texture G/B channels)
+uniform float uDirectOut;     // 1 = no float render target: tone-map here
+${FINISH_GLSL}
+// Colours below are authored in sRGB; all shading is in linear light.
+#define LIN(c) pow(c, vec3(2.2))
 uniform vec4  uGhostMix;
 uniform sampler2D uColMass;   // 2D mass grid (NUM_COLS × NUM_ROWS), normalized 0-1
 uniform int   uNumCols;       // grid columns (50)
@@ -301,8 +417,14 @@ void main() {
   bulb *= mix(0.35, 1.0, horiz);
 
   vec3 warmTint = mix(uCold, uHot, 0.65) * 1.2;
-  vec3 fluidBg = mix(uBg, uBg * 1.3 + warmTint * 0.15, bottomT);
-  fluidBg = mix(fluidBg, warmTint, bulb * 0.35);
+  // The liquid is a coloured medium: light scattered in it comes out as
+  // lamp light filtered by the liquid's colour (not lamp light laid on top,
+  // which greys the colour out). Lamp ≈ incandescent, ~2700 K.
+  vec3 lampLight = LIN(vec3(1.0, 0.86, 0.66));
+  vec3 liqTint = uBg / max(max(uBg.r, uBg.g), max(uBg.b, 1e-4));
+  vec3 scatterCol = lampLight * liqTint;
+  vec3 fluidBg = mix(uBg, uBg * 1.3 + warmTint * 0.06, bottomT);
+  fluidBg += scatterCol * bulb * 0.45;
   fluidBg *= mix(0.85, 1.0, smoothstep(0.0, 1.0, t));
 
   // Permanent opaque pool block
@@ -322,22 +444,20 @@ void main() {
     float light = vol.r;
 
     // God ray: additive warm glow scaled by bulb glow slider
-    vec3 rayColor = mix(uHot, vec3(1.0, 0.97, 0.90), 0.3);
-    // Light scattered by the liquid takes the liquid's colour (lamp light
-    // × liquid tint) instead of being added as near-white light, which is
-    // what washed the fluid out toward beige.
-    vec3 liqTint = uBg / max(max(uBg.r, uBg.g), max(uBg.b, 1e-3));
-    vec3 scatterCol = rayColor * mix(liqTint, vec3(1.0), 0.35);
+    vec3 rayColor = mix(uHot, LIN(vec3(1.0, 0.97, 0.90)), 0.3);
     // Envelope: strong in lower-mid bulb, gentler fade toward top
     float envelope = smoothstep(0.93, 0.65, t) * smoothstep(0.02, 0.15, t);
     float glowScale = uGlow / 0.38;  // normalized so default glow=0.55 → 1.0
-    fluidBg += scatterCol * light * envelope * 0.55 * glowScale;
+    // Beer–Lambert: bulb light is absorbed/scattered on its way up, so the
+    // liquid fades with height above the pool (≈ e^-2.2 per lamp height).
+    float beer = exp(-max(0.88 - t, 0.0) * 2.2);
+    fluidBg += scatterCol * light * envelope * 0.55 * glowScale * beer;
 
     // Caustics: light redirected by wax lenses and wall reflections, as a
     // fraction of clear-lamp light (+ concentrated, − pulled away).
     if (uCaustics > 0.5) {
       float causticEnv = smoothstep(0.02, 0.10, t) * (1.0 - smoothstep(0.86, 0.89, t));
-      fluidBg += scatterCol * clamp(vol.g, -0.6, 2.0) * 0.22 * causticEnv;
+      fluidBg += scatterCol * clamp(vol.g, -0.6, 2.0) * 0.3 * causticEnv * beer;
       wallIrr = vol.b;
     }
 
@@ -399,7 +519,7 @@ void main() {
                     min(2.0, causticConcentration);
   // Specular tinted by the wax color itself — warm highlight on warm wax,
   // cool highlight on cool wax.
-  vec3 specTint = mix(vec3(1.0, 0.95, 0.85), waxColor * 2.0 + vec3(0.3), compIntensity * 0.6);
+  vec3 specTint = mix(LIN(vec3(1.0, 0.95, 0.85)), waxColor * 2.0 + LIN(vec3(0.3)), compIntensity * 0.6);
   waxColor += specTint * highlight;
 
   // ---- Uniform translucency + pressure opacity ----
@@ -411,7 +531,7 @@ void main() {
 
   // Inner core detail
   float coreAlpha = smoothstep(threshold + 0.05, threshold + 0.55, field);
-  vec3 inner = mix(waxColor, waxColor * 1.25 + uHot * 0.18 * tempN, coreAlpha);
+  vec3 inner = mix(waxColor, waxColor * 1.12 + uHot * 0.08 * tempN, coreAlpha);
 
   // Overlap layering: front blob over back blob
   if (fuseBackW > 0.0) {
@@ -434,16 +554,16 @@ void main() {
   vec3 inside = mix(fluidBg, inner, alpha);
   // Fresnel at the curved glass: toward the silhouette less of the interior
   // gets through and more of the (dim) room is reflected.
-  inside = inside * lensT + lensF * (vec3(0.035, 0.028, 0.05) + uHot * 0.04 * uGlow);
+  inside = inside * lensT + lensF * (LIN(vec3(0.035, 0.028, 0.05)) + uHot * 0.04 * uGlow);
 
   // -------- Bottle frame ---------
-  vec3 topCapCol = vec3(0.06, 0.05, 0.10);
+  vec3 topCapCol = LIN(vec3(0.06, 0.05, 0.10));
   float neckBand = smoothstep(0.030, 0.035, t) * (1.0 - smoothstep(0.045, 0.050, t));
-  topCapCol += vec3(0.10, 0.08, 0.14) * neckBand;
+  topCapCol += LIN(vec3(0.10, 0.08, 0.14)) * neckBand;
   float capLight = smoothstep(0.4, 0.0, distFromCenter / (uSim.x * 0.3));
   topCapCol *= mix(1.0, 1.5, capLight * (1.0 - smoothstep(0.0, 0.05, t)));
 
-  vec3 botCapCol = mix(vec3(0.07, 0.04, 0.09), vec3(0.16, 0.10, 0.13), smoothstep(0.95, 1.00, t));
+  vec3 botCapCol = mix(LIN(vec3(0.07, 0.04, 0.09)), LIN(vec3(0.16, 0.10, 0.13)), smoothstep(0.95, 1.00, t));
   float baseGlow = smoothstep(0.99, 0.95, t) * uGlow;
   botCapCol += uHot * baseGlow * 0.4;
   botCapCol += uCold * baseGlow * 0.18;
@@ -461,7 +581,7 @@ void main() {
     col = mix(frameOut, inside, insideGlass);
     float rimDist = halfW - distFromCenter;
     float rim = smoothstep(0.0, 1.5, rimDist) * (1.0 - smoothstep(1.5, 4.0, rimDist));
-    col += vec3(0.22, 0.18, 0.30) * rim * 0.45;
+    col += LIN(vec3(0.22, 0.18, 0.30)) * rim * 0.45;
     // Glass edge lit by the light striking it. Seen edge-on, a shell of
     // thickness tau has line-of-sight length
     //   L(b) = 2(√(R² − b²) − √((R − tau)² − b²))
@@ -473,36 +593,23 @@ void main() {
       float Lo = sqrt(max(R * R - b * b, 0.0));
       float Li = sqrt(max((R - tau) * (R - tau) - b * b, 0.0));
       float L = 2.0 * (Lo - Li) / (2.0 * sqrt(max(2.0 * R * tau - tau * tau, 1e-3)));
-      vec3 edgeCol = mix(uHot, vec3(1.0, 0.97, 0.90), 0.3);
+      vec3 edgeCol = mix(uHot, LIN(vec3(1.0, 0.97, 0.90)), 0.3);
       // soft response: irradiance is ~1 on average, a few × at hot spots
       col += edgeCol * (1.0 - exp(-0.7 * wallIrr)) * L * 0.32 * step(b, R);
     }
     float streakX = clamp(1.0 - abs((simPos.x - (cx - halfW * 0.55)) / 6.0), 0.0, 1.0);
     float streakY = smoothstep(0.10, 0.40, t) * (1.0 - smoothstep(0.40, 0.62, t));
-    col += vec3(0.85, 0.80, 1.0) * streakX * streakY * 0.10 * insideGlass;
+    col += LIN(vec3(0.85, 0.80, 1.0)) * streakX * streakY * 0.10 * insideGlass;
   }
 
   // Soft outer glow
   float outerGlow = smoothstep(0.96, 0.55, t) * uGlow * 0.18;
   outerGlow *= smoothstep(uSim.x * 0.9, 0.0, distFromCenter);
-  col += uHot * outerGlow * (1.0 - insideGlass) * 0.25;
+  // (most of the glow around the lamp now comes from bloom)
+  col += uHot * outerGlow * (1.0 - insideGlass) * 0.06;
 
-  // Filmic shoulder on luminance: bright areas roll off instead of
-  // clipping (which flattened the bright parts of the lamp), while hue and
-  // saturation are kept — a per-channel curve would bleach the wax to cream.
-  float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
-  if (lum > 1e-4) col *= (1.0 - exp(-lum * 1.25)) / lum;
-  col = min(col, vec3(1.0));
-
-  // Vignette
-  vec2 ndc = (pix / uRes) - 0.5;
-  float vig = 1.0 - smoothstep(0.45, 0.95, length(ndc) * 1.2);
-  col *= mix(0.7, 1.0, vig);
-
-  // Film grain
-  float g = (hash(pix + uTime * 0.01) - 0.5) * 0.012;
-  col += g;
-
+  // Output is linear, scene-referred light; the composite pass tone-maps.
+  if (uDirectOut > 0.5) col = finishColor(col, pix, uRes, uTime);
   fragColor = vec4(col, 1.0);
 }
 `;
@@ -510,5 +617,6 @@ void main() {
 
 // UMD export
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { VERTEX_SHADER, fragmentShaderSource };
+  module.exports = { VERTEX_SHADER, fragmentShaderSource, POST_VS,
+                     BLOOM_DOWN_FS, BLOOM_UP_FS, COMPOSITE_FS };
 }

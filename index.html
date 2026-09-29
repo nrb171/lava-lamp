@@ -378,6 +378,10 @@
     <input type="checkbox" id="glassLens" checked />
     <label for="glassLens" style="cursor:pointer">Glass lens</label>
   </div>
+  <div class="control" style="display:flex;align-items:center;gap:6px">
+    <input type="checkbox" id="bloom" checked />
+    <label for="bloom" style="cursor:pointer">Bloom</label>
+  </div>
 
   <button id="reset">Reset simulation</button>
 
@@ -432,6 +436,15 @@ function makeTriBlur(n, maxR) {
   };
 }
 
+// sRGB (0-1) → linear light, into out
+function srgbToLinear(c, out) {
+  for (let i = 0; i < 3; i++) {
+    const v = c[i];
+    out[i] = v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  }
+  return out;
+}
+
 // Unpolarised Fresnel reflectance from index n1 into n2 at incidence cos ci
 // (1 beyond the critical angle: total internal reflection).
 function fresnelR(ci, n1, n2) {
@@ -473,16 +486,43 @@ class MetaballRenderer {
       }
       return sh;
     };
-    const vs = compile(gl.VERTEX_SHADER, VS);
-    const fs = compile(gl.FRAGMENT_SHADER, FS);
-    const prog = gl.createProgram();
-    gl.attachShader(prog, vs);
-    gl.attachShader(prog, fs);
-    gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-      throw new Error("link: " + gl.getProgramInfoLog(prog));
-    }
+    // All passes draw the same fullscreen quad, bound at attribute 0.
+    const link = (vsSrc, fsSrc) => {
+      const p = gl.createProgram();
+      gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+      gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+      gl.bindAttribLocation(p, 0, "a_pos");
+      gl.linkProgram(p);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+        throw new Error("link: " + gl.getProgramInfoLog(p));
+      }
+      return p;
+    };
+    const prog = link(VS, FS);
     this.program = prog;
+
+    // -------- HDR targets --------
+    // The scene renders linear light into a half-float target, then bloom
+    // and the filmic tone map run as small post passes. Without float
+    // render-target support the scene shader tone-maps directly.
+    this.hdr = !!(gl.getExtension("EXT_color_buffer_half_float") ||
+                  gl.getExtension("EXT_color_buffer_float"));
+    this.exposure = 0.8;
+    this.bloomStrength = 0.45;
+    this.bloomThreshold = 0.7;
+    this.bloomKnee = 0.4;
+    if (this.hdr) {
+      this.downProg = link(POST_VS, BLOOM_DOWN_FS);
+      this.upProg = link(POST_VS, BLOOM_UP_FS);
+      this.compProg = link(POST_VS, COMPOSITE_FS);
+      const L = (p, names) => Object.fromEntries(names.map(n => [n, gl.getUniformLocation(p, n)]));
+      this.downU = L(this.downProg, ["uSrc", "uTexel", "uPrefilter", "uThreshold", "uKnee"]);
+      this.upU = L(this.upProg, ["uSrc", "uTexel"]);
+      this.compU = L(this.compProg, ["uScene", "uBloom", "uBloomStrength", "uRes", "uTime", "uExposure"]);
+      this.targets = null;       // allocated to the canvas size on first render
+      // Verify the driver really can render to RGBA16F; else fall back.
+      try { this.ensureTargets(4, 4); } catch (e) { this.hdr = false; }
+    }
 
     // Fullscreen quad
     this.vao = gl.createVertexArray();
@@ -493,9 +533,8 @@ class MetaballRenderer {
       -1,-1,  1,-1, -1, 1,
       -1, 1,  1,-1,  1, 1,
     ]), gl.STATIC_DRAW);
-    const aPos = gl.getAttribLocation(prog, "a_pos");
-    gl.enableVertexAttribArray(aPos);
-    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
     // Particle texture (1 row): (x, y, temperature, groupId + compression/4)
     // per particle. Compression (0..3) rides in the fractional part of the
@@ -630,6 +669,8 @@ class MetaballRenderer {
       colMass:       this.uloc("uColMass"),
       poolId:        this.uloc("uPoolId"),
       lens:          this.uloc("uLens"),
+      directOut:     this.uloc("uDirectOut"),
+      exposure:      this.uloc("uExposure"),
       caustics:      this.uloc("uCaustics"),
       ghostMix:      this.uloc("uGhostMix"),
       numCols:       this.uloc("uNumCols"),
@@ -788,6 +829,93 @@ class MetaballRenderer {
       tmp[r * 2 + sd] = 0.25 * a + 0.5 * b + 0.25 * c;
     }
     wallE.set(tmp);
+  }
+
+  // Half-float scene target plus a bloom pyramid (½, ¼, … of the canvas).
+  ensureTargets(w, h) {
+    const gl = this.gl;
+    if (this.targets && this.targets.w === w && this.targets.h === h) return;
+    if (this.targets) {
+      for (const t of [this.targets.scene, ...this.targets.mips]) {
+        gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fbo);
+      }
+    }
+    const make = (tw, th) => {
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, tw, th, 0, gl.RGBA, gl.HALF_FLOAT, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      const fbo = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      if (!ok) throw new Error("RGBA16F render target unsupported");
+      return { tex, fbo, w: tw, h: th };
+    };
+    const mips = [];
+    let mw = w, mh = h;
+    for (let i = 0; i < 6; i++) {
+      mw = Math.max(1, mw >> 1); mh = Math.max(1, mh >> 1);
+      mips.push(make(mw, mh));
+      if (mw <= 8 || mh <= 8) break;
+    }
+    this.targets = { w, h, scene: make(w, h), mips };
+  }
+
+  // Bloom (dual-filter pyramid) and composite to the canvas.
+  postProcess(params) {
+    const gl = this.gl, T = this.targets;
+    gl.bindVertexArray(this.vao);
+    gl.activeTexture(gl.TEXTURE0);
+    // downsample chain; the first pass keeps only bright light
+    gl.useProgram(this.downProg);
+    gl.uniform1i(this.downU.uSrc, 0);
+    gl.uniform1f(this.downU.uThreshold, this.bloomThreshold);
+    gl.uniform1f(this.downU.uKnee, this.bloomKnee);
+    let src = T.scene;
+    for (let i = 0; i < T.mips.length; i++) {
+      const dst = T.mips[i];
+      gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo);
+      gl.viewport(0, 0, dst.w, dst.h);
+      gl.bindTexture(gl.TEXTURE_2D, src.tex);
+      gl.uniform2f(this.downU.uTexel, 1 / src.w, 1 / src.h);
+      gl.uniform1f(this.downU.uPrefilter, i === 0 ? 1 : 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      src = dst;
+    }
+    // upsample back, adding each blurred level onto the next larger one
+    gl.useProgram(this.upProg);
+    gl.uniform1i(this.upU.uSrc, 0);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    for (let i = T.mips.length - 1; i > 0; i--) {
+      const s2 = T.mips[i], dst = T.mips[i - 1];
+      gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo);
+      gl.viewport(0, 0, dst.w, dst.h);
+      gl.bindTexture(gl.TEXTURE_2D, s2.tex);
+      gl.uniform2f(this.upU.uTexel, 1 / s2.w, 1 / s2.h);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+    gl.disable(gl.BLEND);
+    // composite: scene + bloom → exposure → filmic → sRGB
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.useProgram(this.compProg);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, T.scene.tex);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, T.mips[0].tex);
+    gl.uniform1i(this.compU.uScene, 0);
+    gl.uniform1i(this.compU.uBloom, 1);
+    gl.uniform1f(this.compU.uBloomStrength, params.bloom !== false ? this.bloomStrength : 0);
+    gl.uniform2f(this.compU.uRes, this.canvas.width, this.canvas.height);
+    gl.uniform1f(this.compU.uTime, params.time);
+    gl.uniform1f(this.compU.uExposure, this.exposure);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
 
   // Track particles joining the pool and advance/release merge ghosts.
@@ -1033,7 +1161,7 @@ class MetaballRenderer {
       // 3 cells across, 1 row vertically), then temporal EMA.
       const ct = this.lightSmoothed;              // scratch; recomputed below
       for (let r = 0; r < NR; r++) this.rowBlur(cr, r * NC, 1, 3, ct);
-      for (let c = 0; c < NC; c++) this.colBlur(ct, c, NC, 1, cr);
+      for (let c = 0; c < NC; c++) this.colBlur(ct, c, NC, 3, cr);
       const cs = this.causticSmooth;
       for (let k = 0; k < gridSize; k++) cs[k] += (cr[k] - cs[k]) * 0.45;
       const ws = this.wallSmooth;
@@ -1134,8 +1262,17 @@ class MetaballRenderer {
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, NC, NR, gl.RGBA, gl.FLOAT, colData, 0);
 
     // -------- 3. Draw --------
+    const useHdr = this.hdr && params.hdr !== false;
+    if (useHdr) {
+      this.ensureTargets(this.canvas.width, this.canvas.height);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.targets.scene.fbo);
+    } else {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    }
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.useProgram(this.program);
+    if (this.u.directOut) gl.uniform1f(this.u.directOut, useHdr ? 0 : 1);
+    if (this.u.exposure) gl.uniform1f(this.u.exposure, this.exposure);
     gl.bindVertexArray(this.vao);
     // Textures are already bound on units 0/1 from the upload above.
     gl.uniform1i(this.u.particles, 0);
@@ -1144,9 +1281,10 @@ class MetaballRenderer {
     gl.uniform2f(this.u.res, this.canvas.width, this.canvas.height);
     gl.uniform1f(this.u.h, hRender);
     if (this.u.gridDim) gl.uniform2i(this.u.gridDim, gridW, gridH);
-    gl.uniform3fv(this.u.bg, params.bg);
-    gl.uniform3fv(this.u.cold, params.cold);
-    gl.uniform3fv(this.u.hot, params.hot);
+    // colour pickers are sRGB; shading is in linear light
+    gl.uniform3fv(this.u.bg, srgbToLinear(params.bg, this._linBg || (this._linBg = new Float32Array(3))));
+    gl.uniform3fv(this.u.cold, srgbToLinear(params.cold, this._linCold || (this._linCold = new Float32Array(3))));
+    gl.uniform3fv(this.u.hot, srgbToLinear(params.hot, this._linHot || (this._linHot = new Float32Array(3))));
     gl.uniform1f(this.u.glow, params.glow);
     gl.uniform1f(this.u.time, params.time);
     // Per-blob z values for the front/back picker and the overlap
@@ -1166,6 +1304,7 @@ class MetaballRenderer {
     if (this.u.numCols) gl.uniform1i(this.u.numCols, params.volAbsorb !== false ? this.NUM_COLS : 0);
     if (this.u.numRows) gl.uniform1i(this.u.numRows, params.volAbsorb !== false ? this.NUM_ROWS : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
+    if (useHdr) this.postProcess(params);
   }
 }
 
@@ -1225,6 +1364,7 @@ const params = {
   volAbsorb: true,
   caustics: true,
   lens: true,
+  bloom: true,
 };
 
 // --- UI ---
@@ -1237,6 +1377,7 @@ $("compColor").oninput = (e) => params.compressColor = hexToRgb(e.target.value);
 $("volAbsorb").onchange = (e) => params.volAbsorb = e.target.checked;
 $("caustics").onchange = (e) => params.caustics = e.target.checked;
 $("glassLens").onchange = (e) => params.lens = e.target.checked;
+$("bloom").onchange = (e) => params.bloom = e.target.checked;
 
 $("glow").oninput = (e) => {
   params.glow = parseFloat(e.target.value);
