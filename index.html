@@ -382,6 +382,10 @@
     <input type="checkbox" id="bloom" checked />
     <label for="bloom" style="cursor:pointer">Bloom</label>
   </div>
+  <div class="control" style="display:flex;align-items:center;gap:6px">
+    <input type="checkbox" id="wallLight" checked />
+    <label for="wallLight" style="cursor:pointer">Light on wall behind</label>
+  </div>
 
   <button id="reset">Reset simulation</button>
 
@@ -655,6 +659,24 @@ class MetaballRenderer {
     this.wallCur  = new Float32Array(this.NUM_ROWS * 2);
     // two-stage (critically damped) temporal filter state
     this.capF1 = new Float32Array(G);  this.wallF1 = new Float32Array(this.NUM_ROWS * 2);
+    // Backdrop wall behind the lamp (see traceBackdrop): liquid-light and
+    // wax-light irradiance on the wall, per grid cell of the canvas.
+    this.WALL_DIST = 300;                              // wall plane behind the axis (sim px)
+    this.bdRawL = new Float32Array(G); this.bdRawW = new Float32Array(G);
+    this.bdTmp = new Float32Array(G);
+    this.bdPrevL = new Float32Array(G); this.bdCurL = new Float32Array(G);
+    this.bdPrevW = new Float32Array(G); this.bdCurW = new Float32Array(G);
+    this.bdF1L = new Float32Array(G);   this.bdF1W = new Float32Array(G);
+    this.bdL = new Float32Array(G);     this.bdW = new Float32Array(G);
+    this.bdRef = null;
+    this.bdData = new Float32Array(G * 4);
+    this.backdropTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.backdropTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, colMassFilter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, colMassFilter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, this.NUM_COLS, this.NUM_ROWS, 0, gl.RGBA, gl.FLOAT, null);
 
     // Uniforms
     this.uloc = (n) => gl.getUniformLocation(prog, n);
@@ -673,6 +695,8 @@ class MetaballRenderer {
       blobZ:       this.uloc("uBlobZ"),
       blobSize:    this.uloc("uBlobSize"),
       colMass:       this.uloc("uColMass"),
+      backdrop:      this.uloc("uBackdrop"),
+      wallOn:        this.uloc("uWall"),
       poolId:        this.uloc("uPoolId"),
       lens:          this.uloc("uLens"),
       directOut:     this.uloc("uDirectOut"),
@@ -903,6 +927,130 @@ class MetaballRenderer {
       tmp[r * 2 + sd] = 0.25 * a + 0.5 * b + 0.25 * c;
     }
     wallE.set(tmp);
+  }
+
+  // ---- Light thrown onto a wall behind the lamp --------------------
+  // Each row of the lamp is a horizontal circular slice of radius R. The
+  // lit liquid (lamp light × liquid tint) and the glowing wax in that slice
+  // emit in all directions; rays heading back toward the wall leave through
+  // the curved glass, refracting liquid → air (Snell) and losing the
+  // Fresnel-reflected part (past the critical angle they stay inside). The
+  // slice is a strong cylindrical lens (f ≈ nR / 2(n−1) ≈ 2R), so the light
+  // bunches into bright bands that drift as the wax moves. Rays are binned
+  // where they land on a flat wall WALL_DIST behind the axis; the wall is
+  // neutral and only scatters that light, so all colour comes from the
+  // lamp. Light also leaves at vertical angles — mostly upward, the way the
+  // bulb light travels — so each row's pattern is spread up the wall.
+  traceBackdrop(light, phi, glow, noWax) {
+    const NC = this.NUM_COLS, NR = this.NUM_ROWS;
+    const colW = SIM_W / NC, rowH = SIM_H / NR;
+    const cx = SIM_W * 0.5, D = this.WALL_DIST;
+    const L = this.bdRawL, W = this.bdRawW, T = this.bdTmp;
+    L.fill(0); W.fill(0);
+    const NS = 20, NZ = 2, NA = 12, ETA = 1.34;
+    const lerpRow = (grid, base, x) => {
+      const g = x / colW - 0.5;
+      let c0 = Math.floor(g), f = g - c0;
+      if (c0 < 0) { c0 = 0; f = 0; } else if (c0 >= NC - 1) { c0 = NC - 2; f = 1; }
+      return grid[base + c0] * (1 - f) + grid[base + c0 + 1] * f;
+    };
+    // Ray tubes: within one (depth, direction) family, neighbouring source
+    // positions bound a beam; its power spreads evenly between where the two
+    // rays land (narrow = focused = bright), so the wall light is smooth
+    // instead of a comb of single-ray hits.
+    const tube = (grid, base, xa, xb, e) => {
+      if (xa > xb) { const q = xa; xa = xb; xb = q; }
+      if (xb - xa < colW) { const m = 0.5 * (xa + xb); xa = m - 0.5 * colW; xb = m + 0.5 * colW; }
+      const len = xb - xa;
+      const c0 = Math.max(0, Math.floor(xa / colW)), c1 = Math.min(NC - 1, Math.floor(xb / colW));
+      for (let c = c0; c <= c1; c++) {
+        const ov = Math.min(xb, (c + 1) * colW) - Math.max(xa, c * colW);
+        if (ov > 0) grid[base + c] += e * ov / len;
+      }
+    };
+    if (!this._bdRays || this._bdRays.XW.length !== NS) {
+      this._bdRays = { XW: new Float32Array(NS), EL: new Float32Array(NS), EW: new Float32Array(NS) };
+    }
+    const { XW, EL, EW } = this._bdRays;
+    for (let r = 0; r < NR; r++) {
+      const t = (r + 0.5) / NR;
+      if (t < 0.05 || t > 0.95) continue;
+      const R = bottleHalfFrac(t) * SIM_W;
+      if (R < 3) continue;
+      const base = r * NC;
+      const beer = Math.exp(-Math.max(0.88 - t, 0) * 2.2);
+      const inPool = t > 0.885;
+      // per-source emission (liquid scatter, lit wax), with volume element
+      const srcL = this._srcL || (this._srcL = new Float32Array(64));
+      const srcW = this._srcW || (this._srcW = new Float32Array(64));
+      for (let is = 0; is < NS; is++) {
+        const xs = R * ((((is + 0.5) / NS) * 2) - 1);
+        const zc = Math.sqrt(Math.max(R * R - xs * xs, 0));
+        const X = cx + xs;
+        const lit = noWax ? 1 : lerpRow(light, base, X);
+        const wax = inPool ? 1 : (noWax ? 0 : lerpRow(phi, base, X));
+        const cellA = (2 * R / NS) * (2 * zc / NZ);
+        srcL[is] = lit * beer * (1 - wax) * cellA * glow;
+        srcW[is] = (0.35 + 0.65 * lit) * wax * cellA * glow;
+      }
+      for (let iz = 0; iz < NZ; iz++) {
+        for (let ia = 0; ia < NA; ia++) {
+          const th = (((ia + 0.5) / NA) * 2 - 1) * 1.45;        // ±83° about "toward the wall"
+          const dx = Math.sin(th), dz = -Math.cos(th);
+          for (let is = 0; is < NS; is++) {
+            XW[is] = NaN;
+            const xs = R * ((((is + 0.5) / NS) * 2) - 1);
+            const zc = Math.sqrt(Math.max(R * R - xs * xs, 0));
+            const zs = zc * ((((iz + 0.5) / NZ) * 2) - 1);
+            // exit point on the glass circle
+            const b = xs * dx + zs * dz, c = xs * xs + zs * zs - R * R;
+            const tHit = -b + Math.sqrt(Math.max(b * b - c, 0));
+            const hx = xs + dx * tHit, hz = zs + dz * tHit;
+            const nx = hx / R, nz = hz / R;
+            const ci = dx * nx + dz * nz;
+            if (ci <= 0) continue;
+            const sin2t = ETA * ETA * (1 - ci * ci);
+            if (sin2t >= 1) continue;                             // TIR: stays inside
+            const ct = Math.sqrt(1 - sin2t);
+            const Tr = 1 - fresnelR(ci, ETA, 1.0);
+            const k = ct - ETA * ci;
+            const tx = ETA * dx + k * nx, tz = ETA * dz + k * nz; // refracted direction
+            if (tz > -1e-3) continue;
+            const sw = (-D - hz) / tz;
+            XW[is] = cx + hx + sw * tx;
+            // out-of-plane (vertical) spreading ~ 1/path length
+            const e = Tr / (NA * NZ) / (1 + sw / D);
+            EL[is] = srcL[is] * e; EW[is] = srcW[is] * e;
+          }
+          for (let is = 0; is < NS - 1; is++) {
+            const xa = XW[is], xb = XW[is + 1];
+            if (xa !== xa || xb !== xb || Math.abs(xa - xb) > 20 * colW) continue;
+            const eL = 0.5 * (EL[is] + EL[is + 1]), eW = 0.5 * (EW[is] + EW[is + 1]);
+            if (eL > 0) tube(L, base, xa, xb, eL);
+            if (eW > 0) tube(W, base, xa, xb, eW);
+          }
+        }
+      }
+    }
+    // Vertical spread with an upward bias (light rising from the bulb).
+    const mu = -0.30 * D / rowH, sig = 0.38 * D / rowH;
+    const K = Math.ceil(3 * sig), ker = new Float32Array(2 * K + 1);
+    let ks = 0;
+    for (let d = -K; d <= K; d++) { const v = Math.exp(-0.5 * ((d - mu) / sig) ** 2); ker[d + K] = v; ks += v; }
+    for (let d = 0; d < ker.length; d++) ker[d] /= ks;
+    for (const G of [L, W]) {
+      T.fill(0);
+      for (let r = 0; r < NR; r++) {
+        const src = r * NC;
+        for (let d = -K; d <= K; d++) {
+          const rr = r + d; if (rr < 0 || rr >= NR) continue;
+          const w = ker[d + K]; if (w < 1e-4) continue;
+          const dst = rr * NC;
+          for (let c = 0; c < NC; c++) T[dst + c] += G[src + c] * w;
+        }
+      }
+      G.set(T);
+    }
   }
 
   // Half-float scene target plus a bloom pyramid (½, ¼, … of the canvas).
@@ -1242,6 +1390,26 @@ class MetaballRenderer {
         this.capPrev.set(this.capCur); this.capCur.set(cr);
         this.wallPrev.set(this.wallCur);
         for (let k = 0; k < this.wallCur.length; k++) this.wallCur[k] = this.wallE[k] / ref.e;
+        if (params.wall !== false) {
+          if (!this.bdRef) {
+            // normalise: mean wall light beside an empty lamp, glow 1
+            this.traceBackdrop(colSmooth, this.waxFrac, 1.0, true);
+            let sum = 0, cnt = 0;
+            for (let r = Math.floor(0.1 * NR); r < Math.floor(0.6 * NR); r++) {
+              const hwc = bottleHalfFrac((r + 0.5) / NR) * SIM_W;
+              for (let c = 0; c < NC; c++) {
+                if (Math.abs((c + 0.5) * colW - SIM_W / 2) > hwc) { sum += this.bdRawL[r * NC + c]; cnt++; }
+              }
+            }
+            this.bdRef = cnt && sum > 0 ? sum / cnt : 1;
+          }
+          this.traceBackdrop(colSmooth, this.waxFrac, glowN, false);
+          this.bdPrevL.set(this.bdCurL); this.bdPrevW.set(this.bdCurW);
+          for (let k = 0; k < gridSize; k++) {
+            this.bdCurL[k] = this.bdRawL[k] / this.bdRef;
+            this.bdCurW[k] = this.bdRawW[k] / this.bdRef;
+          }
+        }
       }
       // Linear interpolation between traces, then a critically damped
       // two-stage low-pass (≈45 ms per stage) — like a camera or eye
@@ -1260,6 +1428,17 @@ class MetaballRenderer {
         const v = wp[k] + (wc[k] - wp[k]) * u;
         g1[k] += (v - g1[k]) * A;
         ws[k] += (g1[k] - ws[k]) * A;
+      }
+      if (params.wall !== false) {
+        const pairs = [[this.bdPrevL, this.bdCurL, this.bdF1L, this.bdL],
+                       [this.bdPrevW, this.bdCurW, this.bdF1W, this.bdW]];
+        for (const [pv, cv, f1b, out] of pairs) {
+          for (let k = 0; k < gridSize; k++) {
+            const v = pv[k] + (cv[k] - pv[k]) * u;
+            f1b[k] += (v - f1b[k]) * A;
+            out[k] += (f1b[k] - out[k]) * A;
+          }
+        }
       }
     }
 
@@ -1337,6 +1516,9 @@ class MetaballRenderer {
         colData[dstIdx + 1] = causticsOn ? this.causticSmooth[srcOff + c] : 0;
         colData[dstIdx + 2] = causticsOn ? this.wallSmooth[r * 2 + (c < NC / 2 ? 0 : 1)] : 0;
         colData[dstIdx + 3] = 0;
+        const bi = dstIdx;
+        this.bdData[bi]     = this.bdL[srcOff + c];
+        this.bdData[bi + 1] = this.bdW[srcOff + c];
       }
     }
     } // end volAbsorb gate
@@ -1354,6 +1536,11 @@ class MetaballRenderer {
     gl.activeTexture(gl.TEXTURE2);
     gl.bindTexture(gl.TEXTURE_2D, this.colMassTex);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, NC, NR, gl.RGBA, gl.FLOAT, colData, 0);
+
+    // light on the wall behind the lamp, unit 3
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, this.backdropTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, NC, NR, gl.RGBA, gl.FLOAT, this.bdData, 0);
 
     // -------- 3. Draw --------
     const useHdr = this.hdr && params.hdr !== false;
@@ -1390,6 +1577,9 @@ class MetaballRenderer {
       gl.uniform1fv(this.u.blobSize, this.blobSize36);
     }
     if (this.u.colMass) { gl.uniform1i(this.u.colMass, 2); }
+    if (this.u.backdrop) gl.uniform1i(this.u.backdrop, 3);
+    if (this.u.wallOn) gl.uniform1f(this.u.wallOn,
+      params.wall !== false && params.caustics !== false && params.volAbsorb !== false ? 1 : 0);
     if (this.u.poolId) gl.uniform1f(this.u.poolId, poolGid);
     if (this.u.ghostMix) gl.uniform4fv(this.u.ghostMix, this.ghostMix);
     if (this.u.lens) gl.uniform1f(this.u.lens, params.lens !== false ? 1 : 0);
@@ -1459,6 +1649,7 @@ const params = {
   caustics: true,
   lens: true,
   bloom: true,
+  wall: true,
 };
 
 // --- UI ---
@@ -1472,6 +1663,7 @@ $("volAbsorb").onchange = (e) => params.volAbsorb = e.target.checked;
 $("caustics").onchange = (e) => params.caustics = e.target.checked;
 $("glassLens").onchange = (e) => params.lens = e.target.checked;
 $("bloom").onchange = (e) => params.bloom = e.target.checked;
+$("wallLight").onchange = (e) => params.wall = e.target.checked;
 
 $("glow").oninput = (e) => {
   params.glow = parseFloat(e.target.value);

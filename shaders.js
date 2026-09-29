@@ -156,6 +156,8 @@ ${FINISH_GLSL}
 #define LIN(c) pow(c, vec3(2.2))
 uniform vec4  uGhostMix;
 uniform sampler2D uColMass;   // 2D mass grid (NUM_COLS × NUM_ROWS), normalized 0-1
+uniform sampler2D uBackdrop;  // wall behind the lamp: R = liquid light, G = wax light
+uniform float uWall;          // 1 = draw the lit wall
 uniform int   uNumCols;       // grid columns (50)
 uniform int   uNumRows;       // grid rows (30)
 
@@ -577,7 +579,18 @@ void main() {
   float slit = smoothstep(0.948, 0.955, t) * (1.0 - smoothstep(0.955, 0.962, t));
   botCapCol += uHot * slit * uGlow * 1.4;
 
+  // Wall behind the lamp: a neutral diffuse surface that only scatters the
+  // light the lamp throws onto it (traced on the CPU), so its colour is the
+  // lamp's light — liquid-filtered lamp light and the wax's own glow.
   vec3 frameOut = vec3(0.0);
+  if (uWall > 0.5 && t >= 0.05 && t <= 0.95) {
+    vec2 bd = texture(uBackdrop, vec2(simPos.x / uSim.x, 1.0 - t)).rg;
+    vec3 lampL = LIN(vec3(1.0, 0.86, 0.66));
+    vec3 lTint = uBg / max(max(uBg.r, uBg.g), max(uBg.b, 1e-4));
+    vec3 waxL = mix(uCold, uHot, 0.6);
+    const float WALL_ALBEDO = 0.6;           // matte, neutral
+    frameOut = WALL_ALBEDO * 0.16 * (bd.r * lampL * lTint + bd.g * waxL) * (uGlow / 0.38);
+  }
 
   vec3 col;
   if (t < 0.05) {
