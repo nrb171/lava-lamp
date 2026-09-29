@@ -1078,7 +1078,7 @@ class MetaballRenderer {
     const rowH = SIM_H / NR, wColW = VIEW_W / NW, cellA = wColW * rowH;
     const D = this.WALL_DIST, cx = SIM_W * 0.5;
     const Sx = cx, Sy = SIM_H * 0.965;                  // bulb
-    const BULB_R = 25, LENS_GAIN = 2.2, K_BULB = 0.9;   // bulb ≈ ⅛ of the globe's radius
+    const BULB_R = 25, LENS_GAIN = 2.6, K_BULB = 0.45;  // bulb ≈ ⅛ of the globe radius
     const V0 = sim.mass / sim.restDensity;
     const pr0 = Math.sqrt(V0 / Math.PI);
     const phiW = this.projPhi, pL = this.projL, pW = this.projW;
@@ -1494,8 +1494,10 @@ class MetaballRenderer {
           this.projectBlobs(sim, sx, sy, glowN);
           this.bdPrevL.set(this.bdCurL); this.bdPrevW.set(this.bdCurW);
           for (let k = 0; k < this.bdCurL.length; k++) {
-            this.bdCurL[k] = this.bdRawL[k] / this.bdRef + this.projL[k];
-            this.bdCurW[k] = this.bdRawW[k] / this.bdRef + this.projW[k];
+            // diffuse glow of the globe at half weight so the bulb's blob
+            // images read as distinct shapes when they land beside the lamp
+            this.bdCurL[k] = 0.5 * this.bdRawL[k] / this.bdRef + this.projL[k];
+            this.bdCurW[k] = 0.5 * this.bdRawW[k] / this.bdRef + this.projW[k];
           }
         }
       }

@@ -592,7 +592,8 @@ void main() {
     vec3 lTint = uBg / max(max(uBg.r, uBg.g), max(uBg.b, 1e-4));
     vec3 waxL = mix(uCold, uHot, 0.6);
     const float WALL_ALBEDO = 0.6;           // matte, neutral
-    frameOut = WALL_ALBEDO * 0.16 * (bd.r * lampL * lTint + bd.g * waxL) * (uGlow / 0.38);
+    // kept very subtle: faint spill from the lamp, not a lit backdrop
+    frameOut = WALL_ALBEDO * 0.07 * (bd.r * lampL * lTint + bd.g * waxL) * (uGlow / 0.38);
   }
 
   vec3 col;
