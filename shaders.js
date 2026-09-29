@@ -81,6 +81,8 @@ void main() {
   c += texture(uSrc, vUv + vec2(h.x, -h.y)).rgb;
   c += texture(uSrc, vUv - vec2(h.x, -h.y)).rgb;
   c *= 0.125;
+  // one NaN/Inf pixel would otherwise be smeared across the whole pyramid
+  c = mix(c, vec3(0.0), bvec3(isnan(c.r) || isinf(c.r) || isnan(c.g) || isinf(c.g) || isnan(c.b) || isinf(c.b)));
   if (uPrefilter > 0.5) c = prefilter(min(c, vec3(32.0)));
   o = vec4(c, 1.0);
 }`;
@@ -121,6 +123,7 @@ void main() {
   // conserving, so it can't wash the picture out — only sources much
   // brighter than their surroundings visibly glow.
   vec3 scene = texture(uScene, vUv).rgb;
+  if (any(isnan(scene)) || any(isinf(scene))) scene = vec3(0.0);
   vec3 halo = texture(uBloom, vUv).rgb * uBloomNorm;
   vec3 hdr = mix(scene, halo, uBloomStrength);
   o = vec4(finishColor(hdr, gl_FragCoord.xy, uRes, uTime), 1.0);
@@ -134,6 +137,7 @@ uniform sampler2D uParticles;   // cell-sorted: (x, y, temp, groupId + compressi
 uniform sampler2D uCellRange;   // RGBA32F: r=start, g=count per grid cell
 uniform vec2  uSim;     // simulation domain (px)
 uniform float uViewM;   // wall margin shown on each side of the lamp (sim px)
+uniform float uViewT;   // wall margin above and below the lamp (sim px)
 uniform vec2  uRes;     // canvas size (px)
 uniform float uH;       // smoothing radius (sim px) — also = cellSize
 uniform ivec2 uGridDim; // active grid (cells wide, cells tall)
@@ -157,7 +161,9 @@ ${FINISH_GLSL}
 #define LIN(c) pow(c, vec3(2.2))
 uniform vec4  uGhostMix;
 uniform sampler2D uColMass;   // 2D mass grid (NUM_COLS × NUM_ROWS), normalized 0-1
-uniform sampler2D uBackdrop;  // wall behind the lamp: R = liquid light, G = wax light
+uniform sampler2D uBackdrop;  // wall behind the lamp, previous trace: R = liquid light, G = wax light
+uniform sampler2D uBackdrop2; // … newest trace
+uniform float uWallMix;       // 0 → previous, 1 → newest
 uniform float uWall;          // 1 = draw the lit wall
 uniform int   uNumCols;       // grid columns (50)
 uniform int   uNumRows;       // grid rows (30)
@@ -228,11 +234,16 @@ float hash(vec2 p) {
 
 void main() {
   vec2 pix = gl_FragCoord.xy;
-  // canvas spans sim x ∈ [−uViewM, uSim.x + uViewM]
-  vec2 simPos = vec2(pix.x * (uSim.x + 2.0 * uViewM) / uRes.x - uViewM,
-                     (uRes.y - pix.y) * uSim.y / uRes.y);
+  // canvas spans sim x ∈ [−uViewM, uSim.x + uViewM], y ∈ [−uViewT, uSim.y + uViewT]
+  vec2 viewSize = vec2(uSim.x + 2.0 * uViewM, uSim.y + 2.0 * uViewT);
+  vec2 simPos = vec2(pix.x * viewSize.x / uRes.x - uViewM,
+                     (uRes.y - pix.y) * viewSize.y / uRes.y - uViewT);
 
   float t = simPos.y / uSim.y;
+  // t is outside [0, 1] above and below the lamp (the full-window view);
+  // clamp it wherever it feeds pow() etc., which is NaN for negative bases
+  // — and one NaN pixel is smeared across the frame by the bloom.
+  float tc = clamp(t, 0.0, 1.0);
   float halfFrac = bottleHalfFrac(t);
   float halfW = halfFrac * uSim.x;
   float cx = uSim.x * 0.5;
@@ -441,7 +452,7 @@ void main() {
 
   // Permanent opaque pool block
   float poolBlockMask = smoothstep(0.89, 0.90, t);
-  vec3 poolBlockColor = mix(uCold, uHot, 0.45) * mix(0.55, 1.15, pow(t, 1.4));
+  vec3 poolBlockColor = mix(uCold, uHot, 0.45) * mix(0.55, 1.15, pow(tc, 1.4));
   fluidBg = mix(fluidBg, poolBlockColor, poolBlockMask);
 
   // -------- Volumetric light from below ---------
@@ -481,7 +492,7 @@ void main() {
   // -------- Wax shading from temperature ---------
   float tempN = clamp((temp - 0.18) / 0.85, 0.0, 1.0);
   vec3 waxColor = mix(uCold, uHot, smoothstep(0.0, 1.0, tempN));
-  float lightFromBelow = mix(0.55, 1.15, pow(t, 1.4));
+  float lightFromBelow = mix(0.55, 1.15, pow(tc, 1.4));
   waxColor *= lightFromBelow;
   waxColor = pow(waxColor, vec3(0.95));
 
@@ -587,7 +598,8 @@ void main() {
   // lamp's light — liquid-filtered lamp light and the wax's own glow.
   vec3 frameOut = vec3(0.0);
   if (uWall > 0.5) {
-    vec2 bd = texture(uBackdrop, vec2((simPos.x + uViewM) / (uSim.x + 2.0 * uViewM), 1.0 - t)).rg;
+    vec2 wuv = vec2((simPos.x + uViewM) / viewSize.x, 1.0 - (simPos.y + uViewT) / viewSize.y);
+    vec2 bd = mix(texture(uBackdrop, wuv).rg, texture(uBackdrop2, wuv).rg, uWallMix);
     vec3 lampL = LIN(vec3(1.0, 0.86, 0.66));
     vec3 lTint = uBg / max(max(uBg.r, uBg.g), max(uBg.b, 1e-4));
     vec3 waxL = mix(uCold, uHot, 0.6);
@@ -603,9 +615,9 @@ void main() {
 
   vec3 col;
   bool inCapX = distFromCenter < uSim.x * 0.5;   // cap / base are the lamp's width
-  if (t < 0.05 && inCapX) {
+  if (t >= 0.0 && t < 0.05 && inCapX) {
     col = topCapCol;
-  } else if (t > 0.95 && inCapX) {
+  } else if (t > 0.95 && t <= 1.0 && inCapX) {
     col = botCapCol;
   } else {
     col = mix(frameOut, inside, insideGlass);

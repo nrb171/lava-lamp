@@ -20,26 +20,19 @@
     background: #000;
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
-    min-height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 36px;
-    padding: 24px;
-    flex-wrap: wrap;
+    overflow: hidden;
   }
+  /* The canvas fills the window: the lamp is fitted in the middle and the
+     wall behind it fills the rest. */
   .stage {
-    position: relative;
-    border-radius: 28px;
-    box-shadow: 0 30px 80px -20px rgba(0,0,0,0.7),
-                0 10px 30px -10px rgba(120,40,180,0.3);
+    position: fixed;
+    inset: 0;
   }
   canvas#lava {
     display: block;
-    /* lamp (380) plus 130 of wall on each side, 700 tall (sim px) */
-    width: 640px;
-    height: 700px;
-    border-radius: 28px;
+    width: 100vw;
+    height: 100vh;
+    height: 100dvh;
     /* prevent the browser from translating drag gestures into scroll/zoom */
     touch-action: none;
     cursor: grab;
@@ -71,14 +64,20 @@
     transition: opacity 0.15s ease-out, visibility 0s linear 0.15s;
   }
   .grab-ring.active { opacity: 1; visibility: visible; transition: opacity 0.15s ease-out; }
+  /* Floats over the canvas. Solid tint rather than backdrop-filter: the
+     canvas under it repaints every frame. */
   .controls {
-    background: var(--panel);
+    position: fixed;
+    top: 62px;
+    right: 14px;
+    z-index: 5;
+    max-height: calc(100vh - 76px);
+    overflow-y: auto;
+    background: rgba(14, 9, 22, 0.86);
     border: 1px solid var(--panel-border);
     border-radius: 18px;
     padding: 22px 22px 18px;
     width: 280px;
-    backdrop-filter: blur(14px);
-    -webkit-backdrop-filter: blur(14px);
   }
   .controls h1 {
     font-size: 11px;
@@ -158,12 +157,7 @@
   }
   .preset:hover { color: var(--text); border-color: rgba(184,92,255,0.4); }
   @media (max-width: 760px) {
-    body { padding: 12px; gap: 16px; }
-    /* keep the sim's 380:700 aspect so the lamp isn't stretched */
-    canvas#lava { width: min(400px, calc(100vw - 24px)); height: auto; aspect-ratio: 640 / 700; }
-    .controls { width: 100%; max-width: 320px; }
-    /* backdrop blur is expensive on phones; the panel sits on plain black */
-    .controls { backdrop-filter: none; -webkit-backdrop-filter: none; }
+    .controls { left: 14px; right: 14px; width: auto; max-height: 60vh; }
   }
 
   /* Floating toolbar (fullscreen + panel toggle) */
@@ -200,11 +194,6 @@
   .controls.hidden { display: none; }
 
   /* Fullscreen: scale the canvas to fill the viewport, keep aspect ratio */
-  :fullscreen canvas#lava,
-  :-webkit-full-screen canvas#lava {
-    height: min(94vh, calc(94vw * 700 / 640));
-    width:  min(94vw, calc(94vh * 640 / 700));
-  }
   :fullscreen body,
   :-webkit-full-screen body {
     background: #000;
@@ -664,31 +653,26 @@ class MetaballRenderer {
     // reaches the wall through the globe, split into liquid-path and
     // wax-path light, on a square-celled grid spanning the view.
     this.WALL_DIST = 200;                  // wall plane behind the axis (sim px)
-    this.WG_W = 128; this.WG_H = 140;      // 5 × 5 sim-px cells over 640 × 700
-    const GW = this.WG_W * this.WG_H;
-    this.wlL = new Float32Array(GW); this.wlW = new Float32Array(GW);
-    this.bdRef = null;
-    this.bdPrevL = new Float32Array(GW); this.bdCurL = new Float32Array(GW);
-    this.bdPrevW = new Float32Array(GW); this.bdCurW = new Float32Array(GW);
-    this.bdF1L = new Float32Array(GW);   this.bdF1W = new Float32Array(GW);
-    this.bdL = new Float32Array(GW);     this.bdW = new Float32Array(GW);
-    // The lamp's default wall light: a slow running average (≈25 s). The
-    // wall shows only light above it — moving caustic patches — while
-    // anything steady fades to black.
-    this.bdAvgL = new Float32Array(GW); this.bdAvgW = new Float32Array(GW);
-    this.bdAvgInit = false;
-    this.WALL_AVG_TAU = 25;                // seconds
-    this.bdData = new Float32Array(GW * 4);
-    this.wgRowBlur = makeTriBlur(this.WG_W, 4);
-    this.wgColBlur = makeTriBlur(this.WG_H, 4);
-    this.wgTmp = new Float32Array(GW);
-    this.backdropTex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, this.backdropTex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);   // half-float: filterable
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, this.WG_W, this.WG_H, 0, gl.RGBA, gl.FLOAT, null);
+    // Two wall textures (previous and newest trace); the shader blends
+    // between them every frame, so the CPU only touches the wall grid on
+    // the frames it traces.
+    this.bdTex = [gl.createTexture(), gl.createTexture()];
+    for (const tx of this.bdTex) {
+      gl.bindTexture(gl.TEXTURE_2D, tx);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);   // half-float: filterable
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    }
+    this.bdCurTex = 0;
+    this.wallFramesSince = 0;
+    this.WALL_AVG_TAU = 25;                // seconds (running-average baseline)
+    this.WG_W = 0; this.WG_H = 0;
+    this.ensureWallGrid();
+    // per-particle time since the particle left the pool (for fading a
+    // blob's lens in as it breaks free)
+    this.freeAge = new Float32Array(maxParticles).fill(10);
+    this.poolTime = new Float32Array(maxParticles);
 
     // Uniforms
     this.uloc = (n) => gl.getUniformLocation(prog, n);
@@ -708,7 +692,10 @@ class MetaballRenderer {
       blobSize:    this.uloc("uBlobSize"),
       colMass:       this.uloc("uColMass"),
       backdrop:      this.uloc("uBackdrop"),
+      backdrop2:     this.uloc("uBackdrop2"),
+      wallMix:       this.uloc("uWallMix"),
       viewM:         this.uloc("uViewM"),
+      viewT:         this.uloc("uViewT"),
       wallOn:        this.uloc("uWall"),
       poolId:        this.uloc("uPoolId"),
       lens:          this.uloc("uLens"),
@@ -965,7 +952,7 @@ class MetaballRenderer {
   // path and wax-path light are kept separate so each can tint the wall.
   traceWall3D(sim, px, py, glow) {
     const GWc = this.WG_W, GHc = this.WG_H;
-    const cellW = VIEW_W / GWc, cellH = SIM_H / GHc;
+    const cellW = VIEW_W / GWc, cellH = VIEW_H / GHc;
     const L = this.wlL, Wx = this.wlW;
     L.fill(0); Wx.fill(0);
     const cx = SIM_W * 0.5, D = this.WALL_DIST, Sy = SIM_H * 0.965;
@@ -983,31 +970,47 @@ class MetaballRenderer {
     const Rsl = (y) => { const yc = y < 0 ? 0 : y > RN - 1 ? RN - 1 : y; const i = yc | 0, f = yc - i; return Rs[i] * (1 - f) + Rs[i + 1] * f; };
 
     // ---- wax ellipsoids from the particles (axis-aligned) ----
-    const K = sim.MAX_BLOBS;
-    const acc = this._wAcc || (this._wAcc = new Float64Array(K * 5));
+    // Slots 0..K-1 are sim blobs; K..K+3 are pool-merge ghosts (particles
+    // already in the pool group but still fading in on screen).
+    // Each blob also gets a lens strength s ∈ [0, 1]: the mean of its
+    // particles' fade-in since leaving the pool (or 1 − the ghost's merge
+    // mix). s scales wax's refractive contrast and absorption, so a blob
+    // breaking from the pool — or sinking back into it — changes the light
+    // on the wall smoothly instead of switching on or off.
+    const K = sim.MAX_BLOBS, KG = K + 4;
+    const acc = this._wAcc || (this._wAcc = new Float64Array(KG * 6));
     acc.fill(0);
+    const ghostOf = this.ghostOf, freeAge = this.freeAge;
     for (let i = 0; i < sim.n; i++) {
-      const g = sim.groupId[i], o = g * 5, x = px[i], y = py[i];
-      acc[o] += 1; acc[o + 1] += x; acc[o + 2] += y; acc[o + 3] += x * x; acc[o + 4] += y * y;
+      const gh = i >= sim.nFixed ? ghostOf[i] : -1;
+      const g = gh >= 0 ? K + gh : sim.groupId[i], o = g * 6, x = px[i], y = py[i];
+      const a = Math.min(1, freeAge[i] / 0.8), fade = a * a * (3 - 2 * a);
+      const str = gh >= 0 ? 1 - this.ghostMix[gh] : fade;
+      acc[o] += 1; acc[o + 1] += x; acc[o + 2] += y; acc[o + 3] += x * x; acc[o + 4] += y * y; acc[o + 5] += str;
     }
     const V0 = sim.mass / sim.restDensity, pr2 = V0 / Math.PI;
     const gPool = sim.nFixed > 0 ? sim.groupId[0] : -1;
-    const B = this._wBlobs || (this._wBlobs = new Float32Array(K * 6));
+    const B = this._wBlobs || (this._wBlobs = new Float32Array(KG * 6));
+    const BS = this._wBlobS || (this._wBlobS = new Float32Array(KG));
     let nb = 0;
-    for (let g = 0; g < K; g++) {
-      const o = g * 5, N = acc[o];
+    for (let g = 0; g < KG; g++) {
+      const o = g * 6, N = acc[o];
       if (N < 3 || g === gPool || g === sim._poolBlobId) continue;   // the pool is the source
+      const str = acc[o + 5] / N;
+      if (str < 0.01) continue;
       const mx = acc[o + 1] / N, my = acc[o + 2] / N;
       const vx = Math.max(0, acc[o + 3] / N - mx * mx), vy = Math.max(0, acc[o + 4] / N - my * my);
       // uniform disc: variance = r²/4  →  r = 2σ (plus a particle radius)
       const ax = Math.sqrt(4 * vx + pr2), ay = Math.sqrt(4 * vy + pr2);
       const Rl = Rof(my);
       let az = Math.min(Math.sqrt(ax * ay), 0.9 * Rl);
-      let cz = (sim.blobZ[g] - 0.5) * 2 * 0.8 * Rl;
+      const zN = g < K ? sim.blobZ[g] - 0.5 : (this.blobZ36[g - K + 32] - 0.5);
+      let cz = zN * 2 * 0.8 * Rl;
       const lim = Math.max(0, Rl - az);
       if (cz > lim) cz = lim; else if (cz < -lim) cz = -lim;
       const q = nb * 6;
       B[q] = mx - cx; B[q + 1] = my; B[q + 2] = cz; B[q + 3] = ax; B[q + 4] = ay; B[q + 5] = az;
+      BS[nb] = str;
       nb++;
     }
     // ray / ellipsoid: sets h0, h1 (ray units) and returns true on a hit.
@@ -1041,7 +1044,7 @@ class MetaballRenderer {
     const ySrc = 0.875 * SIM_H, rSrc = 0.55 * Rof(ySrc);
     const SRC = [[0, 0]];
     for (let k = 0; k < 4; k++) SRC.push([rSrc * Math.cos(k * Math.PI / 2 + 0.4), rSrc * Math.sin(k * Math.PI / 2 + 0.4)]);
-    const NPH = 14, NAZ = 24, PHMAX = 1.35;
+    const NPH = 18, NAZ = 30, PHMAX = 1.35;
     const cMin = Math.cos(PHMAX);
     const RX = this._wrX || (this._wrX = new Float32Array(NPH * NAZ));
     const RY = this._wrY || (this._wrY = new Float32Array(NPH * NAZ));
@@ -1114,19 +1117,21 @@ class MetaballRenderer {
             const q = bB * 6;
             let nx = (X - B[q]) / (B[q + 3] * B[q + 3]), ny = (Y - B[q + 1]) / (B[q + 4] * B[q + 4]), nz = (Z - B[q + 2]) / (B[q + 5] * B[q + 5]);
             const nl = Math.sqrt(nx * nx + ny * ny + nz * nz); nx /= nl; ny /= nl; nz /= nl;
-            if (refract(dx, dy, dz, nx, ny, nz, 1 / NW_)) { dx = out3[0]; dy = out3[1]; dz = out3[2]; }
+            const nwB = 1 + BS[bB] * (NW_ - 1);            // faded refractive contrast
+            if (refract(dx, dy, dz, nx, ny, nz, 1 / nwB)) { dx = out3[0]; dy = out3[1]; dz = out3[2]; }
             inB = bB;
           } else {
             // inside blob inB: go to its far side
             const t1 = hitE(inB, X, Y, Z, dx, dy, dz) ? Math.max(h1, 0) : 0;
             X += dx * t1; Y += dy * t1; Z += dz * t1;
-            waxLen += t1;
-            P *= Math.exp(-MU_WAX * t1);
+            waxLen += t1 * BS[inB];
+            P *= Math.exp(-MU_WAX * t1 * BS[inB]);
             const q = inB * 6;
             let nx = (X - B[q]) / (B[q + 3] * B[q + 3]), ny = (Y - B[q + 1]) / (B[q + 4] * B[q + 4]), nz = (Z - B[q + 2]) / (B[q + 5] * B[q + 5]);
             const nl = Math.sqrt(nx * nx + ny * ny + nz * nz); nx /= nl; ny /= nl; nz /= nl;
             // outward normal faces along d here → use −n for the formula
-            if (refract(dx, dy, dz, -nx, -ny, -nz, NW_)) { dx = out3[0]; dy = out3[1]; dz = out3[2]; }
+            const nwO = 1 + BS[inB] * (NW_ - 1);
+            if (refract(dx, dy, dz, -nx, -ny, -nz, nwO)) { dx = out3[0]; dy = out3[1]; dz = out3[2]; }
             else { const ci = dx * nx + dy * ny + dz * nz; dx -= 2 * ci * nx; dy -= 2 * ci * ny; dz -= 2 * ci * nz; }
             X += dx * 1e-2; Y += dy * 1e-2; Z += dz * 1e-2;
             inB = -1;
@@ -1136,9 +1141,9 @@ class MetaballRenderer {
         P *= Math.exp(-MU_LIQ * liqLen);
         const sW = (-D - Z) / dz;
         RX[idx] = X + dx * sW + cx + VIEW_M;              // view coords
-        RY[idx] = Y + dy * sW;
+        RY[idx] = Y + dy * sW + VIEW_T;
         RP[idx] = P;
-        RW[idx] = waxLen > 0 ? 1 : 0;
+        RW[idx] = Math.min(1, waxLen / 20);          // share of wax-path light
       }
     }
 
@@ -1149,7 +1154,7 @@ class MetaballRenderer {
     // bilinearly — smooth and energy-conserving, with no bounding-box
     // overlap (which left ripples along each ring of rays). Converging
     // tubes (small footprint) come out bright: caustics.
-    const MAXSPAN = 70 * cellW;       // wider = genuinely torn (e.g. across a TIR fold)
+    const MAXSPAN = 280;              // sim px; wider = genuinely torn (e.g. across a TIR fold)
     const splat = (x, y, e, wf) => {
       const gx = x / cellW - 0.5, gy = y / cellH - 0.5;
       const c0 = Math.floor(gx), r0 = Math.floor(gy), fx = gx - c0, fy = gy - r0;
@@ -1174,10 +1179,10 @@ class MetaballRenderer {
         if (span > MAXSPAN) continue;                          // torn tube
         const xmin = Math.min(ax0, ax1, bx0, bx1), xmax = Math.max(ax0, ax1, bx0, bx1);
         const ymin = Math.min(ay0, ay1, by0, by1), ymax = Math.max(ay0, ay1, by0, by1);
-        if (xmax < 0 || xmin > VIEW_W || ymax < 0 || ymin > SIM_H) continue;
+        if (xmax < 0 || xmin > VIEW_W || ymax < 0 || ymin > VIEW_H) continue;
         const E = 0.25 * (P0 + P1 + P2 + P3);
         const wf = 0.25 * (RW[i00] + RW[i01] + RW[i10] + RW[i11]);
-        const m = Math.max(1, Math.min(12, Math.ceil(span / (1.2 * cellW))));
+        const m = Math.max(1, Math.min(10, Math.ceil(span / (2.5 * cellW))));   // pieces ≈ 2.5 cells; smoothing fills between
         const e = E / (m * m);
         for (let a = 0; a < m; a++) {
           const u = (a + 0.5) / m;
@@ -1197,6 +1202,37 @@ class MetaballRenderer {
       for (let r = 0; r < GHc; r++) this.wgRowBlur(G, r * GWc, 1, 2, T);
       for (let c = 0; c < GWc; c++) this.wgColBlur(T, c, GWc, 2, G);
     }
+  }
+
+  // Wall grid over the whole view: ~4 sim-px square cells (coarser only on
+  // very large windows, capped at ~60k cells). Rebuilt when the view
+  // changes size; the running-average baseline restarts then.
+  ensureWallGrid() {
+    const cell = Math.max(4, Math.sqrt(VIEW_W * VIEW_H / 60000));
+    const W = Math.max(8, Math.round(VIEW_W / cell)), H = Math.max(8, Math.round(VIEW_H / cell));
+    if (W === this.WG_W && H === this.WG_H && this._wgVW === VIEW_W && this._wgVH === VIEW_H) return;
+    this._wgVW = VIEW_W; this._wgVH = VIEW_H;
+    if (W !== this.WG_W || H !== this.WG_H) {
+      this.WG_W = W; this.WG_H = H;
+      const GW = W * H;
+      this.wlL = new Float32Array(GW); this.wlW = new Float32Array(GW);
+      this.bdL = new Float32Array(GW);     this.bdW = new Float32Array(GW);   // smoothed difference
+      this.bdAvgL = new Float32Array(GW);  this.bdAvgW = new Float32Array(GW);
+      this.bdData = new Float32Array(GW * 2);
+      this.wgRowBlur = makeTriBlur(W, 4);
+      this.wgColBlur = makeTriBlur(H, 4);
+      this.wgTmp = new Float32Array(GW);
+      const gl = this.gl;
+      const zeros = new Float32Array(GW * 2);
+      for (const tx of this.bdTex) {
+        gl.bindTexture(gl.TEXTURE_2D, tx);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG16F, W, H, 0, gl.RG, gl.FLOAT, zeros);
+      }
+    } else {
+      this.bdL.fill(0); this.bdW.fill(0);
+    }
+    this.bdRef = null;
+    this.bdAvgInit = false;
   }
 
   // Half-float scene target plus a bloom pyramid (½, ¼, … of the canvas).
@@ -1367,6 +1403,19 @@ class MetaballRenderer {
       : Math.min(0.1, Math.max(0, params.time - this.lastTime)) * (sim.timeScale || 1);
     this.lastTime = params.time;
     const poolGid = this.updateGhosts(sim, dt);
+    // Time since each particle left the pool. It only restarts once the
+    // particle has really been back in the pool for 0.3 s: particles on the
+    // pool's edge flicker in and out of its group frame to frame, and
+    // restarting on every flicker made the lens strengths shimmer.
+    {
+      const fa = this.freeAge, pt = this.poolTime, gid = sim.groupId;
+      if (sim.resetCount !== this._faReset) { fa.fill(10); pt.fill(0); this._faReset = sim.resetCount; }
+      for (let i = sim.nFixed; i < n; i++) {
+        if (gid[i] === poolGid) { pt[i] += dt; if (pt[i] > 0.3) fa[i] = 0; }
+        else { pt[i] = 0; fa[i] += dt; }
+      }
+    }
+    this.ensureWallGrid();
     const ghostOf = this.ghostOf;
 
     // -------- 1. Counting-sort particles into spatial grid cells --------
@@ -1541,13 +1590,15 @@ class MetaballRenderer {
         this._wallTick = (this._wallTick || 0) + 1;
         if (params.wall !== false && (this._wallTick & 1) === 0) {
           this.traceWall3D(sim, sx, sy, glowN);
-          const GWn = this.bdCurL.length;
+          const GWn = this.bdL.length;
           if (!this.bdRef) {
             // normalise by the mean wall light beside the lamp at first trace
             let sum = 0, cnt = 0;
-            const cw = VIEW_W / this.WG_W, ch = SIM_H / this.WG_H;
-            for (let r = Math.floor(0.1 * this.WG_H); r < Math.floor(0.9 * this.WG_H); r++) {
-              const hwc = bottleHalfFrac((r + 0.5) / this.WG_H) * SIM_W;
+            const cw = VIEW_W / this.WG_W, ch = VIEW_H / this.WG_H;
+            for (let r = 0; r < this.WG_H; r++) {
+              const ys = (r + 0.5) * ch - VIEW_T;
+              if (ys < 0.1 * SIM_H || ys > 0.9 * SIM_H) continue;
+              const hwc = bottleHalfFrac(ys / SIM_H) * SIM_W;
               for (let c = 0; c < this.WG_W; c++) {
                 if (Math.abs((c + 0.5) * cw - VIEW_M - SIM_W / 2) > hwc) {
                   const k = r * this.WG_W + c; sum += this.wlL[k] + this.wlW[k]; cnt++;
@@ -1556,7 +1607,6 @@ class MetaballRenderer {
             }
             this.bdRef = cnt && sum > 0 ? sum / cnt : 1;
           }
-          this.bdPrevL.set(this.bdCurL); this.bdPrevW.set(this.bdCurW);
           // Only light above the lamp's running-average (default) wall light
           // is drawn; negative where wax takes light away (the shader clamps
           // each component at zero).
@@ -1568,14 +1618,29 @@ class MetaballRenderer {
           this._bdAge += 2 * every / 60;
           const tau = this._bdAge < 20 ? 2 : this.WALL_AVG_TAU;
           const alpha = Math.min(1, 2 * every / 60 / tau);
+          // Light temporal smoothing per trace (the shader then blends the
+          // last two traces linearly between trace frames).
+          const sL = this.bdL, sW = this.bdW, SM = 0.5;
           for (let k = 0; k < GWn; k++) {
             const vL = this.wlL[k] / this.bdRef, vW = this.wlW[k] / this.bdRef;
-            if (!this.bdAvgInit) { aL[k] = vL; aW[k] = vW; }
+            if (!this.bdAvgInit) { aL[k] = vL; aW[k] = vW; sL[k] = 0; sW[k] = 0; }
             else { aL[k] += (vL - aL[k]) * alpha; aW[k] += (vW - aW[k]) * alpha; }
-            this.bdCurL[k] = vL - aL[k];
-            this.bdCurW[k] = vW - aW[k];
+            sL[k] += ((vL - aL[k]) - sL[k]) * SM;
+            sW[k] += ((vW - aW[k]) - sW[k]) * SM;
           }
           this.bdAvgInit = true;
+          // pack (rows flipped: texture v = 1 at the top) and upload into
+          // the older of the two textures, which becomes the newest
+          const NW = this.WG_W, NH = this.WG_H, bd = this.bdData;
+          for (let r = 0; r < NH; r++) {
+            const src = r * NW, dst = (NH - 1 - r) * NW;
+            for (let c = 0; c < NW; c++) { const o = (dst + c) << 1; bd[o] = sL[src + c]; bd[o + 1] = sW[src + c]; }
+          }
+          this.bdCurTex ^= 1;
+          gl.bindTexture(gl.TEXTURE_2D, this.bdTex[this.bdCurTex]);
+          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, NW, NH, gl.RG, gl.FLOAT, bd, 0);
+          this.wallFramesSince = 0;
+          this.wallInterval = 2 * every;
         }
       }
       // Linear interpolation between traces, then a critically damped
@@ -1595,19 +1660,6 @@ class MetaballRenderer {
         const v = wp[k] + (wc[k] - wp[k]) * u;
         g1[k] += (v - g1[k]) * A;
         ws[k] += (g1[k] - ws[k]) * A;
-      }
-      if (params.wall !== false) {
-        // wall traces come every 2·every frames
-        const uw = (((this._wallTick & 1) * every) + phase + 1) / (2 * every);
-        const pairs = [[this.bdPrevL, this.bdCurL, this.bdF1L, this.bdL],
-                       [this.bdPrevW, this.bdCurW, this.bdF1W, this.bdW]];
-        for (const [pv, cv, f1b, out] of pairs) {
-          for (let k = 0; k < out.length; k++) {
-            const v = pv[k] + (cv[k] - pv[k]) * uw;
-            f1b[k] += (v - f1b[k]) * A;
-            out[k] += (f1b[k] - out[k]) * A;
-          }
-        }
       }
     }
 
@@ -1687,18 +1739,6 @@ class MetaballRenderer {
         colData[dstIdx + 3] = 0;
       }
     }
-    // wall grid (view width), flipped the same way
-    {
-      const NW = this.WG_W, NH = this.WG_H;
-      for (let r = 0; r < NH; r++) {
-        const src = r * NW, dst = (NH - 1 - r) * NW;
-        for (let c = 0; c < NW; c++) {
-          const o = (dst + c) << 2;
-          this.bdData[o]     = this.bdL[src + c];
-          this.bdData[o + 1] = this.bdW[src + c];
-        }
-      }
-    }
     } // end volAbsorb gate
 
     // -------- 2. Upload textures (always reset active unit first) --------
@@ -1715,10 +1755,13 @@ class MetaballRenderer {
     gl.bindTexture(gl.TEXTURE_2D, this.colMassTex);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, NC, NR, gl.RGBA, gl.FLOAT, colData, 0);
 
-    // light on the wall behind the lamp, unit 3
+    // light on the wall behind the lamp: previous trace on unit 3, newest
+    // on unit 4; the shader blends them by how far we are to the next trace
     gl.activeTexture(gl.TEXTURE3);
-    gl.bindTexture(gl.TEXTURE_2D, this.backdropTex);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.WG_W, this.WG_H, gl.RGBA, gl.FLOAT, this.bdData, 0);
+    gl.bindTexture(gl.TEXTURE_2D, this.bdTex[this.bdCurTex ^ 1]);
+    gl.activeTexture(gl.TEXTURE4);
+    gl.bindTexture(gl.TEXTURE_2D, this.bdTex[this.bdCurTex]);
+    this.wallFramesSince++;
 
     // -------- 3. Draw --------
     const useHdr = this.hdr && params.hdr !== false;
@@ -1738,6 +1781,7 @@ class MetaballRenderer {
     if (this.u.cellRange) gl.uniform1i(this.u.cellRange, 1);
     gl.uniform2f(this.u.sim, SIM_W, SIM_H);
     if (this.u.viewM) gl.uniform1f(this.u.viewM, VIEW_M);
+    if (this.u.viewT) gl.uniform1f(this.u.viewT, VIEW_T);
     gl.uniform2f(this.u.res, this.canvas.width, this.canvas.height);
     gl.uniform1f(this.u.h, hRender);
     if (this.u.gridDim) gl.uniform2i(this.u.gridDim, gridW, gridH);
@@ -1757,6 +1801,9 @@ class MetaballRenderer {
     }
     if (this.u.colMass) { gl.uniform1i(this.u.colMass, 2); }
     if (this.u.backdrop) gl.uniform1i(this.u.backdrop, 3);
+    if (this.u.backdrop2) gl.uniform1i(this.u.backdrop2, 4);
+    if (this.u.wallMix) gl.uniform1f(this.u.wallMix,
+      Math.min(1, this.wallFramesSince / (this.wallInterval || 4)));
     if (this.u.wallOn) gl.uniform1f(this.u.wallOn,
       params.wall !== false && params.caustics !== false && params.volAbsorb !== false ? 1 : 0);
     if (this.u.poolId) gl.uniform1f(this.u.poolId, poolGid);
@@ -1771,10 +1818,22 @@ class MetaballRenderer {
   }
 }
 
-// The canvas shows the lamp plus a strip of the wall behind it on each
-// side: sim x ∈ [−VIEW_M, SIM_W + VIEW_M].
-const VIEW_M = 130;
-const VIEW_W = SIM_W + 2 * VIEW_M;
+// The canvas fills the window. The lamp (SIM_W × SIM_H) is fitted in the
+// middle with a small margin above and below; the wall behind it fills the
+// rest. The canvas shows sim x ∈ [−VIEW_M, SIM_W + VIEW_M] and
+// y ∈ [−VIEW_T, SIM_H + VIEW_T]. On a wide window VIEW_M grows; on a
+// narrow (portrait) one the lamp fits the width and VIEW_T grows.
+let VIEW_M = 130, VIEW_T = 0.04 * SIM_H;
+let VIEW_W = SIM_W + 2 * VIEW_M, VIEW_H = SIM_H + 2 * VIEW_T;
+function updateView(cssW, cssH) {
+  if (!(cssW > 0 && cssH > 0)) return;
+  const aspect = cssW / cssH;
+  const hFit = SIM_H * 1.08, wFit = SIM_W * 1.06;
+  if (aspect * hFit >= wFit) { VIEW_H = hFit; VIEW_W = aspect * VIEW_H; }
+  else { VIEW_W = wFit; VIEW_H = VIEW_W / aspect; }
+  VIEW_M = 0.5 * (VIEW_W - SIM_W);
+  VIEW_T = 0.5 * (VIEW_H - SIM_H);
+}
 
 // ----------------- App glue ----------------------------------
 const canvas = document.getElementById("lava");
@@ -1785,7 +1844,7 @@ const canvas = document.getElementById("lava");
 // doesn't shade a 760×1400 buffer. MAX_PIXELS caps big fullscreen windows.
 // The quality scale adapts to measured frame time unless ?scale=<0.3-1>
 // pins it (handy for benchmarking).
-const MAX_PIXELS = 1280 * 1400;   // wall pixels are cheap (no particle gather)
+const MAX_PIXELS = 2560 * 1600;   // wall pixels are cheap (no particle gather)
 const MIN_SCALE = 0.45;
 const pinnedScale = parseFloat(new URLSearchParams(location.search).get("scale"));
 let renderScale = pinnedScale > 0 ? Math.min(1, Math.max(0.3, pinnedScale)) : 1.0;
@@ -1793,6 +1852,7 @@ let renderScale = pinnedScale > 0 ? Math.min(1, Math.max(0.3, pinnedScale)) : 1.
 function sizeCanvas() {
   const rect = canvas.getBoundingClientRect();
   if (rect.width < 1 || rect.height < 1) return;
+  updateView(rect.width, rect.height);
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   let w = rect.width * dpr * renderScale;
   let h = rect.height * dpr * renderScale;
@@ -2031,6 +2091,7 @@ $("reset").onclick = () => sim.reset();
 
 // --- Fullscreen + panel toggle ---
 const controlsEl = document.querySelector(".controls");
+if (window.innerWidth < 760) controlsEl.classList.add("hidden");
 $("togglePanel").onclick = () => controlsEl.classList.toggle("hidden");
 $("toggleFs").onclick = async () => {
   const inFs = document.fullscreenElement || document.webkitFullscreenElement;
@@ -2095,7 +2156,7 @@ document.querySelectorAll(".preset").forEach((b) => {
   function clientToSim(ev) {
     const rect = canvas.getBoundingClientRect();
     const ax = (ev.clientX - rect.left) * (VIEW_W / rect.width) - VIEW_M;
-    const sy = (ev.clientY - rect.top)  * (SIM_H / rect.height);
+    const sy = (ev.clientY - rect.top)  * (VIEW_H / rect.height) - VIEW_T;
     // ringX: apparent (on-screen) position for the halo
     return { sx: lensToSim(ax, sy), sy, rect, ringX: ax };
   }
@@ -2106,7 +2167,7 @@ document.querySelectorAll(".preset").forEach((b) => {
     const stage = canvas.parentElement;
     const stageRect = stage.getBoundingClientRect();
     const cssX = (rect.left - stageRect.left) + (sx + VIEW_M) * (rect.width / VIEW_W);
-    const cssY = (rect.top  - stageRect.top ) + sy * (rect.height / SIM_H);
+    const cssY = (rect.top  - stageRect.top ) + (sy + VIEW_T) * (rect.height / VIEW_H);
     const cssDiameter = 2 * sim.grab.radius * (rect.width / VIEW_W);
     grabRing.style.width  = cssDiameter + "px";
     grabRing.style.height = cssDiameter + "px";
