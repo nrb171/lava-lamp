@@ -370,6 +370,14 @@
     <input type="checkbox" id="volAbsorb" checked />
     <label for="volAbsorb" style="cursor:pointer">Volumetric absorption</label>
   </div>
+  <div class="control" style="display:flex;align-items:center;gap:6px">
+    <input type="checkbox" id="caustics" checked />
+    <label for="caustics" style="cursor:pointer">Caustics</label>
+  </div>
+  <div class="control" style="display:flex;align-items:center;gap:6px">
+    <input type="checkbox" id="glassLens" checked />
+    <label for="glassLens" style="cursor:pointer">Glass lens</label>
+  </div>
 
   <button id="reset">Reset simulation</button>
 
@@ -422,6 +430,18 @@ function makeTriBlur(n, maxR) {
       dst[idx] = R === 0 ? src[idx] : tri(i, R) / den[R * n + i];
     }
   };
+}
+
+// Unpolarised Fresnel reflectance from index n1 into n2 at incidence cos ci
+// (1 beyond the critical angle: total internal reflection).
+function fresnelR(ci, n1, n2) {
+  const si = Math.sqrt(Math.max(0, 1 - ci * ci));
+  const st = (n1 / n2) * si;
+  if (st >= 1) return 1;
+  const ct = Math.sqrt(1 - st * st);
+  const rs = (n1 * ci - n2 * ct) / (n1 * ci + n2 * ct);
+  const rp = (n1 * ct - n2 * ci) / (n1 * ct + n2 * ci);
+  return 0.5 * (rs * rs + rp * rp);
 }
 
 // ----------------- WebGL Renderer -----------------------------
@@ -581,6 +601,15 @@ class MetaballRenderer {
     this.VOL_SMOOTH_R = 4;
     this.rowBlur = makeTriBlur(this.NUM_COLS, this.VOL_MAX_RADIUS);
     this.colBlur = makeTriBlur(this.NUM_ROWS, this.VOL_SMOOTH_R);
+    // Caustics (see traceCaustics): per-frame buffers + smoothed outputs
+    this.waxFrac      = new Float32Array(G);          // wax volume fraction φ
+    this.fTrace       = new Float32Array(G);          // fluence, refracted+reflected rays
+    this.fStraight    = new Float32Array(G);          // fluence, same rays unbent
+    this.causticRaw   = new Float32Array(G);
+    this.causticSmooth = new Float32Array(G);
+    this.wallE        = new Float32Array(this.NUM_ROWS * 2);   // [row*2 + side]
+    this.wallSmooth   = new Float32Array(this.NUM_ROWS * 2);
+    this.causticRef   = null;                          // no-wax normalisation
 
     // Uniforms
     this.uloc = (n) => gl.getUniformLocation(prog, n);
@@ -600,10 +629,165 @@ class MetaballRenderer {
       blobSize:    this.uloc("uBlobSize"),
       colMass:       this.uloc("uColMass"),
       poolId:        this.uloc("uPoolId"),
+      lens:          this.uloc("uLens"),
+      caustics:      this.uloc("uCaustics"),
       ghostMix:      this.uloc("uGhostMix"),
       numCols:       this.uloc("uNumCols"),
       numRows:       this.uloc("uNumRows"),
     };
+  }
+
+  // ---- Caustics: 2-D ray tracing of pool light, every frame ----
+  // Rays leave the lit pool surface (Lambertian, brighter at the centre)
+  // and march upward row by row through the wax grid:
+  //  • Wax lensing — paraffin (n 1.43) in the liquid (n 1.34) is a
+  //    converging medium. Crossing a row of height Δy whose wax volume
+  //    fraction φ varies in x, a ray is bent like a thin prism:
+  //        Δ(dx/dy) = (n_wax/n_liquid − 1) · Δy · ∂φ/∂x
+  //    toward the thicker wax. Wax also absorbs, at the volumetric rate.
+  //  • Walls — at the glass the ray reflects with the Fresnel reflectance
+  //    for liquid → air (the thin glass shell is ~parallel, so the exit
+  //    into air decides it). Past ~48° incidence that is total internal
+  //    reflection, which is why grazing light hugs and piles up along the
+  //    walls. The light striking the glass at each height is recorded
+  //    (wall irradiance → the glowing glass edge).
+  // Each ray also has an unbent, non-reflecting twin; the fluence
+  // difference (traced − straight) is the caustic: where lensing and wall
+  // reflections concentrate light (+) or pull it away (−). Plain shadowing
+  // is already the volumetric R channel, so this only adds the redirection.
+  traceCaustics(sim, massRaw, glow, noWax) {
+    const NC = this.NUM_COLS, NR = this.NUM_ROWS;
+    const colW = SIM_W / NC, rowH = SIM_H / NR;
+    const cx = SIM_W * 0.5;
+    const hw = (y) => bottleHalfFrac(y / SIM_H) * SIM_W - 2;   // inner wall
+    const phi = this.waxFrac, fT = this.fTrace, fS = this.fStraight;
+    const wallE = this.wallE;
+    const V0 = sim.mass / sim.restDensity;                   // area per particle
+    // massRaw spreads each particle over 2 units (1 + 4 × 0.25)
+    const fracPerUnit = 0.5 * V0 / (colW * rowH);
+    for (let k = 0; k < phi.length; k++) phi[k] = noWax ? 0 : Math.min(1, massRaw[k] * fracPerUnit);
+    fT.fill(0); fS.fill(0); wallE.fill(0);
+
+    const N_REL = 1.43 / 1.34, LENS = (N_REL - 1) * rowH;
+    const ABSORB = noWax ? 0 : 0.18;
+    const poolRow = Math.floor(0.82 * NR);
+    const ySrc = (poolRow + 1) * rowH;
+    const srcHalf = hw(ySrc) * 0.97;
+    const NX = 40, NA = 14;
+    // Per-row wall radius / slope and per-cell transmittance, computed once
+    // per trace instead of per ray step.
+    if (!this._rowW) { this._rowW = new Float32Array(NR); this._rowS = new Float32Array(NR); }
+    const rowWall = this._rowW, rowSlope = this._rowS;
+    for (let r = 0; r < NR; r++) {
+      const y = (r + 0.5) * rowH;
+      rowWall[r] = hw(y);
+      rowSlope[r] = (hw(y + 0.5 * rowH) - hw(y - 0.5 * rowH)) / rowH;
+    }
+    const trans = this._trans || (this._trans = new Float32Array(NC * NR));
+    for (let k = 0; k < trans.length; k++) trans[k] = Math.exp(-massRaw[k] * ABSORB);
+    // Per angle family, every ray's state at every row (for ray tubes)
+    if (!this._rt || this._rt.NX !== NX) {
+      this._rt = { NX, x: new Float32Array(NX * NR), P: new Float32Array(NX * NR),
+                   b: new Int8Array(NX * NR), xs: new Float32Array(NX * NR),
+                   Ps: new Float32Array(NX * NR) };
+    }
+    const RT = this._rt;
+    const cellOf = (x) => Math.min(NC - 1, Math.max(0, (x / colW) | 0));
+    const splat = (grid, r, x, e) => {
+      const g = x / colW - 0.5, c0 = Math.floor(g), f = g - c0;
+      if (c0 >= 0 && c0 < NC) grid[r * NC + c0] += e * (1 - f);
+      if (c0 + 1 >= 0 && c0 + 1 < NC) grid[r * NC + c0 + 1] += e * f;
+    };
+    // Spread a tube's power uniformly over [xa, xb] (energy-conserving):
+    // narrow tube = focused light, wide tube = spread-out light.
+    const tube = (grid, r, xa, xb, e) => {
+      if (xa > xb) { const t = xa; xa = xb; xb = t; }
+      const len = xb - xa;
+      if (len < colW * 0.5) { splat(grid, r, 0.5 * (xa + xb), e); return; }
+      const c0 = Math.max(0, Math.floor(xa / colW)), c1 = Math.min(NC - 1, Math.floor(xb / colW));
+      for (let c = c0; c <= c1; c++) {
+        const ov = Math.min(xb, (c + 1) * colW) - Math.max(xa, c * colW);
+        if (ov > 0) grid[r * NC + c] += e * ov / len;
+      }
+    };
+
+    for (let ia = 0; ia < NA; ia++) {
+      // stratified Lambertian angles, limited to ±70° from vertical
+      const ang = Math.asin((((ia + 0.5) / NA) * 2 - 1) * Math.sin(70 * Math.PI / 180));
+      const slope0 = Math.tan(ang);
+      for (let ix = 0; ix < NX; ix++) {
+        const u = ((ix + 0.5) / NX) * 2 - 1;
+        const x0 = cx + u * srcHalf;
+        let P = Math.max(0, 1 - Math.abs(u * u * u)) * glow / (NX * NA);
+        let x = x0, slope = slope0, bounces = 0;
+        let xs = x0, Ps = P;
+        for (let r = poolRow; r >= 0; r--) {
+          const W = rowWall[r], o = ix * NR + r;
+          if (P > 1e-7) {
+            const c = cellOf(x), base = r * NC;
+            const cl = Math.max(0, c - 2), cr = Math.min(NC - 1, c + 2);
+            slope += LENS * (phi[base + cr] - phi[base + cl]) / ((cr - cl) * colW);
+            if (slope > 3) slope = 3; else if (slope < -3) slope = -3;
+            P *= trans[base + c];
+            x += slope * rowH;
+            if (Math.abs(x - cx) > W && bounces < 6) {
+              const side = x > cx ? 1 : 0, sgn = side ? 1 : -1;
+              const dhw = rowSlope[r];
+              const dl = 1 / Math.sqrt(slope * slope + 1);
+              const dx = slope * dl, dy = -dl;
+              const nl = 1 / Math.sqrt(1 + dhw * dhw);
+              const Nx = sgn * nl, Ny = -dhw * nl;
+              const ci = dx * Nx + dy * Ny;
+              if (ci > 0) {
+                wallE[r * 2 + side] += P;                    // light striking the glass
+                const R = fresnelR(ci, 1.34, 1.0) * 0.96;
+                const rx = dx - 2 * ci * Nx;
+                let ry = dy - 2 * ci * Ny;
+                if (ry > -0.05) ry = -0.05;                  // keep marching upward
+                slope = rx / -ry;
+                P *= R;
+                x = cx + sgn * (2 * W - Math.abs(x - cx));   // back inside
+                bounces++;
+              }
+            }
+            if (Math.abs(x - cx) > W + 1) P = 0;
+          }
+          RT.x[o] = x; RT.P[o] = P; RT.b[o] = bounces;
+          // straight twin: no lensing, lost at the wall
+          if (Ps > 1e-7) {
+            Ps *= trans[r * NC + cellOf(xs)];
+            xs += slope0 * rowH;
+            if (Math.abs(xs - cx) > W) Ps = 0;
+          }
+          RT.xs[o] = xs; RT.Ps[o] = Ps;
+        }
+      }
+      // Deposit ray tubes between neighbouring rays of this family.
+      for (let r = poolRow; r >= 0; r--) {
+        for (let ix = 0; ix < NX - 1; ix++) {
+          const o0 = ix * NR + r, o1 = o0 + NR;
+          const P0 = RT.P[o0], P1 = RT.P[o1];
+          if (P0 > 0 || P1 > 0) {
+            if (P0 > 0 && P1 > 0 && RT.b[o0] === RT.b[o1]) {
+              tube(fT, r, RT.x[o0], RT.x[o1], 0.5 * (P0 + P1));
+            } else {                                         // tube torn by a wall
+              if (P0 > 0) splat(fT, r, RT.x[o0], 0.5 * P0);
+              if (P1 > 0) splat(fT, r, RT.x[o1], 0.5 * P1);
+            }
+          }
+          const S0 = RT.Ps[o0], S1 = RT.Ps[o1];
+          if (S0 > 0 && S1 > 0) tube(fS, r, RT.xs[o0], RT.xs[o1], 0.5 * (S0 + S1));
+          else { if (S0 > 0) splat(fS, r, RT.xs[o0], 0.5 * S0); if (S1 > 0) splat(fS, r, RT.xs[o1], 0.5 * S1); }
+        }
+      }
+    }
+    // wall irradiance: light 1-2-1 smoothing along the height
+    const tmp = this._wallTmp || (this._wallTmp = new Float32Array(wallE.length));
+    for (let r = 0; r < NR; r++) for (let sd = 0; sd < 2; sd++) {
+      const a = wallE[Math.max(0, r - 1) * 2 + sd], b = wallE[r * 2 + sd], c = wallE[Math.min(NR - 1, r + 1) * 2 + sd];
+      tmp[r * 2 + sd] = 0.25 * a + 0.5 * b + 0.25 * c;
+    }
+    wallE.set(tmp);
   }
 
   // Track particles joining the pool and advance/release merge ghosts.
@@ -823,6 +1007,40 @@ class MetaballRenderer {
       }
     }
 
+    // Step 2b: caustics from wax lensing + wall reflection (see traceCaustics).
+    const causticsOn = params.caustics !== false;
+    if (causticsOn) {
+      if (!this.causticRef) {
+        // Normalise against an empty lamp at the reference glow, so the
+        // numbers are "fraction of clear-lamp light".
+        this.traceCaustics(sim, massRaw, 1.0, true);
+        // f: brightest clear-lamp fluence; e: mean irradiance on lit glass
+        let fMax = 0, eSum = 0, eN = 0;
+        for (const v of this.fStraight) fMax = Math.max(fMax, v);
+        for (const v of this.wallE) if (v > 0) { eSum += v; eN++; }
+        this.causticRef = { f: fMax || 1, e: eN ? eSum / eN : 1 };
+      }
+      const glowN = params.glow / 0.38;
+      // Caustics change slowly and are temporally smoothed: trace every
+      // other frame, or every 4th once adaptive quality has kicked in.
+      this._causticTick = (this._causticTick || 0) + 1;
+      const every = (params.quality !== undefined && params.quality < 0.8) ? 4 : 2;
+      if (this._causticTick % every === 0) {
+      this.traceCaustics(sim, massRaw, glowN, false);
+      const cr = this.causticRaw, ref = this.causticRef;
+      for (let k = 0; k < gridSize; k++) cr[k] = (this.fTrace[k] - this.fStraight[k]) / ref.f;
+      // Smooth out the discreteness of the ray families (triangle blur,
+      // 3 cells across, 1 row vertically), then temporal EMA.
+      const ct = this.lightSmoothed;              // scratch; recomputed below
+      for (let r = 0; r < NR; r++) this.rowBlur(cr, r * NC, 1, 3, ct);
+      for (let c = 0; c < NC; c++) this.colBlur(ct, c, NC, 1, cr);
+      const cs = this.causticSmooth;
+      for (let k = 0; k < gridSize; k++) cs[k] += (cr[k] - cs[k]) * 0.45;
+      const ws = this.wallSmooth;
+      for (let k = 0; k < ws.length; k++) ws[k] += (this.wallE[k] / ref.e - ws[k]) * 0.45;
+      }
+    }
+
     // Step 3: Vertical convolution for blur-kernel field.
     // For each cell, sum mass in the same column over LOOK_BELOW rows
     // below it. This determines how much horizontal smoothing to apply.
@@ -893,8 +1111,9 @@ class MetaballRenderer {
         const dstIdx = (dstRow + c) << 2;
         const light = Math.min(colSmooth[srcOff + c], 1.0);
         colData[dstIdx]     = light;
-        colData[dstIdx + 1] = 0;
-        colData[dstIdx + 2] = 0;
+        // G = caustic excess, B = irradiance on the glass on this side
+        colData[dstIdx + 1] = causticsOn ? this.causticSmooth[srcOff + c] : 0;
+        colData[dstIdx + 2] = causticsOn ? this.wallSmooth[r * 2 + (c < NC / 2 ? 0 : 1)] : 0;
         colData[dstIdx + 3] = 0;
       }
     }
@@ -941,6 +1160,9 @@ class MetaballRenderer {
     if (this.u.colMass) { gl.uniform1i(this.u.colMass, 2); }
     if (this.u.poolId) gl.uniform1f(this.u.poolId, poolGid);
     if (this.u.ghostMix) gl.uniform4fv(this.u.ghostMix, this.ghostMix);
+    if (this.u.lens) gl.uniform1f(this.u.lens, params.lens !== false ? 1 : 0);
+    if (this.u.caustics) gl.uniform1f(this.u.caustics,
+      params.caustics !== false && params.volAbsorb !== false ? 1 : 0);
     if (this.u.numCols) gl.uniform1i(this.u.numCols, params.volAbsorb !== false ? this.NUM_COLS : 0);
     if (this.u.numRows) gl.uniform1i(this.u.numRows, params.volAbsorb !== false ? this.NUM_ROWS : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
@@ -1001,6 +1223,8 @@ const params = {
   glow: 0.38,
   time: 0,
   volAbsorb: true,
+  caustics: true,
+  lens: true,
 };
 
 // --- UI ---
@@ -1011,6 +1235,8 @@ $("coldColor").oninput = (e) => params.cold = hexToRgb(e.target.value);
 $("hotColor").oninput  = (e) => params.hot  = hexToRgb(e.target.value);
 $("compColor").oninput = (e) => params.compressColor = hexToRgb(e.target.value);
 $("volAbsorb").onchange = (e) => params.volAbsorb = e.target.checked;
+$("caustics").onchange = (e) => params.caustics = e.target.checked;
+$("glassLens").onchange = (e) => params.lens = e.target.checked;
 
 $("glow").oninput = (e) => {
   params.glow = parseFloat(e.target.value);
@@ -1244,11 +1470,23 @@ document.querySelectorAll(".preset").forEach((b) => {
   let lastSimX = 0, lastSimY = 0;
   // We use the canvas getBoundingClientRect each event so the mapping
   // works under fullscreen scaling, devicePixelRatio, and panel toggles.
+  // The view of the interior goes through the glass lens (see shader), so
+  // map the pointer the same way: grab what you see, not what's behind it.
+  function lensToSim(sx, sy) {
+    if (params.lens === false) return sx;
+    const cx = SIM_W * 0.5, R = bottleHalfFrac(sy / SIM_H) * SIM_W;
+    const b = Math.abs(sx - cx);
+    if (R <= 1 || b >= R) return sx;
+    const sI = b / R, delta = Math.asin(sI) - Math.asin(sI / 1.34);
+    const x0 = Math.max(0, b - Math.sqrt(R * R - b * b) * Math.tan(delta));
+    return cx + Math.sign(sx - cx) * x0;
+  }
   function clientToSim(ev) {
     const rect = canvas.getBoundingClientRect();
-    const sx = (ev.clientX - rect.left) * (SIM_W / rect.width);
+    const ax = (ev.clientX - rect.left) * (SIM_W / rect.width);
     const sy = (ev.clientY - rect.top)  * (SIM_H / rect.height);
-    return { sx, sy, rect };
+    // ringX: apparent (on-screen) position for the halo
+    return { sx: lensToSim(ax, sy), sy, rect, ringX: ax };
   }
   function placeRing(rect, sx, sy, visible) {
     // grab-ring is absolutely positioned inside .stage (same offset
@@ -1269,7 +1507,7 @@ document.querySelectorAll(".preset").forEach((b) => {
   canvas.addEventListener("pointerdown", (ev) => {
     // Ignore secondary buttons (right-click etc.)
     if (ev.button !== 0 && ev.pointerType === "mouse") return;
-    const { sx, sy, rect } = clientToSim(ev);
+    const { sx, sy, rect, ringX } = clientToSim(ev);
     const grabbed = sim.beginGrab(sx, sy);
     if (!grabbed) return; // empty space — let the click do nothing
     pointerId = ev.pointerId;
@@ -1277,7 +1515,7 @@ document.querySelectorAll(".preset").forEach((b) => {
     canvas.classList.add("grabbing");
     lastEventTime = performance.now();
     lastSimX = sx; lastSimY = sy;
-    placeRing(rect, sx, sy, true);
+    placeRing(rect, ringX, sy, true);
     ev.preventDefault();
   });
 
@@ -1285,13 +1523,13 @@ document.querySelectorAll(".preset").forEach((b) => {
     if (pointerId === null || ev.pointerId !== pointerId) return;
     const now = performance.now();
     const dt = Math.max(0.001, (now - lastEventTime) / 1000);
-    const { sx, sy, rect } = clientToSim(ev);
+    const { sx, sy, rect, ringX } = clientToSim(ev);
     const vx = (sx - lastSimX) / dt;
     const vy = (sy - lastSimY) / dt;
     sim.updateGrab(sx, sy, vx, vy);
     lastEventTime = now;
     lastSimX = sx; lastSimY = sy;
-    placeRing(rect, sx, sy, true);
+    placeRing(rect, ringX, sy, true);
   });
 
   function releaseGrab() {
@@ -1423,6 +1661,7 @@ function frame(now) {
   stepPhysics(rawDt);
 
   params.time = now / 1000;
+  params.quality = renderScale;
   renderer.render(sim, params);
 
   frames++;

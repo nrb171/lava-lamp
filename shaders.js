@@ -29,6 +29,8 @@ uniform float uBlobSize[36];
 // 0 → 1. At 0 the pair renders as two touching blobs; at 1 exactly as one
 // body (the summed field), so the ghost can then be dropped invisibly.
 uniform float uPoolId;        // pool's group id, or -1
+uniform float uLens;          // 1 = view the interior through the cylindrical glass lens
+uniform float uCaustics;      // 1 = draw caustics (texture G/B channels)
 uniform vec4  uGhostMix;
 uniform sampler2D uColMass;   // 2D mass grid (NUM_COLS × NUM_ROWS), normalized 0-1
 uniform int   uNumCols;       // grid columns (50)
@@ -108,6 +110,34 @@ void main() {
   float cx = uSim.x * 0.5;
   float distFromCenter = abs(simPos.x - cx);
 
+  // -------- The glass as a cylindrical lens ---------
+  // The lamp is a solid of revolution. A view ray at apparent offset b
+  // from the axis meets the curved surface at incidence sin θi = b/R and
+  // refracts into the liquid (thin glass shell ≈ parallel, so air → n 1.34
+  // decides it), bending toward the axis by δ = θi − θt. It crosses the
+  // mid-plane — where the sim lives — at
+  //     x0 = b − √(R² − b²) · tan δ
+  // so the middle looks magnified ~1.34× while a wide slice near the walls
+  // is squeezed into a thin band at the silhouette. The interior is
+  // sampled at x0; the Fresnel reflectance at entry (→ 1 at the edge)
+  // trades transmitted interior light for reflected room light.
+  vec2 sp = simPos;                 // where the view ray samples the interior
+  float lensT = 1.0, lensF = 0.0;   // Fresnel transmission / reflection at entry
+  if (uLens > 0.5 && halfW > 1.0 && distFromCenter < halfW) {
+    float b = distFromCenter;
+    float sI = b / halfW;
+    float sT = sI / N_FLUID;
+    float delta = asin(sI) - asin(sT);
+    float zin = sqrt(max(halfW * halfW - b * b, 0.0));
+    float x0 = max(b - zin * tan(delta), 0.0);
+    sp.x = cx + sign(simPos.x - cx) * x0;
+    float cI = sqrt(max(1.0 - sI * sI, 0.0));
+    float r0 = (N_FLUID - 1.0) / (N_FLUID + 1.0); r0 *= r0;
+    float x5 = 1.0 - cI; x5 = x5 * x5 * x5 * x5 * x5;
+    lensF = r0 + (1.0 - r0) * x5;
+    lensT = 1.0 - lensF;
+  }
+
   // -------- Per-blob metaball field, temperature & compression ---------
   // A pixel only ever overlaps a handful of blobs, so instead of 32-entry
   // per-group arrays (which mobile GPUs spill to slow memory because they
@@ -126,7 +156,7 @@ void main() {
     // Spatial-grid lookup: only visit particles in the 3x3 cell neighborhood
     // around this pixel. cellSize == uH, so any particle within the kernel
     // radius is guaranteed to live in one of these 9 cells.
-    ivec2 cellHere = ivec2(floor(simPos / uH));
+    ivec2 cellHere = ivec2(floor(sp / uH));
     for (int dy = -1; dy <= 1; dy++) {
       for (int dx = -1; dx <= 1; dx++) {
         ivec2 c = cellHere + ivec2(dx, dy);
@@ -138,7 +168,7 @@ void main() {
         for (int j = 0; j < 700; j++) {
           if (j >= count) break;
           vec4 part = texelFetch(uParticles, ivec2(start + j, 0), 0);
-          vec2 d = simPos - part.xy;
+          vec2 d = sp - part.xy;
           float r2 = dot(d, d);
           if (r2 < h2) {
             float w = 1.0 - r2 * invH2;
@@ -267,12 +297,12 @@ void main() {
   // -------- Background inside glass ---------
   float bottomT = clamp((t - 0.55) / 0.40, 0.0, 1.0);
   float bulb = pow(clamp((t - 0.78) / 0.16, 0.0, 1.0), 1.7) * uGlow;
-  float horiz = 1.0 - smoothstep(0.0, halfW * 0.95, distFromCenter);
+  float horiz = 1.0 - smoothstep(0.0, halfW * 0.95, abs(sp.x - cx));
   bulb *= mix(0.35, 1.0, horiz);
 
   vec3 warmTint = mix(uCold, uHot, 0.65) * 1.2;
-  vec3 fluidBg = mix(uBg, uBg * 1.4 + warmTint * 0.35, bottomT);
-  fluidBg = mix(fluidBg, warmTint, bulb * 0.55);
+  vec3 fluidBg = mix(uBg, uBg * 1.3 + warmTint * 0.15, bottomT);
+  fluidBg = mix(fluidBg, warmTint, bulb * 0.35);
   fluidBg *= mix(0.85, 1.0, smoothstep(0.0, 1.0, t));
 
   // Permanent opaque pool block
@@ -284,17 +314,32 @@ void main() {
   // The texture holds per-column light intensity: bright where light from
   // the pool passes through unobstructed, dark where wax blocks it.
   // Horizontally blurred on CPU with mass-dependent kernel for refraction.
+  float wallIrr = 0.0;             // light striking the glass on this side
   if (uNumCols > 0 && uNumRows > 0) {
-    float colU = simPos.x / uSim.x;
+    float colU = sp.x / uSim.x;
     float colV = 1.0 - t;   // texV: 0=top of lamp, 1=bottom
-    float light = texture(uColMass, vec2(colU, colV)).r;
+    vec4 vol = texture(uColMass, vec2(colU, colV));
+    float light = vol.r;
 
     // God ray: additive warm glow scaled by bulb glow slider
     vec3 rayColor = mix(uHot, vec3(1.0, 0.97, 0.90), 0.3);
+    // Light scattered by the liquid takes the liquid's colour (lamp light
+    // × liquid tint) instead of being added as near-white light, which is
+    // what washed the fluid out toward beige.
+    vec3 liqTint = uBg / max(max(uBg.r, uBg.g), max(uBg.b, 1e-3));
+    vec3 scatterCol = rayColor * mix(liqTint, vec3(1.0), 0.35);
     // Envelope: strong in lower-mid bulb, gentler fade toward top
     float envelope = smoothstep(0.93, 0.65, t) * smoothstep(0.02, 0.15, t);
     float glowScale = uGlow / 0.38;  // normalized so default glow=0.55 → 1.0
-    fluidBg += rayColor * light * envelope * 0.80 * glowScale;
+    fluidBg += scatterCol * light * envelope * 0.55 * glowScale;
+
+    // Caustics: light redirected by wax lenses and wall reflections, as a
+    // fraction of clear-lamp light (+ concentrated, − pulled away).
+    if (uCaustics > 0.5) {
+      float causticEnv = smoothstep(0.02, 0.10, t) * (1.0 - smoothstep(0.86, 0.89, t));
+      fluidBg += scatterCol * clamp(vol.g, -0.6, 2.0) * 0.22 * causticEnv;
+      wallIrr = vol.b;
+    }
 
     // Darken where light is blocked (1 - light = shadow)
     float shadow = (1.0 - light) * envelope * 0.45 * glowScale;
@@ -360,8 +405,8 @@ void main() {
   // ---- Uniform translucency + pressure opacity ----
   // Base 10% transparency, plus a soft center fade so the core
   // of each blob feels translucent rather than a solid disc.
-  alpha *= 0.82;
-  alpha *= 1.0 - centerness * 0.30;
+  alpha *= 0.90;
+  alpha *= 1.0 - centerness * 0.18;
   alpha *= max(1.0 - compIntensity * 0.65, 0.40);  // clip at 60% transparency
 
   // Inner core detail
@@ -387,6 +432,9 @@ void main() {
 
   // Mix wax over fluid bg
   vec3 inside = mix(fluidBg, inner, alpha);
+  // Fresnel at the curved glass: toward the silhouette less of the interior
+  // gets through and more of the (dim) room is reflected.
+  inside = inside * lensT + lensF * (vec3(0.035, 0.028, 0.05) + uHot * 0.04 * uGlow);
 
   // -------- Bottle frame ---------
   vec3 topCapCol = vec3(0.06, 0.05, 0.10);
@@ -414,6 +462,21 @@ void main() {
     float rimDist = halfW - distFromCenter;
     float rim = smoothstep(0.0, 1.5, rimDist) * (1.0 - smoothstep(1.5, 4.0, rimDist));
     col += vec3(0.22, 0.18, 0.30) * rim * 0.45;
+    // Glass edge lit by the light striking it. Seen edge-on, a shell of
+    // thickness tau has line-of-sight length
+    //   L(b) = 2(√(R² − b²) − √((R − tau)² − b²))
+    // through glass at apparent offset b, peaking at the inner surface:
+    // limb brightening, which is why a lit glass shows bright rim lines.
+    if (wallIrr > 0.0) {
+      float tau = 3.0;
+      float b = distFromCenter, R = halfW;
+      float Lo = sqrt(max(R * R - b * b, 0.0));
+      float Li = sqrt(max((R - tau) * (R - tau) - b * b, 0.0));
+      float L = 2.0 * (Lo - Li) / (2.0 * sqrt(max(2.0 * R * tau - tau * tau, 1e-3)));
+      vec3 edgeCol = mix(uHot, vec3(1.0, 0.97, 0.90), 0.3);
+      // soft response: irradiance is ~1 on average, a few × at hot spots
+      col += edgeCol * (1.0 - exp(-0.7 * wallIrr)) * L * 0.32 * step(b, R);
+    }
     float streakX = clamp(1.0 - abs((simPos.x - (cx - halfW * 0.55)) / 6.0), 0.0, 1.0);
     float streakY = smoothstep(0.10, 0.40, t) * (1.0 - smoothstep(0.40, 0.62, t));
     col += vec3(0.85, 0.80, 1.0) * streakX * streakY * 0.10 * insideGlass;
@@ -423,6 +486,13 @@ void main() {
   float outerGlow = smoothstep(0.96, 0.55, t) * uGlow * 0.18;
   outerGlow *= smoothstep(uSim.x * 0.9, 0.0, distFromCenter);
   col += uHot * outerGlow * (1.0 - insideGlass) * 0.25;
+
+  // Filmic shoulder on luminance: bright areas roll off instead of
+  // clipping (which flattened the bright parts of the lamp), while hue and
+  // saturation are kept — a per-channel curve would bleach the wax to cream.
+  float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+  if (lum > 1e-4) col *= (1.0 - exp(-lum * 1.25)) / lum;
+  col = min(col, vec3(1.0));
 
   // Vignette
   vec2 ndc = (pix / uRes) - 0.5;
