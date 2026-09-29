@@ -660,39 +660,35 @@ class MetaballRenderer {
     this.wallCur  = new Float32Array(this.NUM_ROWS * 2);
     // two-stage (critically damped) temporal filter state
     this.capF1 = new Float32Array(G);  this.wallF1 = new Float32Array(this.NUM_ROWS * 2);
-    // Backdrop wall behind the lamp (see traceBackdrop): liquid-light and
-    // wax-light irradiance on the wall, per grid cell of the canvas.
-    this.WALL_DIST = 200;                              // wall plane behind the axis (sim px): lamp near a wall
-    // The wall grid covers the whole view (lamp + margins), same cell width.
-    this.WCOLS = Math.round(VIEW_W / (SIM_W / this.NUM_COLS));
-    const GW = this.WCOLS * this.NUM_ROWS;
-    this.bdRawL = new Float32Array(GW); this.bdRawW = new Float32Array(GW);
-    this.bdTmp = new Float32Array(GW);
-    this.projL = new Float32Array(GW);  this.projW = new Float32Array(GW);
-    this.projPhi = new Float32Array(GW);
+    // Wall behind the lamp (see traceWall3D): light from the bulb that
+    // reaches the wall through the globe, split into liquid-path and
+    // wax-path light, on a square-celled grid spanning the view.
+    this.WALL_DIST = 200;                  // wall plane behind the axis (sim px)
+    this.WG_W = 128; this.WG_H = 140;      // 5 × 5 sim-px cells over 640 × 700
+    const GW = this.WG_W * this.WG_H;
+    this.wlL = new Float32Array(GW); this.wlW = new Float32Array(GW);
+    this.bdRef = null;
     this.bdPrevL = new Float32Array(GW); this.bdCurL = new Float32Array(GW);
     this.bdPrevW = new Float32Array(GW); this.bdCurW = new Float32Array(GW);
     this.bdF1L = new Float32Array(GW);   this.bdF1W = new Float32Array(GW);
     this.bdL = new Float32Array(GW);     this.bdW = new Float32Array(GW);
-    this.bdRef = null;
     // The lamp's default wall light: a slow running average (≈25 s). The
-    // wall shows only light above it — passing blob images and shifting
-    // bands — while anything steady (incl. resting wax) fades to black.
+    // wall shows only light above it — moving caustic patches — while
+    // anything steady fades to black.
     this.bdAvgL = new Float32Array(GW); this.bdAvgW = new Float32Array(GW);
     this.bdAvgInit = false;
-    this.WALL_AVG_TAU = 25;          // seconds
+    this.WALL_AVG_TAU = 25;                // seconds
     this.bdData = new Float32Array(GW * 4);
-    this.wallRowBlur = makeTriBlur(this.WCOLS, 48);
-    this.MAX_SPOTS = 12;
-    this.spotData = new Float32Array(this.MAX_SPOTS * 4);
-    this.spotFade = new Map();          // blob id → 0..1, eases spots in/out
+    this.wgRowBlur = makeTriBlur(this.WG_W, 4);
+    this.wgColBlur = makeTriBlur(this.WG_H, 4);
+    this.wgTmp = new Float32Array(GW);
     this.backdropTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.backdropTex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, colMassFilter);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, colMassFilter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);   // half-float: filterable
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, this.WCOLS, this.NUM_ROWS, 0, gl.RGBA, gl.FLOAT, null);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, this.WG_W, this.WG_H, 0, gl.RGBA, gl.FLOAT, null);
 
     // Uniforms
     this.uloc = (n) => gl.getUniformLocation(prog, n);
@@ -712,8 +708,6 @@ class MetaballRenderer {
       blobSize:    this.uloc("uBlobSize"),
       colMass:       this.uloc("uColMass"),
       backdrop:      this.uloc("uBackdrop"),
-      spots:         this.uloc("uSpots"),
-      spotCount:     this.uloc("uSpotCount"),
       viewM:         this.uloc("uViewM"),
       wallOn:        this.uloc("uWall"),
       poolId:        this.uloc("uPoolId"),
@@ -948,260 +942,261 @@ class MetaballRenderer {
     wallE.set(tmp);
   }
 
-  // ---- Light thrown onto a wall behind the lamp --------------------
-  // Each row of the lamp is a horizontal circular slice of radius R. The
-  // lit liquid (lamp light × liquid tint) and the glowing wax in that slice
-  // emit in all directions; rays heading back toward the wall leave through
-  // the curved glass, refracting liquid → air (Snell) and losing the
-  // Fresnel-reflected part (past the critical angle they stay inside). The
-  // slice is a strong cylindrical lens (f ≈ nR / 2(n−1) ≈ 2R), so the light
-  // bunches into bright bands that drift as the wax moves. Rays are binned
-  // where they land on a flat wall WALL_DIST behind the axis; the wall is
-  // neutral and only scatters that light, so all colour comes from the
-  // lamp. Light also leaves at vertical angles — mostly upward, the way the
-  // bulb light travels — so each row's pattern is spread up the wall.
-  // light × lightScale = volumetric light at glow 1 (so glow enters once)
-  traceBackdrop(light, phi, glow, noWax, lightScale) {
-    const NC = this.NUM_COLS, NR = this.NUM_ROWS;
-    const colW = SIM_W / NC, rowH = SIM_H / NR;
-    const cx = SIM_W * 0.5, D = this.WALL_DIST;
-    const NW = this.WCOLS, wColW = VIEW_W / NW;            // wall grid, view coords
-    const L = this.bdRawL, W = this.bdRawW, T = this.bdTmp;
-    L.fill(0); W.fill(0);
-    const NS = 20, NZ = 2, NA = 12, ETA = 1.34;
-    const lerpRow = (grid, base, x) => {
-      const g = x / colW - 0.5;
-      let c0 = Math.floor(g), f = g - c0;
-      if (c0 < 0) { c0 = 0; f = 0; } else if (c0 >= NC - 1) { c0 = NC - 2; f = 1; }
-      return grid[base + c0] * (1 - f) + grid[base + c0 + 1] * f;
-    };
-    // Ray tubes: within one (depth, direction) family, neighbouring source
-    // positions bound a beam; its power spreads evenly between where the two
-    // rays land (narrow = focused = bright), so the wall light is smooth
-    // instead of a comb of single-ray hits.
-    // xa, xb in sim x; the wall grid starts at −VIEW_M
-    const tube = (grid, base, xa, xb, e) => {
-      xa += VIEW_M; xb += VIEW_M;
-      if (xa > xb) { const q = xa; xa = xb; xb = q; }
-      if (xb - xa < wColW) { const m = 0.5 * (xa + xb); xa = m - 0.5 * wColW; xb = m + 0.5 * wColW; }
-      const len = xb - xa;
-      const c0 = Math.max(0, Math.floor(xa / wColW)), c1 = Math.min(NW - 1, Math.floor(xb / wColW));
-      for (let c = c0; c <= c1; c++) {
-        const ov = Math.min(xb, (c + 1) * wColW) - Math.max(xa, c * wColW);
-        if (ov > 0) grid[base + c] += e * ov / len;
-      }
-    };
-    if (!this._bdRays || this._bdRays.XW.length !== NS) {
-      this._bdRays = { XW: new Float32Array(NS), EL: new Float32Array(NS), EW: new Float32Array(NS) };
+  // ---- Pool light on the wall behind: a 3-D ray trace ---------------
+  // The bulb lights the wax pool from below; paraffin scatters strongly, so
+  // the pool's top surface glows as a broad, soft (Lambertian) source —
+  // modelled as 7 points spread over it. Rays toward the back are followed
+  // in 3-D:
+  //  • the globe is the real surface of revolution ρ = R(y), so its normal
+  //    (x/ρ, −R′(y), z/ρ) bends light both sideways and vertically;
+  //  • each free wax blob is an ellipsoid fitted to its particles (depth
+  //    from the blob depth the renderer already uses), and
+  //    rays refract into and out of it (Snell, n 1.43 / 1.34), with wax
+  //    absorbing along the chord;
+  //  • at the glass, rays refract liquid → air with Fresnel loss; past the
+  //    critical angle they reflect back inside (TIR) and try again;
+  //  • the liquid attenuates along the path (the same e^-2.2 per lamp
+  //    height as the in-lamp light).
+  // Rays land on a flat wall WALL_DIST behind the axis. Neighbouring rays
+  // (from the same source point) form small quads and each quad's power is
+  // spread over the patch it covers — ray-tube density, i.e. true 2-D
+  // caustics: converging light (a blob lensing) is bright, diverging light
+  // is dim. The broad source softens them into drifting patches. Liquid-
+  // path and wax-path light are kept separate so each can tint the wall.
+  traceWall3D(sim, px, py, glow) {
+    const GWc = this.WG_W, GHc = this.WG_H;
+    const cellW = VIEW_W / GWc, cellH = SIM_H / GHc;
+    const L = this.wlL, Wx = this.wlW;
+    L.fill(0); Wx.fill(0);
+    const cx = SIM_W * 0.5, D = this.WALL_DIST, Sy = SIM_H * 0.965;
+    const ETA_G = 1.34, NW_ = 1.43 / 1.34;
+    const MU_WAX = 0.004, MU_LIQ = 2.2 / SIM_H;
+    // globe radius / slope tables (per sim px of height)
+    if (!this._Rt) {
+      const n = SIM_H + 2;
+      this._Rt = new Float32Array(n); this._Rs = new Float32Array(n);
+      for (let y = 0; y < n; y++) this._Rt[y] = bottleHalfFrac(Math.min(1, y / SIM_H)) * SIM_W;
+      for (let y = 0; y < n; y++) this._Rs[y] = 0.5 * (this._Rt[Math.min(n - 1, y + 1)] - this._Rt[Math.max(0, y - 1)]);
     }
-    const { XW, EL, EW } = this._bdRays;
-    for (let r = 0; r < NR; r++) {
-      const t = (r + 0.5) / NR;
-      if (t < 0.05 || t > 0.95) continue;
-      const R = bottleHalfFrac(t) * SIM_W;
-      if (R < 3) continue;
-      const base = r * NC, wbase = r * NW;
-      const beer = Math.exp(-Math.max(0.88 - t, 0) * 2.2);
-      const inPool = t > 0.885;
-      // per-source emission (liquid scatter, lit wax), with volume element
-      const srcL = this._srcL || (this._srcL = new Float32Array(64));
-      const srcW = this._srcW || (this._srcW = new Float32Array(64));
-      for (let is = 0; is < NS; is++) {
-        const xs = R * ((((is + 0.5) / NS) * 2) - 1);
-        const zc = Math.sqrt(Math.max(R * R - xs * xs, 0));
-        const X = cx + xs;
-        const lit = lerpRow(light, base, X) * lightScale;
-        const wax = inPool ? 1 : (noWax ? 0 : lerpRow(phi, base, X));
-        const cellA = (2 * R / NS) * (2 * zc / NZ);
-        srcL[is] = lit * beer * (1 - wax) * cellA * glow;
-        srcW[is] = (0.35 + 0.65 * lit) * wax * cellA * glow;
-      }
-      for (let iz = 0; iz < NZ; iz++) {
-        for (let ia = 0; ia < NA; ia++) {
-          const th = (((ia + 0.5) / NA) * 2 - 1) * 1.45;        // ±83° about "toward the wall"
-          const dx = Math.sin(th), dz = -Math.cos(th);
-          for (let is = 0; is < NS; is++) {
-            XW[is] = NaN;
-            const xs = R * ((((is + 0.5) / NS) * 2) - 1);
-            const zc = Math.sqrt(Math.max(R * R - xs * xs, 0));
-            const zs = zc * ((((iz + 0.5) / NZ) * 2) - 1);
-            // exit point on the glass circle
-            const b = xs * dx + zs * dz, c = xs * xs + zs * zs - R * R;
-            const tHit = -b + Math.sqrt(Math.max(b * b - c, 0));
-            const hx = xs + dx * tHit, hz = zs + dz * tHit;
-            const nx = hx / R, nz = hz / R;
-            const ci = dx * nx + dz * nz;
-            if (ci <= 0) continue;
-            const sin2t = ETA * ETA * (1 - ci * ci);
-            if (sin2t >= 1) continue;                             // TIR: stays inside
-            const ct = Math.sqrt(1 - sin2t);
-            const Tr = 1 - fresnelR(ci, ETA, 1.0);
-            const k = ct - ETA * ci;
-            const tx = ETA * dx + k * nx, tz = ETA * dz + k * nz; // refracted direction
-            if (tz > -1e-3) continue;
-            const sw = (-D - hz) / tz;
-            XW[is] = cx + hx + sw * tx;
-            // out-of-plane (vertical) spreading ~ 1/path length
-            const e = Tr / (NA * NZ) / (1 + sw / D);
-            EL[is] = srcL[is] * e; EW[is] = srcW[is] * e;
-          }
-          for (let is = 0; is < NS - 1; is++) {
-            const xa = XW[is], xb = XW[is + 1];
-            if (xa !== xa || xb !== xb || Math.abs(xa - xb) > 20 * colW) continue;
-            const eL = 0.5 * (EL[is] + EL[is + 1]), eW = 0.5 * (EW[is] + EW[is + 1]);
-            if (eL > 0) tube(L, wbase, xa, xb, eL);
-            if (eW > 0) tube(W, wbase, xa, xb, eW);
-          }
-        }
-      }
-    }
-    // Out-of-plane spread: light leaves each slice at a range of angles,
-    // so its pattern spreads over the wall by ~0.38·D — vertically (with an
-    // upward bias, light rising from the bulb) and equally sideways, which
-    // keeps the patches round rather than tall streaks.
-    const mu = -0.30 * D / rowH, sig = 0.38 * D / rowH;
-    const K = Math.ceil(3 * sig), ker = new Float32Array(2 * K + 1);
-    let ks = 0;
-    for (let d = -K; d <= K; d++) { const v = Math.exp(-0.5 * ((d - mu) / sig) ** 2); ker[d + K] = v; ks += v; }
-    for (let d = 0; d < ker.length; d++) ker[d] /= ks;
-    for (const G of [L, W]) {
-      T.fill(0);
-      for (let r = 0; r < NR; r++) {
-        const src = r * NW;
-        for (let d = -K; d <= K; d++) {
-          const rr = r + d; if (rr < 0 || rr >= NR) continue;
-          const w = ker[d + K]; if (w < 1e-4) continue;
-          const dst = rr * NW;
-          for (let c = 0; c < NW; c++) T[dst + c] += G[src + c] * w;
-        }
-      }
-      G.set(T);
-      // same spread sideways: triangle ∘ triangle ≈ Gaussian with σ = 0.38·D
-      // (a triangle of radius R has σ = R/√6, so two of R = σ·√3 each)
-      const Rh = Math.min(48, Math.round(0.38 * D / wColW * Math.sqrt(3)));
-      for (let r = 0; r < NR; r++) this.wallRowBlur(G, r * NW, 1, Rh, T);
-      for (let r = 0; r < NR; r++) this.wallRowBlur(T, r * NW, 1, Rh, G);
-    }
-  }
+    const Rt = this._Rt, Rs = this._Rs, RN = Rt.length - 1;
+    const Rof = (y) => { const yc = y < 0 ? 0 : y > RN - 1 ? RN - 1 : y; const i = yc | 0, f = yc - i; return Rt[i] * (1 - f) + Rt[i + 1] * f; };
+    const Rsl = (y) => { const yc = y < 0 ? 0 : y > RN - 1 ? RN - 1 : y; const i = yc | 0, f = yc - i; return Rs[i] * (1 - f) + Rs[i + 1] * f; };
 
-  // ---- Blob images projected onto the wall by the bulb -------------
-  // The bulb under the base is a compact source, so each blob in the back
-  // half of the globe (depth z < 0 — the same depth the renderer uses to
-  // layer blobs) throws a magnified image of itself onto the wall: a point
-  // p goes to  S + (p − S)·D/|z|  (S = bulb, D = wall distance). Images
-  // rise faster than the blobs and grow up the wall as blobs leave the
-  // pool. The bulb's finite size softens their edges (penumbra ∝ (1−s)/s).
-  // Wax is a weak converging lens (f ≈ 8 × blob radius, comparable to the
-  // distance to the wall), so its image is brighter than the surrounding
-  // liquid-filtered light and takes the wax's colour.
-  projectBlobs(sim, px, py, glow, noBlobs) {
-    const NR = this.NUM_ROWS, NW = this.WCOLS;
-    const rowH = SIM_H / NR, wColW = VIEW_W / NW, cellA = wColW * rowH;
-    const D = this.WALL_DIST, cx = SIM_W * 0.5;
-    const Sx = cx, Sy = SIM_H * 0.965;                  // bulb
-    const BULB_R = 25, LENS_GAIN = 2.6, K_BULB = 0.9;   // bulb ≈ ⅛ of the globe radius
-    const V0 = sim.mass / sim.restDensity;
-    const pr0 = Math.sqrt(V0 / Math.PI);
-    const phiW = this.projPhi, pL = this.projL, pW = this.projW;
-    phiW.fill(0);
-    const gid = sim.groupId, bz = sim.blobZ;
-    const skipA = sim.nFixed > 0 ? gid[0] : -1, skipB = sim._poolBlobId;
-    for (let i = noBlobs ? sim.n : sim.nFixed; i < sim.n; i++) {
-      const g = gid[i];
-      if (g === skipA || g === skipB) continue;
-      const zN = bz[g] - 0.5;                            // < 0 : back half
-      if (zN >= -0.02) continue;
-      const Rloc = bottleHalfFrac(Math.min(0.95, Math.max(0.05, sim.cmy[g] / SIM_H))) * SIM_W;
-      const z = -zN * 2 * 0.8 * Rloc;                   // |z| behind the mid-plane
-      const sSc = Math.min(0.7, Math.max(0.18, z / D));
-      const mag = 1 / sSc;
-      const wx = Sx + (px[i] - Sx) * mag + VIEW_M, wy = Sy + (py[i] - Sy) * mag;
-      const rp = pr0 * mag, pen = BULB_R * (1 - sSc) / sSc;
-      const Rk = 1.3 * Math.sqrt(rp * rp + pen * pen), Rk2 = Rk * Rk;
-      if (wy + Rk < 0 || wy - Rk > SIM_H || wx + Rk < 0 || wx - Rk > VIEW_W) continue;
-      const c0 = Math.max(0, Math.floor((wx - Rk) / wColW)), c1 = Math.min(NW - 1, Math.floor((wx + Rk) / wColW));
-      const r0 = Math.max(0, Math.floor((wy - Rk) / rowH)), r1 = Math.min(NR - 1, Math.floor((wy + Rk) / rowH));
-      // normalisation of the kernel, then deposit projected area V0·mag²
-      let wsum = 0;
-      for (let r = r0; r <= r1; r++) {
-        const dy = (r + 0.5) * rowH - wy;
-        for (let c = c0; c <= c1; c++) {
-          const dx = (c + 0.5) * wColW - wx;
-          const q = 1 - (dx * dx + dy * dy) / Rk2;
-          if (q > 0) wsum += q * q;
-        }
-      }
-      if (wsum <= 0) continue;
-      const amp = V0 * mag * mag / (cellA * wsum);
-      for (let r = r0; r <= r1; r++) {
-        const dy = (r + 0.5) * rowH - wy;
-        for (let c = c0; c <= c1; c++) {
-          const dx = (c + 0.5) * wColW - wx;
-          const q = 1 - (dx * dx + dy * dy) / Rk2;
-          if (q > 0) phiW[r * NW + c] += q * q * amp;
-        }
-      }
+    // ---- wax ellipsoids from the particles (axis-aligned) ----
+    const K = sim.MAX_BLOBS;
+    const acc = this._wAcc || (this._wAcc = new Float64Array(K * 5));
+    acc.fill(0);
+    for (let i = 0; i < sim.n; i++) {
+      const g = sim.groupId[i], o = g * 5, x = px[i], y = py[i];
+      acc[o] += 1; acc[o + 1] += x; acc[o + 2] += y; acc[o + 3] += x * x; acc[o + 4] += y * y;
     }
-    // Direct bulb light on the wall: point source, flat wall → E ∝ (D/r)³;
-    // the base blocks it below the bulb. Split into light through liquid
-    // and light through (projected) wax.
-    for (let r = 0; r < NR; r++) {
-      const y = (r + 0.5) * rowH, dy = y - Sy;
-      const above = Math.min(1, Math.max(0, (Sy - y) / (0.08 * SIM_H)));
-      for (let c = 0; c < NW; c++) {
-        const x = (c + 0.5) * wColW - VIEW_M, dx = x - Sx;
-        const rr = Math.sqrt(dx * dx + dy * dy + D * D);
-        const E = K_BULB * glow * above * (D / rr) ** 3;
-        const k = r * NW + c;
-        const cov = 1 - Math.exp(-phiW[k]);
-        pL[k] = E * (1 - cov);
-        pW[k] = E * cov * LENS_GAIN;
-      }
+    const V0 = sim.mass / sim.restDensity, pr2 = V0 / Math.PI;
+    const gPool = sim.nFixed > 0 ? sim.groupId[0] : -1;
+    const B = this._wBlobs || (this._wBlobs = new Float32Array(K * 6));
+    let nb = 0;
+    for (let g = 0; g < K; g++) {
+      const o = g * 5, N = acc[o];
+      if (N < 3 || g === gPool || g === sim._poolBlobId) continue;   // the pool is the source
+      const mx = acc[o + 1] / N, my = acc[o + 2] / N;
+      const vx = Math.max(0, acc[o + 3] / N - mx * mx), vy = Math.max(0, acc[o + 4] / N - my * my);
+      // uniform disc: variance = r²/4  →  r = 2σ (plus a particle radius)
+      const ax = Math.sqrt(4 * vx + pr2), ay = Math.sqrt(4 * vy + pr2);
+      const Rl = Rof(my);
+      let az = Math.min(Math.sqrt(ax * ay), 0.9 * Rl);
+      let cz = (sim.blobZ[g] - 0.5) * 2 * 0.8 * Rl;
+      const lim = Math.max(0, Rl - az);
+      if (cz > lim) cz = lim; else if (cz < -lim) cz = -lim;
+      const q = nb * 6;
+      B[q] = mx - cx; B[q + 1] = my; B[q + 2] = cz; B[q + 3] = ax; B[q + 4] = ay; B[q + 5] = az;
+      nb++;
     }
-  }
+    // ray / ellipsoid: sets h0, h1 (ray units) and returns true on a hit.
+    // (No array per call — this runs thousands of times per trace.)
+    let h0 = 0, h1 = 0;
+    const hitE = (b, X, Y, Z, dx, dy, dz) => {
+      const q = b * 6, ax = B[q + 3], ay = B[q + 4], az = B[q + 5];
+      const ox = (X - B[q]) / ax, oy = (Y - B[q + 1]) / ay, oz = (Z - B[q + 2]) / az;
+      const ex = dx / ax, ey = dy / ay, ez = dz / az;
+      const A2 = ex * ex + ey * ey + ez * ez, Bh = ox * ex + oy * ey + oz * ez, C = ox * ox + oy * oy + oz * oz - 1;
+      const disc = Bh * Bh - A2 * C;
+      if (disc <= 0) return false;
+      const sq = Math.sqrt(disc);
+      h0 = (-Bh - sq) / A2; h1 = (-Bh + sq) / A2;
+      return true;
+    };
+    // refract d through a surface with unit normal n facing against d
+    // (GLSL refract); returns false on total internal reflection
+    const out3 = this._o3 || (this._o3 = new Float64Array(3));
+    const refract = (dx, dy, dz, nx, ny, nz, eta) => {
+      const ci = -(dx * nx + dy * ny + dz * nz);
+      const k = 1 - eta * eta * (1 - ci * ci);
+      if (k < 0) return false;
+      const f = eta * ci - Math.sqrt(k);
+      out3[0] = eta * dx + f * nx; out3[1] = eta * dy + f * ny; out3[2] = eta * dz + f * nz;
+      return true;
+    };
 
-  // ---- Focused spots: each blob is a lens imaging the bulb ----------
-  // A wax blob of radius a in the liquid is a weak converging lens,
-  // f ≈ n_rel·a / (2(n_rel − 1)) ≈ 8a. The bulb (a disc, radius BULB_R, a
-  // distance u below/behind the blob) is imaged at v = 1/(1/f − 1/u). The
-  // light the blob intercepts lands on the wall — w beyond the blob along
-  // the bulb→blob ray — as a sharp-edged disc: the defocus circle
-  // a·|1 − w/v| or the bulb's image BULB_R·w/u, whichever is larger. Its
-  // brightness is that intercepted power spread over the disc, relative to
-  // the plain bulb light there. Only blobs in the back half (z < 0) throw
-  // light onto the wall behind. Returns spots in sim coordinates.
-  computeSpots(sim, maxSpots) {
-    const D = this.WALL_DIST, cx = SIM_W * 0.5;
-    const Sy = SIM_H * 0.965, BULB_R = 25;
-    const NREL = 1.43 / 1.34;
-    const V0 = sim.mass / sim.restDensity;
-    const gid0 = sim.nFixed > 0 ? sim.groupId[0] : -1;
-    const out = [];
-    for (let g = 1; g < sim.MAX_BLOBS; g++) {
-      const N = sim.cmn[g];
-      if (N < 3 || g === gid0 || g === sim._poolBlobId) continue;
-      const zN = sim.blobZ[g] - 0.5;
-      if (zN >= -0.02) continue;
-      const Rloc = bottleHalfFrac(Math.min(0.95, Math.max(0.05, sim.cmy[g] / SIM_H))) * SIM_W;
-      const z = -zN * 2 * 0.8 * Rloc;                  // depth behind the mid-plane
-      const bx = sim.cmx[g] - cx, by = sim.cmy[g] - Sy;
-      const u = Math.sqrt(bx * bx + by * by + z * z);   // bulb → blob
-      const k = D / z;                                   // ray parameter to the wall
-      const wx = cx + bx * k, wy = Sy + by * k;
-      if (wy < -80 || wy > SIM_H + 80 || wx < -VIEW_M - 80 || wx > SIM_W + VIEW_M + 80) continue;
-      const w = u * (k - 1);                             // blob → wall
-      const a = Math.sqrt(N * V0 / Math.PI);
-      const f = NREL * a / (2 * (NREL - 1));
-      let rDef;
-      if (u > f) { const v = 1 / (1 / f - 1 / u); rDef = a * Math.abs(1 - w / v); }
-      else { const vv = 1 / (1 / u - 1 / f); rDef = a * (1 + w / vv); }   // diverging
-      const r = Math.max(rDef, BULB_R * w / u, 4);
-      // intercepted power over the disc, relative to plain bulb light there
-      const gain = Math.min(12, (a * (u + w) / (u * r)) ** 2);
-      out.push({ x: wx, y: wy, r, gain, g });
+    // ---- sources on the pool surface; per source, rays over the upward
+    // cone (equal solid angle), toward the back ----
+    const ySrc = 0.875 * SIM_H, rSrc = 0.55 * Rof(ySrc);
+    const SRC = [[0, 0]];
+    for (let k = 0; k < 4; k++) SRC.push([rSrc * Math.cos(k * Math.PI / 2 + 0.4), rSrc * Math.sin(k * Math.PI / 2 + 0.4)]);
+    const NPH = 14, NAZ = 24, PHMAX = 1.35;
+    const cMin = Math.cos(PHMAX);
+    const RX = this._wrX || (this._wrX = new Float32Array(NPH * NAZ));
+    const RY = this._wrY || (this._wrY = new Float32Array(NPH * NAZ));
+    const RP = this._wrP || (this._wrP = new Float32Array(NPH * NAZ));
+    const RW = this._wrW || (this._wrW = new Float32Array(NPH * NAZ));
+    for (const [sx0, sz0] of SRC) {
+    for (let ip = 0; ip < NPH; ip++) {
+      const c = 1 - (1 - cMin) * (ip + 0.5) / NPH, sph = Math.sqrt(1 - c * c);
+      for (let ia = 0; ia < NAZ; ia++) {
+        const idx = ip * NAZ + ia;
+        RP[idx] = 0;
+        const al = Math.PI + Math.PI * (ia + 0.5) / NAZ;      // dz < 0: toward the wall
+        let dx = sph * Math.cos(al), dy = -c, dz = sph * Math.sin(al);
+        let X = sx0, Y = ySrc, Z = sz0;
+        let P = c * glow / SRC.length;                        // Lambertian, upward
+        let waxLen = 0, liqLen = 0, inB = -1, refl = 0, exited = false;
+        for (let ev = 0; ev < 10 && P > 1e-4; ev++) {
+          if (inB < 0) {
+            // is the start point inside a blob?
+            if (ev === 0) {
+              for (let b = 0; b < nb; b++) {
+                if (hitE(b, X, Y, Z, dx, dy, dz) && h0 < 0 && h1 > 0) { inB = b; break; }
+              }
+              if (inB >= 0) continue;
+            }
+            // nearest blob entry ahead
+            let tB = 1e9, bB = -1;
+            for (let b = 0; b < nb; b++) {
+              if (hitE(b, X, Y, Z, dx, dy, dz) && h0 > 1e-3 && h0 < tB) { tB = h0; bB = b; }
+            }
+            // march to the glass (or the blob, whichever first)
+            let t = 0, tExit = -1;
+            const STEP = 8;
+            while (t < tB) {
+              const tn = Math.min(t + STEP, tB);
+              const Yn = Y + dy * tn;
+              if (Yn < 0.05 * SIM_H || Yn > 0.995 * SIM_H) { P = 0; break; }
+              const Xn = X + dx * tn, Zn = Z + dz * tn;
+              if (Xn * Xn + Zn * Zn > Rof(Yn) ** 2) {
+                let lo = t, hi = tn;
+                for (let k = 0; k < 10; k++) {
+                  const m = 0.5 * (lo + hi), Ym = Y + dy * m, Xm = X + dx * m, Zm = Z + dz * m;
+                  if (Xm * Xm + Zm * Zm > Rof(Ym) ** 2) hi = m; else lo = m;
+                }
+                tExit = lo; break;
+              }
+              t = tn;
+            }
+            if (P === 0) break;
+            if (tExit >= 0) {
+              X += dx * tExit; Y += dy * tExit; Z += dz * tExit; liqLen += tExit;
+              const rho = Math.sqrt(X * X + Z * Z) || 1e-6;
+              let nx = X / rho, ny = -Rsl(Y), nz = Z / rho;
+              const nl = Math.sqrt(nx * nx + ny * ny + nz * nz); nx /= nl; ny /= nl; nz /= nl;
+              const ci = dx * nx + dy * ny + dz * nz;
+              if (ci > 0 && refract(dx, dy, dz, -nx, -ny, -nz, ETA_G)) {
+                P *= 1 - fresnelR(ci, ETA_G, 1.0);
+                dx = out3[0]; dy = out3[1]; dz = out3[2];
+                exited = true; break;
+              }
+              // total internal reflection: back inside
+              if (++refl > 2) { P = 0; break; }
+              dx -= 2 * ci * nx; dy -= 2 * ci * ny; dz -= 2 * ci * nz;
+              X -= nx * 0.5; Y -= ny * 0.5; Z -= nz * 0.5;
+              P *= 0.96;
+              continue;
+            }
+            // enter blob bB
+            X += dx * tB; Y += dy * tB; Z += dz * tB; liqLen += tB;
+            const q = bB * 6;
+            let nx = (X - B[q]) / (B[q + 3] * B[q + 3]), ny = (Y - B[q + 1]) / (B[q + 4] * B[q + 4]), nz = (Z - B[q + 2]) / (B[q + 5] * B[q + 5]);
+            const nl = Math.sqrt(nx * nx + ny * ny + nz * nz); nx /= nl; ny /= nl; nz /= nl;
+            if (refract(dx, dy, dz, nx, ny, nz, 1 / NW_)) { dx = out3[0]; dy = out3[1]; dz = out3[2]; }
+            inB = bB;
+          } else {
+            // inside blob inB: go to its far side
+            const t1 = hitE(inB, X, Y, Z, dx, dy, dz) ? Math.max(h1, 0) : 0;
+            X += dx * t1; Y += dy * t1; Z += dz * t1;
+            waxLen += t1;
+            P *= Math.exp(-MU_WAX * t1);
+            const q = inB * 6;
+            let nx = (X - B[q]) / (B[q + 3] * B[q + 3]), ny = (Y - B[q + 1]) / (B[q + 4] * B[q + 4]), nz = (Z - B[q + 2]) / (B[q + 5] * B[q + 5]);
+            const nl = Math.sqrt(nx * nx + ny * ny + nz * nz); nx /= nl; ny /= nl; nz /= nl;
+            // outward normal faces along d here → use −n for the formula
+            if (refract(dx, dy, dz, -nx, -ny, -nz, NW_)) { dx = out3[0]; dy = out3[1]; dz = out3[2]; }
+            else { const ci = dx * nx + dy * ny + dz * nz; dx -= 2 * ci * nx; dy -= 2 * ci * ny; dz -= 2 * ci * nz; }
+            X += dx * 1e-2; Y += dy * 1e-2; Z += dz * 1e-2;
+            inB = -1;
+          }
+        }
+        if (!exited || P <= 1e-5 || dz > -1e-4) continue;
+        P *= Math.exp(-MU_LIQ * liqLen);
+        const sW = (-D - Z) / dz;
+        RX[idx] = X + dx * sW + cx + VIEW_M;              // view coords
+        RY[idx] = Y + dy * sW;
+        RP[idx] = P;
+        RW[idx] = waxLen > 0 ? 1 : 0;
+      }
     }
-    out.sort((p, q) => q.gain - p.gain);
-    return out.slice(0, maxSpots);
+
+    // ---- ray-tube (quad) deposition ----
+    // Each quad of neighbouring rays is a tube of light. Its power is
+    // spread over the quad's actual footprint by tessellating it (m × m
+    // pieces, m ∝ its size on the wall) and splatting each piece's share
+    // bilinearly — smooth and energy-conserving, with no bounding-box
+    // overlap (which left ripples along each ring of rays). Converging
+    // tubes (small footprint) come out bright: caustics.
+    const MAXSPAN = 70 * cellW;       // wider = genuinely torn (e.g. across a TIR fold)
+    const splat = (x, y, e, wf) => {
+      const gx = x / cellW - 0.5, gy = y / cellH - 0.5;
+      const c0 = Math.floor(gx), r0 = Math.floor(gy), fx = gx - c0, fy = gy - r0;
+      for (let j = 0; j < 2; j++) {
+        const r = r0 + j; if (r < 0 || r >= GHc) continue;
+        const wy = j ? fy : 1 - fy;
+        for (let i = 0; i < 2; i++) {
+          const c = c0 + i; if (c < 0 || c >= GWc) continue;
+          const w = wy * (i ? fx : 1 - fx) * e, k = r * GWc + c;
+          L[k] += w * (1 - wf); Wx[k] += w * wf;
+        }
+      }
+    };
+    for (let ip = 0; ip < NPH - 1; ip++) {
+      for (let ia = 0; ia < NAZ - 1; ia++) {
+        const i00 = ip * NAZ + ia, i01 = i00 + 1, i10 = i00 + NAZ, i11 = i10 + 1;
+        const P0 = RP[i00], P1 = RP[i01], P2 = RP[i10], P3 = RP[i11];
+        if (P0 <= 0 || P1 <= 0 || P2 <= 0 || P3 <= 0) continue;
+        const ax0 = RX[i00], ay0 = RY[i00], ax1 = RX[i01], ay1 = RY[i01];
+        const bx0 = RX[i10], by0 = RY[i10], bx1 = RX[i11], by1 = RY[i11];
+        const span = Math.max(Math.hypot(ax0 - bx1, ay0 - by1), Math.hypot(ax1 - bx0, ay1 - by0));
+        if (span > MAXSPAN) continue;                          // torn tube
+        const xmin = Math.min(ax0, ax1, bx0, bx1), xmax = Math.max(ax0, ax1, bx0, bx1);
+        const ymin = Math.min(ay0, ay1, by0, by1), ymax = Math.max(ay0, ay1, by0, by1);
+        if (xmax < 0 || xmin > VIEW_W || ymax < 0 || ymin > SIM_H) continue;
+        const E = 0.25 * (P0 + P1 + P2 + P3);
+        const wf = 0.25 * (RW[i00] + RW[i01] + RW[i10] + RW[i11]);
+        const m = Math.max(1, Math.min(12, Math.ceil(span / (1.2 * cellW))));
+        const e = E / (m * m);
+        for (let a = 0; a < m; a++) {
+          const u = (a + 0.5) / m;
+          const lx0 = ax0 + (bx0 - ax0) * u, ly0 = ay0 + (by0 - ay0) * u;   // edge ip→ip+1 at ia
+          const lx1 = ax1 + (bx1 - ax1) * u, ly1 = ay1 + (by1 - ay1) * u;   // … at ia+1
+          for (let b = 0; b < m; b++) {
+            const v = (b + 0.5) / m;
+            splat(lx0 + (lx1 - lx0) * v, ly0 + (ly1 - ly0) * v, e, wf);
+          }
+        }
+      }
+    }
+    }   // sources
+    // Light 2-D smoothing (≈2 cells) against residual sampling noise.
+    const T = this.wgTmp;
+    for (const G of [L, Wx]) {
+      for (let r = 0; r < GHc; r++) this.wgRowBlur(G, r * GWc, 1, 2, T);
+      for (let c = 0; c < GWc; c++) this.wgColBlur(T, c, GWc, 2, G);
+    }
   }
 
   // Half-float scene target plus a bloom pyramid (½, ¼, … of the canvas).
@@ -1541,29 +1536,26 @@ class MetaballRenderer {
         this.capPrev.set(this.capCur); this.capCur.set(cr);
         this.wallPrev.set(this.wallCur);
         for (let k = 0; k < this.wallCur.length; k++) this.wallCur[k] = this.wallE[k] / ref.e;
-        if (params.wall !== false) {
+        // The wall trace is the heaviest part: run it every other caustic
+        // trace (the interpolation + filter below keeps it smooth).
+        this._wallTick = (this._wallTick || 0) + 1;
+        if (params.wall !== false && (this._wallTick & 1) === 0) {
+          this.traceWall3D(sim, sx, sy, glowN);
+          const GWn = this.bdCurL.length;
           if (!this.bdRef) {
-            // Normalisation: wall light of the lamp with only the lit pool,
-            // glow 1 (pool brightness profile carried straight up).
-            const baseLight = new Float32Array(gridSize);
-            const poolHalf = bottleHalfFrac(0.85) * SIM_W;
-            for (let c = 0; c < NC; c++) {
-              const e = Math.min(Math.abs((c + 0.5) * colW - SIM_W * 0.5) / poolHalf, 1);
-              const v = Math.max(0, 1 - e * e * e);
-              for (let r = 0; r < NR; r++) baseLight[r * NC + c] = v;
-            }
-            this.traceBackdrop(baseLight, this.waxFrac, 1.0, true, 1);
+            // normalise by the mean wall light beside the lamp at first trace
             let sum = 0, cnt = 0;
-            const NW = this.WCOLS, wColW = VIEW_W / NW;
-            for (let r = Math.floor(0.1 * NR); r < Math.floor(0.6 * NR); r++) {
-              const hwc = bottleHalfFrac((r + 0.5) / NR) * SIM_W;
-              for (let c = 0; c < NW; c++) {
-                if (Math.abs((c + 0.5) * wColW - VIEW_M - SIM_W / 2) > hwc) { sum += this.bdRawL[r * NW + c]; cnt++; }
+            const cw = VIEW_W / this.WG_W, ch = SIM_H / this.WG_H;
+            for (let r = Math.floor(0.1 * this.WG_H); r < Math.floor(0.9 * this.WG_H); r++) {
+              const hwc = bottleHalfFrac((r + 0.5) / this.WG_H) * SIM_W;
+              for (let c = 0; c < this.WG_W; c++) {
+                if (Math.abs((c + 0.5) * cw - VIEW_M - SIM_W / 2) > hwc) {
+                  const k = r * this.WG_W + c; sum += this.wlL[k] + this.wlW[k]; cnt++;
+                }
               }
             }
             this.bdRef = cnt && sum > 0 ? sum / cnt : 1;
           }
-          this.traceBackdrop(colSmooth, this.waxFrac, glowN, false, 1 / Math.max(glowN, 1e-3));
           this.bdPrevL.set(this.bdCurL); this.bdPrevW.set(this.bdCurW);
           // Only light above the lamp's running-average (default) wall light
           // is drawn; negative where wax takes light away (the shader clamps
@@ -1573,12 +1565,11 @@ class MetaballRenderer {
           // While the lamp settles (first ~20 s after start/reset) the
           // average follows quickly, so the wall starts dark.
           if (!this.bdAvgInit) this._bdAge = 0;
-          this._bdAge += every / 60;
+          this._bdAge += 2 * every / 60;
           const tau = this._bdAge < 20 ? 2 : this.WALL_AVG_TAU;
-          const alpha = Math.min(1, every / 60 / tau);
-          for (let k = 0; k < this.bdCurL.length; k++) {
-            const vL = this.bdRawL[k] / this.bdRef;
-            const vW = this.bdRawW[k] / this.bdRef;
+          const alpha = Math.min(1, 2 * every / 60 / tau);
+          for (let k = 0; k < GWn; k++) {
+            const vL = this.wlL[k] / this.bdRef, vW = this.wlW[k] / this.bdRef;
             if (!this.bdAvgInit) { aL[k] = vL; aW[k] = vW; }
             else { aL[k] += (vL - aL[k]) * alpha; aW[k] += (vW - aW[k]) * alpha; }
             this.bdCurL[k] = vL - aL[k];
@@ -1606,11 +1597,13 @@ class MetaballRenderer {
         ws[k] += (g1[k] - ws[k]) * A;
       }
       if (params.wall !== false) {
+        // wall traces come every 2·every frames
+        const uw = (((this._wallTick & 1) * every) + phase + 1) / (2 * every);
         const pairs = [[this.bdPrevL, this.bdCurL, this.bdF1L, this.bdL],
                        [this.bdPrevW, this.bdCurW, this.bdF1W, this.bdW]];
         for (const [pv, cv, f1b, out] of pairs) {
           for (let k = 0; k < out.length; k++) {
-            const v = pv[k] + (cv[k] - pv[k]) * u;
+            const v = pv[k] + (cv[k] - pv[k]) * uw;
             f1b[k] += (v - f1b[k]) * A;
             out[k] += (f1b[k] - out[k]) * A;
           }
@@ -1696,9 +1689,9 @@ class MetaballRenderer {
     }
     // wall grid (view width), flipped the same way
     {
-      const NW = this.WCOLS;
-      for (let r = 0; r < NR; r++) {
-        const src = r * NW, dst = (NR - 1 - r) * NW;
+      const NW = this.WG_W, NH = this.WG_H;
+      for (let r = 0; r < NH; r++) {
+        const src = r * NW, dst = (NH - 1 - r) * NW;
         for (let c = 0; c < NW; c++) {
           const o = (dst + c) << 2;
           this.bdData[o]     = this.bdL[src + c];
@@ -1725,7 +1718,7 @@ class MetaballRenderer {
     // light on the wall behind the lamp, unit 3
     gl.activeTexture(gl.TEXTURE3);
     gl.bindTexture(gl.TEXTURE_2D, this.backdropTex);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.WCOLS, NR, gl.RGBA, gl.FLOAT, this.bdData, 0);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.WG_W, this.WG_H, gl.RGBA, gl.FLOAT, this.bdData, 0);
 
     // -------- 3. Draw --------
     const useHdr = this.hdr && params.hdr !== false;
@@ -1764,28 +1757,6 @@ class MetaballRenderer {
     }
     if (this.u.colMass) { gl.uniform1i(this.u.colMass, 2); }
     if (this.u.backdrop) gl.uniform1i(this.u.backdrop, 3);
-    if (this.u.spots) {
-      // Spots follow their blobs every frame; each fades in/out over ~0.3 s
-      // so blobs appearing, merging or crossing the mid-plane don't pop.
-      const spots = params.wall !== false ? this.computeSpots(sim, this.MAX_SPOTS) : [];
-      const seen = new Set();
-      for (const sp of spots) seen.add(sp.g);
-      for (const [g, a] of this.spotFade) if (!seen.has(g)) {
-        const na = a - dt / 0.3; if (na <= 0) this.spotFade.delete(g); else this.spotFade.set(g, na);
-      }
-      let n = 0;
-      const glowN = params.glow / 0.38;
-      for (const sp of spots) {
-        const a = Math.min(1, (this.spotFade.get(sp.g) || 0) + dt / 0.3);
-        this.spotFade.set(sp.g, a);
-        const o = n * 4;
-        this.spotData[o] = sp.x; this.spotData[o + 1] = sp.y;
-        this.spotData[o + 2] = sp.r; this.spotData[o + 3] = sp.gain * a * glowN;
-        n++;
-      }
-      gl.uniform4fv(this.u.spots, this.spotData);
-      gl.uniform1i(this.u.spotCount, n);
-    }
     if (this.u.wallOn) gl.uniform1f(this.u.wallOn,
       params.wall !== false && params.caustics !== false && params.volAbsorb !== false ? 1 : 0);
     if (this.u.poolId) gl.uniform1f(this.u.poolId, poolGid);
