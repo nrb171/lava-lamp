@@ -22,8 +22,14 @@ uniform vec3  uCold;
 uniform vec3  uHot;
 uniform float uGlow;
 uniform float uTime;
-uniform float uBlobZ[32];
-uniform float uBlobSize[32];
+uniform float uBlobZ[36];     // 0-31: sim blobs, 32-35: merge ghosts
+uniform float uBlobSize[36];
+// Pool-merge fusion. A blob that just joined the pool keeps rendering as a
+// "ghost" group (id 32+k) whose fusion with the pool, uGhostMix[k], eases
+// 0 → 1. At 0 the pair renders as two touching blobs; at 1 exactly as one
+// body (the summed field), so the ghost can then be dropped invisibly.
+uniform float uPoolId;        // pool's group id, or -1
+uniform vec4  uGhostMix;
 uniform sampler2D uColMass;   // 2D mass grid (NUM_COLS × NUM_ROWS), normalized 0-1
 uniform int   uNumCols;       // grid columns (50)
 uniform int   uNumRows;       // grid rows (30)
@@ -159,6 +165,64 @@ void main() {
     }
   }
 
+  // -------- Pool-merge fusion ---------
+  // Where a ghost and the pool overlap, fold them into the pool slot with
+  // a smooth union  F = (Fp^p + Fg^p)^(1/p),  p easing 8 → 1: p = 8 is
+  // ~max(Fp, Fg) (two blobs, dark seam where they touch), p = 1 is the sum
+  // (one body, neck filled in). Temperature, compression and size blend
+  // with the same weights rather than being picked by depth, so no hard
+  // occlusion edge sweeps through the blob while it fuses. At L = 0 the
+  // result reproduces the depth-ordered look of two separate blobs (front
+  // one wins wherever it is visible), which then fades into the union over
+  // the first third of the ramp — so the first merged frame matches the
+  // last unmerged one.
+  float sizeOverride = -1.0;
+  // Back layer of the depth-ordered look (the rear body seen through the
+  // translucent front one), faded out with the same weight.
+  float fuseBackF = 0.0, fuseBackT = 0.18, fuseBackW = 0.0;
+  int poolSlot = -1;
+  for (int s = 0; s < 4; s++) if (uPoolId >= 0.0 && ids[s] == uPoolId) poolSlot = s;
+  if (poolSlot >= 0) {
+    float poolSize = uBlobSize[int(uPoolId)];
+    float sizeAcc = poolSize;
+    for (int s = 0; s < 4; s++) {
+      if (ids[s] >= 32.0) {
+        int k = int(ids[s]) - 32;
+        float L = uGhostMix[k];
+        float Fp = F[poolSlot], Fg = F[s];
+        float p = mix(8.0, 1.0, L);
+        // normalise before pow to keep the numbers small
+        float m = max(max(Fp, Fg), 1e-6);
+        float a = pow(Fp / m, p), b = pow(Fg / m, p);
+        float Fu = m * pow(a + b, 1.0 / p);
+        float wpU = a / max(a + b, 1e-6);
+        float tp = Fp > 1e-6 ? WT[poolSlot] / Fp : 0.0, tg = Fg > 1e-6 ? WT[s] / Fg : 0.0;
+        float cp = Fp > 1e-6 ? WC[poolSlot] / Fp : 0.0, cg = Fg > 1e-6 ? WC[s] / Fg : 0.0;
+        // depth-ordered (pre-merge) equivalent
+        bool poolFront = uBlobZ[int(uPoolId)] >= uBlobZ[int(ids[s])];
+        float Ffront = poolFront ? Fp : Fg;
+        bool frontVis = Ffront > 0.55;                    // SHOW_THRESH
+        float Focc = frontVis ? Ffront : max(Fp, Fg);
+        float wpOcc = frontVis ? (poolFront ? 1.0 : 0.0) : (Fp >= Fg ? 1.0 : 0.0);
+        float kU = smoothstep(0.0, 0.35, L);
+        float Fback = poolFront ? Fg : Fp;
+        if (frontVis && Fback > 0.55 && 1.0 - kU > fuseBackW) {
+          fuseBackF = Fback;
+          fuseBackT = poolFront ? tg : tp;
+          fuseBackW = 1.0 - kU;
+        }
+        Fu = mix(Focc, Fu, kU);
+        float wp = mix(wpOcc, wpU, kU), wg = 1.0 - wp;
+        F[poolSlot]  = Fu;
+        WT[poolSlot] = Fu * (wp * tp + wg * tg);
+        WC[poolSlot] = Fu * (wp * cp + wg * cg);
+        sizeAcc = wp * sizeAcc + wg * uBlobSize[int(ids[s])];
+        ids[s] = -1.0; F[s] = 0.0; WT[s] = 0.0; WC[s] = 0.0;
+      }
+    }
+    sizeOverride = sizeAcc;
+  }
+
   // Pick the dominant blob at this pixel (largest field) ...
   const float SHOW_THRESH = 0.55;
   int dom = -1;
@@ -254,6 +318,7 @@ void main() {
 
   // -------- Physically-based spherical refractivity ---------
   float blobSz = clamp(uBlobSize[domGid], 0.0, 1.0);
+  if (dom == poolSlot && sizeOverride >= 0.0) blobSz = clamp(sizeOverride, 0.0, 1.0);
 
   float threshold = 0.55;
   float alpha = smoothstep(threshold - 0.18, threshold + 0.04, field);
@@ -304,6 +369,12 @@ void main() {
   vec3 inner = mix(waxColor, waxColor * 1.25 + uHot * 0.18 * tempN, coreAlpha);
 
   // Overlap layering: front blob over back blob
+  if (fuseBackW > 0.0) {
+    float bT = clamp((fuseBackT - 0.18) / 0.85, 0.0, 1.0);
+    vec3 bWax = mix(uCold, uHot, smoothstep(0.0, 1.0, bT)) * lightFromBelow;
+    float bA = smoothstep(threshold - 0.18, threshold + 0.04, fuseBackF) * 0.90;
+    fluidBg = mix(fluidBg, bWax, bA * fuseBackW);
+  }
   if (otherDom >= 0) {
     float otherFieldRaw = F[otherDom];
     float otherTemp = otherFieldRaw > 0.001 ? (WT[otherDom] / otherFieldRaw) : 0.18;

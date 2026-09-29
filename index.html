@@ -520,6 +520,31 @@ class MetaballRenderer {
     this.cellStart     = new Int32Array(gridCells);
     this.cellTmpOffset = new Int32Array(gridCells);
     this.particleCell  = new Int32Array(maxParticles);
+
+    // -------- Pool-merge ghosts --------
+    // When a blob joins the pool, the sim regroups its particles instantly;
+    // rendering that directly makes the neck, rim and shading pop in one
+    // frame. Instead its particles keep rendering as ghost group 32+k whose
+    // fusion with the pool (uGhostMix) eases 0 → 1 over mergeFadeSec, while
+    // its depth and size uniforms slide to the pool's. See the shader.
+    this.MAX_GHOSTS = 4;
+    this.mergeFadeSec = 1.0;
+    this.MIN_GHOST_PARTICLES = 3;
+    this.ghosts = Array.from({ length: this.MAX_GHOSTS },
+                             () => ({ active: false, m: 0, z0: 0, size0: 0, members: 0 }));
+    this.ghostOf  = new Int8Array(maxParticles).fill(-1);
+    this.prevGid  = new Int32Array(maxParticles);
+    this.prevBlobZ    = new Float32Array(32);
+    this.prevBlobSize = new Float32Array(32);
+    this.prevPool = -1;
+    this.prevN = -1;
+    this.prevReset = -1;
+    this.lastTime = -1;
+    this.joinTally = new Int32Array(32);
+    this.joinGhost = new Int8Array(32);
+    this.blobZ36    = new Float32Array(36);
+    this.blobSize36 = new Float32Array(36);
+    this.ghostMix   = new Float32Array(4);
     // 4 floats per cell to match RGBA32F; only .r and .g are populated.
     this.cellRangeData = new Float32Array(gridCells * 4);
 
@@ -574,14 +599,94 @@ class MetaballRenderer {
       blobZ:       this.uloc("uBlobZ"),
       blobSize:    this.uloc("uBlobSize"),
       colMass:       this.uloc("uColMass"),
+      poolId:        this.uloc("uPoolId"),
+      ghostMix:      this.uloc("uGhostMix"),
       numCols:       this.uloc("uNumCols"),
       numRows:       this.uloc("uNumRows"),
     };
   }
 
+  // Track particles joining the pool and advance/release merge ghosts.
+  updateGhosts(sim, dt) {
+    const n = sim.n, nFixed = sim.nFixed, gid = sim.groupId;
+    const pool = nFixed > 0 ? gid[0] : -1;
+    const ghostOf = this.ghostOf, ghosts = this.ghosts;
+
+    // After a reset / particle-count change, indices and groups are new.
+    if (n !== this.prevN || sim.resetCount !== this.prevReset) {
+      ghostOf.fill(-1);
+      for (const g of ghosts) g.active = false;
+    } else {
+      for (const g of ghosts) if (g.active) g.m += dt / this.mergeFadeSec;
+      // Particles that leave the pool again are their own blob, not a ghost.
+      for (let i = nFixed; i < n; i++) {
+        if (ghostOf[i] >= 0 && gid[i] !== pool) ghostOf[i] = -1;
+      }
+      // New joiners, grouped by the blob they came from.
+      const tally = this.joinTally, map = this.joinGhost;
+      tally.fill(0); map.fill(-1);
+      const prevGid = this.prevGid, prevPool = this.prevPool;
+      for (let i = nFixed; i < n; i++) {
+        if (gid[i] === pool && prevGid[i] !== prevPool && ghostOf[i] < 0) tally[prevGid[i]]++;
+      }
+      for (let p = 0; p < 32; p++) {
+        if (tally[p] < this.MIN_GHOST_PARTICLES) continue;
+        const k = ghosts.findIndex(g => !g.active);
+        if (k < 0) break;                       // all slots busy: plain merge
+        const g = ghosts[k];
+        g.active = true; g.m = 0;
+        g.z0 = this.prevBlobZ[p]; g.size0 = this.prevBlobSize[p];
+        map[p] = k;
+      }
+      for (let i = nFixed; i < n; i++) {
+        if (gid[i] === pool && prevGid[i] !== prevPool && ghostOf[i] < 0) {
+          const k = map[prevGid[i]];
+          if (k >= 0) ghostOf[i] = k;
+        }
+      }
+      // Release finished or emptied ghosts.
+      for (const g of ghosts) g.members = 0;
+      for (let i = nFixed; i < n; i++) if (ghostOf[i] >= 0) ghosts[ghostOf[i]].members++;
+      for (let k = 0; k < ghosts.length; k++) {
+        const g = ghosts[k];
+        if (g.active && (g.m >= 1 || g.members === 0)) {
+          g.active = false;
+          for (let i = nFixed; i < n; i++) if (ghostOf[i] === k) ghostOf[i] = -1;
+        }
+      }
+    }
+
+    // Uniforms: sim blobs 0-31, ghosts 32-35 easing toward the pool's look.
+    this.blobZ36.set(sim.blobZ.subarray(0, 32));
+    this.blobSize36.set(sim.blobSizeSmooth.subarray(0, 32));
+    const poolZ = pool >= 0 ? sim.blobZ[pool] : 0.5;
+    const poolSize = pool >= 0 ? sim.blobSizeSmooth[pool] : 1;
+    for (let k = 0; k < 4; k++) {
+      const g = ghosts[k];
+      const m = g.active ? Math.min(1, g.m) : 1;
+      const e = m * m * (3 - 2 * m);                       // smoothstep ease
+      this.ghostMix[k] = e;
+      this.blobZ36[32 + k]    = g.z0 + (poolZ - g.z0) * e;
+      this.blobSize36[32 + k] = g.size0 + (poolSize - g.size0) * e;
+    }
+
+    this.prevGid.set(gid.subarray(0, n));
+    this.prevPool = pool;
+    this.prevN = n;
+    this.prevReset = sim.resetCount;
+    this.prevBlobZ.set(sim.blobZ.subarray(0, 32));
+    this.prevBlobSize.set(sim.blobSizeSmooth.subarray(0, 32));
+    return pool;
+  }
+
   render(sim, params) {
     const gl = this.gl;
     const n = sim.n;
+    const dt = this.lastTime < 0 ? 0
+      : Math.min(0.1, Math.max(0, params.time - this.lastTime)) * (sim.timeScale || 1);
+    this.lastTime = params.time;
+    const poolGid = this.updateGhosts(sim, dt);
+    const ghostOf = this.ghostOf;
 
     // -------- 1. Counting-sort particles into spatial grid cells --------
     // cellSize == kernel radius the shader uses (uH). With this choice,
@@ -603,7 +708,9 @@ class MetaballRenderer {
 
     // (a) Count particles per active cell + record cell index per particle
     for (let c = 0; c < numCells; c++) cellCount[c] = 0;
-    const sx = sim.x, sy = sim.y;
+    // Interpolated positions from the main loop when available (fixed
+    // physics step), else the sim's current positions.
+    const sx = params.px || sim.x, sy = params.py || sim.y;
     for (let i = 0; i < n; i++) {
       let cx = (sx[i] * invCell) | 0;
       let cy = (sy[i] * invCell) | 0;
@@ -632,7 +739,8 @@ class MetaballRenderer {
       data[dst + 1] = sy[i];
       data[dst + 2] = stemp[i];
       const cmp = scomp[i];
-      data[dst + 3] = sgroup[i] + (cmp < 3 ? cmp : 2.999) * 0.25;
+      const rg = ghostOf[i] >= 0 ? 32 + ghostOf[i] : sgroup[i];
+      data[dst + 3] = rg + (cmp < 3 ? cmp : 2.999) * 0.25;
       tmpOffset[c]++;
     }
     // (d) Build cellRange texture (RGBA32F: r=start, g=count, b/a unused)
@@ -824,13 +932,15 @@ class MetaballRenderer {
     gl.uniform1f(this.u.time, params.time);
     // Per-blob z values for the front/back picker and the overlap
     // highlight. Pass the whole array (size = MAX_G).
-    if (this.u.blobZ) gl.uniform1fv(this.u.blobZ, sim.blobZ);
+    if (this.u.blobZ) gl.uniform1fv(this.u.blobZ, this.blobZ36);
     // Per-blob smoothed visual size (normalized 0-1). Uses the
     // smoothed values so split-off blobs transition gradually.
     if (this.u.blobSize) {
-      gl.uniform1fv(this.u.blobSize, sim.blobSizeSmooth);
+      gl.uniform1fv(this.u.blobSize, this.blobSize36);
     }
     if (this.u.colMass) { gl.uniform1i(this.u.colMass, 2); }
+    if (this.u.poolId) gl.uniform1f(this.u.poolId, poolGid);
+    if (this.u.ghostMix) gl.uniform4fv(this.u.ghostMix, this.ghostMix);
     if (this.u.numCols) gl.uniform1i(this.u.numCols, params.volAbsorb !== false ? this.NUM_COLS : 0);
     if (this.u.numRows) gl.uniform1i(this.u.numRows, params.volAbsorb !== false ? this.NUM_ROWS : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
@@ -1256,6 +1366,50 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
+// ---- Fixed physics timestep ----
+// The sim always advances in identical frames of PHYS_DT (one regroup +
+// 5 substeps). Letting the step follow the display frame rate made the
+// fluid behave differently per device: at 30 fps a quarter of the wax
+// ended up in 80+ particle blobs, at 60 fps none. Rendering interpolates
+// positions between the last two physics frames, so motion stays smooth
+// at any frame rate or Speed setting.
+const PHYS_DT = 1 / 60;
+const SUBSTEPS = 5;
+const MAX_PHYS_FRAMES = 4;          // per render; beyond this we slow down
+let physAcc = 0;
+let interpX = null, interpY = null, prevX = null, prevY = null;
+let interpN = -1, interpReset = -1;
+function stepPhysics(rawDt) {
+  const n = sim.n;
+  if (!interpX || interpX.length < sim.cap) {
+    interpX = new Float32Array(sim.cap); interpY = new Float32Array(sim.cap);
+    prevX = new Float32Array(sim.cap);   prevY = new Float32Array(sim.cap);
+  }
+  if (n !== interpN || sim.resetCount !== interpReset) {
+    prevX.set(sim.x.subarray(0, n)); prevY.set(sim.y.subarray(0, n));
+    interpN = n; interpReset = sim.resetCount; physAcc = 0;
+  }
+  physAcc += Math.min(0.1, rawDt) * sim.timeScale;
+  let steps = 0;
+  while (physAcc >= PHYS_DT) {
+    if (steps === MAX_PHYS_FRAMES) { physAcc = 0; break; }
+    prevX.set(sim.x.subarray(0, n)); prevY.set(sim.y.subarray(0, n));
+    sim.stepFrame(PHYS_DT);
+    for (let i = 0; i < SUBSTEPS; i++) {
+      sim.step(PHYS_DT / SUBSTEPS);
+      sim.applyGrab(PHYS_DT / SUBSTEPS);
+    }
+    physAcc -= PHYS_DT;
+    steps++;
+  }
+  const a = physAcc / PHYS_DT;
+  for (let i = 0; i < n; i++) {
+    interpX[i] = prevX[i] + (sim.x[i] - prevX[i]) * a;
+    interpY[i] = prevY[i] + (sim.y[i] - prevY[i]) * a;
+  }
+  params.px = interpX; params.py = interpY;
+}
+
 function frame(now) {
   if (paused) { requestAnimationFrame(frame); return; }
   // Cap at ~60 fps: on 90/120 Hz screens rAF fires more often, which would
@@ -1266,16 +1420,7 @@ function frame(now) {
   const rawDt = (now - last) / 1000;
   adaptQuality(now - last);
   last = now;
-  // Clamp per-frame dt and split into substeps for SPH stability.
-  const dt = Math.min(0.033, rawDt) * sim.timeScale;
-  const substeps = 5;
-  const sub = dt / substeps;
-  // Per-frame work: groups, blob-z, centroids, noise (once, not per substep)
-  sim.stepFrame(dt);
-  for (let i = 0; i < substeps; i++) {
-    sim.step(sub);
-    sim.applyGrab(sub);
-  }
+  stepPhysics(rawDt);
 
   params.time = now / 1000;
   renderer.render(sim, params);

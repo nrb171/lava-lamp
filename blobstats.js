@@ -12,6 +12,9 @@
 //    aspect      — mean major/minor axis ratio of free blobs (1 = round)
 //    jiggle      — mean internal (non-rigid) speed² of free blobs
 //    aloft       — mean fraction of fluid particles in the upper 60%
+//    size        — mean particle count of free blobs (>= 5 particles)
+//    sizeP90     — 90th percentile free-blob size
+//    big         — mean # of free blobs with > 45 particles
 //    ms/frame    — sim cost per rendered frame
 //
 //  Usage: node blobstats.js [seconds=90] [seeds=3] [key=value ...]
@@ -44,6 +47,7 @@ function runOnce(seed, seconds, overrides) {
 
   let tears = 0, detaches = 0, fragSum = 0, aspSum = 0, aspN = 0;
   let jigSum = 0, jigN = 0, aloftSum = 0, samples = 0, simMs = 0;
+  const sizes = []; let bigSum = 0;
 
   for (let f = 0; f < frames; f++) {
     prev.set(sim.groupId);
@@ -105,6 +109,8 @@ function runOnce(seed, seconds, overrides) {
     for (let k = 1; k < K; k++) {
       if (k === pool || size[k] === 0) continue;
       if (size[k] <= 4) { fragSum++; continue; }
+      sizes.push(size[k]);
+      if (size[k] > 45) bigSum++;
       if (size[k] < 8) continue;
       const a = sxx[k] / size[k], b = syy[k] / size[k], c = sxy[k] / size[k];
       const tr = a + b, det = a * b - c * c;
@@ -122,6 +128,9 @@ function runOnce(seed, seconds, overrides) {
     aspect: aspN ? aspSum / aspN : NaN,
     jiggle: jigN ? jigSum / jigN : NaN,
     aloft: aloftSum / samples,
+    size: sizes.length ? sizes.reduce((a, b) => a + b, 0) / sizes.length : NaN,
+    sizeP90: sizes.length ? sizes.sort((a, b) => a - b)[Math.floor(sizes.length * 0.9)] : NaN,
+    big: bigSum / samples,
     ms: simMs / frames,
   };
 }

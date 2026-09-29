@@ -277,6 +277,7 @@ class SPH {
   }
 
   reset() {
+    this.resetCount = (this.resetCount || 0) + 1;   // lets the renderer drop stale per-particle state
     this.n = 0;
     // 1) Permanent pool: pinned wall particles
     const wallSpacingX = this.h * 0.55;
