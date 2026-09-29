@@ -682,6 +682,7 @@ class MetaballRenderer {
     this.bdAvgInit = false;
     this.WALL_AVG_TAU = 25;          // seconds
     this.bdData = new Float32Array(GW * 4);
+    this.wallRowBlur = makeTriBlur(this.WCOLS, 48);
     this.backdropTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.backdropTex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, colMassFilter);
@@ -1049,7 +1050,10 @@ class MetaballRenderer {
         }
       }
     }
-    // Vertical spread with an upward bias (light rising from the bulb).
+    // Out-of-plane spread: light leaves each slice at a range of angles,
+    // so its pattern spreads over the wall by ~0.38·D — vertically (with an
+    // upward bias, light rising from the bulb) and equally sideways, which
+    // keeps the patches round rather than tall streaks.
     const mu = -0.30 * D / rowH, sig = 0.38 * D / rowH;
     const K = Math.ceil(3 * sig), ker = new Float32Array(2 * K + 1);
     let ks = 0;
@@ -1067,6 +1071,11 @@ class MetaballRenderer {
         }
       }
       G.set(T);
+      // same spread sideways: triangle ∘ triangle ≈ Gaussian with σ = 0.38·D
+      // (a triangle of radius R has σ = R/√6, so two of R = σ·√3 each)
+      const Rh = Math.min(48, Math.round(0.38 * D / wColW * Math.sqrt(3)));
+      for (let r = 0; r < NR; r++) this.wallRowBlur(G, r * NW, 1, Rh, T);
+      for (let r = 0; r < NR; r++) this.wallRowBlur(T, r * NW, 1, Rh, G);
     }
   }
 
