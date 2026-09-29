@@ -592,8 +592,13 @@ void main() {
     vec3 lTint = uBg / max(max(uBg.r, uBg.g), max(uBg.b, 1e-4));
     vec3 waxL = mix(uCold, uHot, 0.6);
     const float WALL_ALBEDO = 0.6;           // matte, neutral
-    // kept very subtle: faint spill from the lamp, not a lit backdrop
-    frameOut = WALL_ALBEDO * 0.07 * (bd.r * lampL * lTint + bd.g * waxL) * (uGlow / 0.38);
+    // bd holds light beyond the lamp's default state (see traceBackdrop /
+    // projectBlobs), so the wall is dark except for moving shapes and bands.
+    // Clamp each light component before combining: extra liquid-filtered
+    // light shows purple, extra light through / from wax shows amber, and
+    // light taken away just leaves the wall dark (clamping the mixed colour
+    // per channel would leave odd hues, e.g. green from amber − purple).
+    frameOut = WALL_ALBEDO * 0.16 * (max(bd.r, 0.0) * lampL * lTint + max(bd.g, 0.0) * waxL);
   }
 
   vec3 col;

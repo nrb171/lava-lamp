@@ -675,6 +675,12 @@ class MetaballRenderer {
     this.bdF1L = new Float32Array(GW);   this.bdF1W = new Float32Array(GW);
     this.bdL = new Float32Array(GW);     this.bdW = new Float32Array(GW);
     this.bdRef = null;
+    // The lamp's default wall light: a slow running average (≈25 s). The
+    // wall shows only light above it — passing blob images and shifting
+    // bands — while anything steady (incl. resting wax) fades to black.
+    this.bdAvgL = new Float32Array(GW); this.bdAvgW = new Float32Array(GW);
+    this.bdAvgInit = false;
+    this.WALL_AVG_TAU = 25;          // seconds
     this.bdData = new Float32Array(GW * 4);
     this.backdropTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.backdropTex);
@@ -948,7 +954,8 @@ class MetaballRenderer {
   // neutral and only scatters that light, so all colour comes from the
   // lamp. Light also leaves at vertical angles — mostly upward, the way the
   // bulb light travels — so each row's pattern is spread up the wall.
-  traceBackdrop(light, phi, glow, noWax) {
+  // light × lightScale = volumetric light at glow 1 (so glow enters once)
+  traceBackdrop(light, phi, glow, noWax, lightScale) {
     const NC = this.NUM_COLS, NR = this.NUM_ROWS;
     const colW = SIM_W / NC, rowH = SIM_H / NR;
     const cx = SIM_W * 0.5, D = this.WALL_DIST;
@@ -997,7 +1004,7 @@ class MetaballRenderer {
         const xs = R * ((((is + 0.5) / NS) * 2) - 1);
         const zc = Math.sqrt(Math.max(R * R - xs * xs, 0));
         const X = cx + xs;
-        const lit = noWax ? 1 : lerpRow(light, base, X);
+        const lit = lerpRow(light, base, X) * lightScale;
         const wax = inPool ? 1 : (noWax ? 0 : lerpRow(phi, base, X));
         const cellA = (2 * R / NS) * (2 * zc / NZ);
         srcL[is] = lit * beer * (1 - wax) * cellA * glow;
@@ -1073,19 +1080,19 @@ class MetaballRenderer {
   // Wax is a weak converging lens (f ≈ 8 × blob radius, comparable to the
   // distance to the wall), so its image is brighter than the surrounding
   // liquid-filtered light and takes the wax's colour.
-  projectBlobs(sim, px, py, glow) {
+  projectBlobs(sim, px, py, glow, noBlobs) {
     const NR = this.NUM_ROWS, NW = this.WCOLS;
     const rowH = SIM_H / NR, wColW = VIEW_W / NW, cellA = wColW * rowH;
     const D = this.WALL_DIST, cx = SIM_W * 0.5;
     const Sx = cx, Sy = SIM_H * 0.965;                  // bulb
-    const BULB_R = 25, LENS_GAIN = 2.6, K_BULB = 0.45;  // bulb ≈ ⅛ of the globe radius
+    const BULB_R = 25, LENS_GAIN = 2.6, K_BULB = 0.9;   // bulb ≈ ⅛ of the globe radius
     const V0 = sim.mass / sim.restDensity;
     const pr0 = Math.sqrt(V0 / Math.PI);
     const phiW = this.projPhi, pL = this.projL, pW = this.projW;
     phiW.fill(0);
     const gid = sim.groupId, bz = sim.blobZ;
     const skipA = sim.nFixed > 0 ? gid[0] : -1, skipB = sim._poolBlobId;
-    for (let i = sim.nFixed; i < sim.n; i++) {
+    for (let i = noBlobs ? sim.n : sim.nFixed; i < sim.n; i++) {
       const g = gid[i];
       if (g === skipA || g === skipB) continue;
       const zN = bz[g] - 0.5;                            // < 0 : back half
@@ -1478,8 +1485,16 @@ class MetaballRenderer {
         for (let k = 0; k < this.wallCur.length; k++) this.wallCur[k] = this.wallE[k] / ref.e;
         if (params.wall !== false) {
           if (!this.bdRef) {
-            // normalise: mean wall light beside an empty lamp, glow 1
-            this.traceBackdrop(colSmooth, this.waxFrac, 1.0, true);
+            // Normalisation: wall light of the lamp with only the lit pool,
+            // glow 1 (pool brightness profile carried straight up).
+            const baseLight = new Float32Array(gridSize);
+            const poolHalf = bottleHalfFrac(0.85) * SIM_W;
+            for (let c = 0; c < NC; c++) {
+              const e = Math.min(Math.abs((c + 0.5) * colW - SIM_W * 0.5) / poolHalf, 1);
+              const v = Math.max(0, 1 - e * e * e);
+              for (let r = 0; r < NR; r++) baseLight[r * NC + c] = v;
+            }
+            this.traceBackdrop(baseLight, this.waxFrac, 1.0, true, 1);
             let sum = 0, cnt = 0;
             const NW = this.WCOLS, wColW = VIEW_W / NW;
             for (let r = Math.floor(0.1 * NR); r < Math.floor(0.6 * NR); r++) {
@@ -1490,15 +1505,29 @@ class MetaballRenderer {
             }
             this.bdRef = cnt && sum > 0 ? sum / cnt : 1;
           }
-          this.traceBackdrop(colSmooth, this.waxFrac, glowN, false);
+          this.traceBackdrop(colSmooth, this.waxFrac, glowN, false, 1 / Math.max(glowN, 1e-3));
           this.projectBlobs(sim, sx, sy, glowN);
           this.bdPrevL.set(this.bdCurL); this.bdPrevW.set(this.bdCurW);
+          // Only light above the lamp's running-average (default) wall light
+          // is drawn; negative where wax takes light away (the shader clamps
+          // each component at zero).
+          if (sim.resetCount !== this._bdResetSeen) { this.bdAvgInit = false; this._bdResetSeen = sim.resetCount; }
+          const aL = this.bdAvgL, aW = this.bdAvgW;
+          // While the lamp settles (first ~20 s after start/reset) the
+          // average follows quickly, so the wall starts dark.
+          if (!this.bdAvgInit) this._bdAge = 0;
+          this._bdAge += every / 60;
+          const tau = this._bdAge < 20 ? 2 : this.WALL_AVG_TAU;
+          const alpha = Math.min(1, every / 60 / tau);
           for (let k = 0; k < this.bdCurL.length; k++) {
-            // diffuse glow of the globe at half weight so the bulb's blob
-            // images read as distinct shapes when they land beside the lamp
-            this.bdCurL[k] = 0.5 * this.bdRawL[k] / this.bdRef + this.projL[k];
-            this.bdCurW[k] = 0.5 * this.bdRawW[k] / this.bdRef + this.projW[k];
+            const vL = this.bdRawL[k] / this.bdRef + this.projL[k];
+            const vW = this.bdRawW[k] / this.bdRef + this.projW[k];
+            if (!this.bdAvgInit) { aL[k] = vL; aW[k] = vW; }
+            else { aL[k] += (vL - aL[k]) * alpha; aW[k] += (vW - aW[k]) * alpha; }
+            this.bdCurL[k] = vL - aL[k];
+            this.bdCurW[k] = vW - aW[k];
           }
+          this.bdAvgInit = true;
         }
       }
       // Linear interpolation between traces, then a critically damped
