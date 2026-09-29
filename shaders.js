@@ -11,11 +11,12 @@ function fragmentShaderSource() {
   return `#version 300 es
 precision highp float;
 
-uniform sampler2D uParticles;
-uniform int   uCount;
+uniform sampler2D uParticles;   // cell-sorted: (x, y, temp, groupId + compression/4)
+uniform sampler2D uCellRange;   // RGBA32F: r=start, g=count per grid cell
 uniform vec2  uSim;     // simulation domain (px)
 uniform vec2  uRes;     // canvas size (px)
-uniform float uH;       // smoothing radius (sim px)
+uniform float uH;       // smoothing radius (sim px) — also = cellSize
+uniform ivec2 uGridDim; // active grid (cells wide, cells tall)
 uniform vec3  uBg;
 uniform vec3  uCold;
 uniform vec3  uHot;
@@ -23,8 +24,6 @@ uniform float uGlow;
 uniform float uTime;
 uniform float uBlobZ[32];
 uniform float uBlobSize[32];
-uniform int   uPoolGroupId;
-uniform vec3  uCompressColor;  // accent color for high-compression zones
 uniform sampler2D uColMass;   // 2D mass grid (NUM_COLS × NUM_ROWS), normalized 0-1
 uniform int   uNumCols;       // grid columns (50)
 uniform int   uNumRows;       // grid rows (30)
@@ -104,59 +103,93 @@ void main() {
   float distFromCenter = abs(simPos.x - cx);
 
   // -------- Per-blob metaball field, temperature & compression ---------
-  const int MAX_G = 32;
-  float fields[MAX_G];
-  float wtemps[MAX_G];
-  float wcomps[MAX_G];  // weighted compression per group
-  for (int g = 0; g < MAX_G; g++) { fields[g] = 0.0; wtemps[g] = 0.0; wcomps[g] = 0.0; }
-  float h2 = uH * uH;
+  // A pixel only ever overlaps a handful of blobs, so instead of 32-entry
+  // per-group arrays (which mobile GPUs spill to slow memory because they
+  // are indexed by texture data) we keep 4 register slots:
+  //   ids = group id per slot (-1 = empty), F = Σk, WT = Σk·temp, WC = Σk·comp
+  vec4 ids = vec4(-1.0);
+  vec4 F = vec4(0.0), WT = vec4(0.0), WC = vec4(0.0);
 
-  for (int i = 0; i < 700; i++) {
-    if (i >= uCount) break;
-    vec4 part = texelFetch(uParticles, ivec2(i, 0), 0);
-    float comp = texelFetch(uParticles, ivec2(i, 1), 0).r;  // compression from row 1
-    vec2 d = simPos - part.xy;
-    float r2 = dot(d, d);
-    if (r2 < h2) {
-      float w = 1.0 - r2 / h2;
-      float k = w * w * w;
-      int g = int(part.w + 0.5);
-      g = clamp(g, 0, MAX_G - 1);
-      fields[g] += k;
-      wtemps[g] += k * part.z;
-      wcomps[g] += k * comp;
+  float insideRaw = distFromCenter - (halfW + 1.5);
+  // Caps and everything outside the glass never show wax, so skip the
+  // particle gather there (roughly a third of the canvas).
+  bool needField = t >= 0.05 && t <= 0.95 && halfFrac > 0.001 && insideRaw < 0.0;
+  if (needField) {
+    float h2 = uH * uH;
+    float invH2 = 1.0 / h2;
+    // Spatial-grid lookup: only visit particles in the 3x3 cell neighborhood
+    // around this pixel. cellSize == uH, so any particle within the kernel
+    // radius is guaranteed to live in one of these 9 cells.
+    ivec2 cellHere = ivec2(floor(simPos / uH));
+    for (int dy = -1; dy <= 1; dy++) {
+      for (int dx = -1; dx <= 1; dx++) {
+        ivec2 c = cellHere + ivec2(dx, dy);
+        if (c.x < 0 || c.y < 0 || c.x >= uGridDim.x || c.y >= uGridDim.y) continue;
+        vec2 range = texelFetch(uCellRange, c, 0).rg;
+        int start = int(range.x);
+        int count = int(range.y);
+        // Static bound for the compiler; the early break is the real exit.
+        for (int j = 0; j < 700; j++) {
+          if (j >= count) break;
+          vec4 part = texelFetch(uParticles, ivec2(start + j, 0), 0);
+          vec2 d = simPos - part.xy;
+          float r2 = dot(d, d);
+          if (r2 < h2) {
+            float w = 1.0 - r2 * invH2;
+            float k = w * w * w;
+            float gf = floor(part.w);
+            float comp = fract(part.w) * 4.0;
+            bvec4 m = equal(ids, vec4(gf));
+            if (!any(m)) {
+              // claim the first free slot (drop the particle if all 4 are taken)
+              if      (ids.x < 0.0) ids.x = gf;
+              else if (ids.y < 0.0) ids.y = gf;
+              else if (ids.z < 0.0) ids.z = gf;
+              else if (ids.w < 0.0) ids.w = gf;
+              else continue;
+              m = equal(ids, vec4(gf));
+            }
+            vec4 mv = vec4(m);
+            F  += mv * k;
+            WT += mv * (k * part.z);
+            WC += mv * (k * comp);
+          }
+        }
+      }
     }
   }
 
-  // Pick the dominant blob at this pixel
+  // Pick the dominant blob at this pixel (largest field) ...
   const float SHOW_THRESH = 0.55;
-  int dom = 0;
+  int dom = -1;
   float maxF = 0.0;
-  for (int g = 0; g < MAX_G; g++) {
-    if (fields[g] > maxF) { maxF = fields[g]; dom = g; }
+  for (int s = 0; s < 4; s++) {
+    if (F[s] > maxF) { maxF = F[s]; dom = s; }
   }
-  // Override by z among blobs that are "visible"
+  // ... then override by z among blobs that are "visible"
   int frontDom = -1;
   float frontZ = -1.0;
   int otherDom = -1;
   float otherF = 0.0;
-  for (int g = 1; g < MAX_G; g++) {
-    if (fields[g] > SHOW_THRESH) {
-      if (uBlobZ[g] > frontZ) {
-        otherDom = frontDom; otherF = (frontDom >= 0) ? fields[frontDom] : 0.0;
-        frontDom = g; frontZ = uBlobZ[g];
-      } else if (fields[g] > otherF) {
-        otherDom = g; otherF = fields[g];
+  for (int s = 0; s < 4; s++) {
+    if (ids[s] >= 1.0 && F[s] > SHOW_THRESH) {
+      float z = uBlobZ[int(ids[s])];
+      if (z > frontZ) {
+        otherDom = frontDom; otherF = (frontDom >= 0) ? F[frontDom] : 0.0;
+        frontDom = s; frontZ = z;
+      } else if (F[s] > otherF) {
+        otherDom = s; otherF = F[s];
       }
     }
   }
   if (frontDom >= 0) dom = frontDom;
-  float field = fields[dom];
-  float temp = field > 0.001 ? (wtemps[dom] / field) : 0.18;
+  float field  = dom >= 0 ? F[dom]  : 0.0;
+  float domWT  = dom >= 0 ? WT[dom] : 0.0;
+  float domWC  = dom >= 0 ? WC[dom] : 0.0;
+  int   domGid = dom >= 0 ? int(ids[dom]) : 0;
+  float temp = field > 0.001 ? (domWT / field) : 0.18;
   // Average compression for the dominant blob at this pixel
-  float compAvg = field > 0.001 ? (wcomps[dom] / field) : 0.0;
-  // Smooth onset: ramp from 0 at comp=0.3 to 1 at comp=1.5
-  // so only genuinely compressed regions light up
+  float compAvg = field > 0.001 ? (domWC / field) : 0.0;
   // Log scale: compresses high values so medium blobs are visible
   // but large blobs don't blow out. Range: ~0 at rest → ~0.7 at heavy compression.
   float compRaw = max(compAvg - 0.2, 0.0);  // dead zone below 0.2
@@ -196,7 +229,7 @@ void main() {
     vec3 rayColor = mix(uHot, vec3(1.0, 0.97, 0.90), 0.3);
     // Envelope: strong in lower-mid bulb, gentler fade toward top
     float envelope = smoothstep(0.93, 0.65, t) * smoothstep(0.02, 0.15, t);
-    float glowScale = uGlow / 0.38;  // normalized so default glow=0.38 → 1.0
+    float glowScale = uGlow / 0.38;  // normalized so default glow=0.55 → 1.0
     fluidBg += rayColor * light * envelope * 0.80 * glowScale;
 
     // Darken where light is blocked (1 - light = shadow)
@@ -216,12 +249,11 @@ void main() {
   // rather than injecting a foreign accent. This looks natural
   // at any temperature — hot wax glows hotter, cool wax gets richer.
   float compLuma = dot(waxColor, vec3(0.299, 0.587, 0.114));
-  vec3 compSaturated = waxColor / max(compLuma, 0.01) * compLuma; // normalize then re-apply
   // Boost: brighten by up to 40% and increase saturation
   waxColor = mix(waxColor, waxColor * 1.4 + (waxColor - vec3(compLuma)) * 0.5, compIntensity * 0.6);
 
   // -------- Physically-based spherical refractivity ---------
-  float blobSz = clamp(uBlobSize[dom], 0.0, 1.0);
+  float blobSz = clamp(uBlobSize[domGid], 0.0, 1.0);
 
   float threshold = 0.55;
   float alpha = smoothstep(threshold - 0.18, threshold + 0.04, field);
@@ -273,8 +305,8 @@ void main() {
 
   // Overlap layering: front blob over back blob
   if (otherDom >= 0) {
-    float otherFieldRaw = fields[otherDom];
-    float otherTemp = otherFieldRaw > 0.001 ? (wtemps[otherDom] / otherFieldRaw) : 0.18;
+    float otherFieldRaw = F[otherDom];
+    float otherTemp = otherFieldRaw > 0.001 ? (WT[otherDom] / otherFieldRaw) : 0.18;
     float otherTempN = clamp((otherTemp - 0.18) / 0.85, 0.0, 1.0);
     vec3 otherWax = mix(uCold, uHot, smoothstep(0.0, 1.0, otherTempN)) * lightFromBelow;
     float otherAlpha = smoothstep(threshold - 0.18, threshold + 0.04, otherFieldRaw);
@@ -286,9 +318,6 @@ void main() {
   vec3 inside = mix(fluidBg, inner, alpha);
 
   // -------- Bottle frame ---------
-  float capTop  = smoothstep(0.05, 0.045, t);
-  float capBot  = smoothstep(0.95, 0.955, t);
-
   vec3 topCapCol = vec3(0.06, 0.05, 0.10);
   float neckBand = smoothstep(0.030, 0.035, t) * (1.0 - smoothstep(0.045, 0.050, t));
   topCapCol += vec3(0.10, 0.08, 0.14) * neckBand;

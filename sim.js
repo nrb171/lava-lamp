@@ -47,9 +47,19 @@ class SPH {
     this.mass = 0.9;
     this.gasK = 2400 * 3.00;      // pressure stiffness
     this.viscosity = 0.2 / 26;    // base kinematic viscosity
-    this.viscScale = 1.00;        // user multiplier
+    this.viscScale = 0.50;        // user multiplier (lower = bouncier: Ohnesorge ∝ ν/√(σR))
     this.cohesion = 0.55;
-    this.surfaceTensionScale = 1.60;
+    this.surfaceTensionScale = 2.20;   // UI "Surface tension": scales cohesion AND capSigma
+
+    // Capillary (surface-tension) restoring force on each free blob's
+    // lowest shape mode — see _applyCapillaryMode() for the derivation.
+    // capSigma is the kinematic surface tension σ/ρ (sim px³/s²), before
+    // surfaceTensionScale. At the default scale σ/ρ = 33000, a Bond number
+    // Bo = g'R²/(σ/ρ) ≈ 0.3 for a typical 12-particle blob (R ≈ 30 px,
+    // g' = gravity·hotDensityDeficit ≈ 11 px/s²): surface tension beats
+    // buoyancy, so rising blobs stay round. (Real lamps sit near Bo ≈ 1-2.)
+    this.capSigma = 15000;
+    this.capMinN = 5;        // fewer particles than this: no resolvable shape
 
     // Distinct masses ("blobs")
     this.MAX_BLOBS = 32;
@@ -57,6 +67,15 @@ class SPH {
     this.interRepel = 60;
     this.tempRepelMult = 0.05;
     this.connectDist = this.h * 0.82;
+    // Rupture distance. Coalescence and pinch-off are different physical
+    // events: two blobs merge only once the film between them drains (the
+    // tight connectDist), but a continuous body only splits once its neck
+    // thins past rupture. So fluid particles already in the same blob stay
+    // linked out to ruptureDist. Without this hysteresis, a wobbling blob
+    // flickers between one group and two — swapping cohesion for
+    // inter-blob repulsion — and tears itself apart.
+    this.ruptureDist = this.h * 0.95;   // must stay < h (3×3 cell search)
+
 
     // Pair-wise spring binding
     this.springRest = this.h * 0.55;
@@ -83,12 +102,42 @@ class SPH {
     this.poolDwellTau = 3.0;
     this.poolBarrierFloor = 0.05;
 
-    // Pinned wall particles
+    // Pool/wall particles — anchored by a heavily-damped harmonic oscillator
+    // (no longer fully pinned). Each particle is pulled back to its home
+    // position (set in reset()) by a stiff spring; per-substep velocity is
+    // multiplied by wallDampFactor so motion stays small and well-controlled.
     this.MAX_FIXED = 60;
+    this.wallSpringK    = 1500;   // restoring stiffness toward home
+    this.wallDampFactor = 0.30;   // velocity retained per substep (heavy)
+    this.wallMaxDisplace = 4.0;   // hard clamp on displacement (sim px)
 
     // Cushion zone
     this.cushionRange = this.h * 1.35;
     this.cushionStrength = 1.50;
+
+    // Mouse "grab" — when the user clicks and holds, fluid particles
+    // near the cursor are pulled toward an (offset-preserved) target
+    // with a per-particle Gaussian-weighted spring + damping. The
+    // weight falls off smoothly with distance from the click point,
+    // so the centre of the cluster is tugged firmly while the fringes
+    // are only nudged. A separately-smoothed "soft target" lags a bit
+    // behind the raw cursor, giving the whole interaction a draggy
+    // feel rather than snapping rigidly to the mouse.
+    this.grab = {
+      active: false,
+      tx: 0,  ty: 0,         // raw target (cursor) position, sim coords
+      stx: 0, sty: 0,        // smoothed target — what the spring pulls to
+      tvx: 0, tvy: 0,        // low-pass cursor velocity, sim px/s
+      springK: 90,           // spring stiffness (acc / sim px), per-particle scaled by w
+      damp: 14,              // PURE friction toward zero (1/s) — higher = more drag
+      vCouple: 0.30,         // 0..1 — how much cursor velocity transfers to grabbed particles
+      targetSmoothK: 9,      // how fast stx,sty chase tx,ty (1/s); lower = more drag
+      radius: 40,            // outer pickup cutoff (sim px) — hard zero past this
+      sigma: 22,             // Gaussian std-dev for the weight falloff
+      weightThresh: 0.02,    // ignore particles whose weight is below this
+      maxParticles: 100,     // safety cap on how many to grab at once
+      particles: [],         // [{idx, offX, offY, w}]
+    };
 
     // Time scale
     this.timeScale = 1.0;
@@ -115,7 +164,7 @@ class SPH {
     this.ambientCoolScale = 1.10;
     this.heatNoise = 0.50;
     this.simTime = 0;
-    this.bulbHeight = 50;
+    this.bulbHeight = 58;
     this.edgeFactor = 0.80;
 
     this.restDensity = 1;
@@ -137,16 +186,22 @@ class SPH {
     this.cap = n;
     this.x  = new Float32Array(n);
     this.y  = new Float32Array(n);
+    // Home (anchor) position for pool/wall particles; fluid particles ignore.
+    this.homeX = new Float32Array(n);
+    this.homeY = new Float32Array(n);
     this.vx = new Float32Array(n);
     this.vy = new Float32Array(n);
     this.fx = new Float32Array(n);
     this.fy = new Float32Array(n);
     this.density  = new Float32Array(n);
-    this.compression = new Float32Array(n);  // per-particle compression ratio (0 = rest, >0 = squeezed)
+    this.compression = new Float32Array(n);  // per-particle compression ratio
     this.pressure = new Float32Array(n);
     this.temp = new Float32Array(n);
     this.dT   = new Float32Array(n);
     this.zoneDwell = new Float32Array(n);
+    // Per-step, per-particle factors hoisted out of the pair loop
+    this._dwellExp = new Float32Array(n);   // exp(-dwell / (2·poolDwellTau))
+    this._poolRamp = new Float32Array(n);   // cosine pool-zone ramp on y
     this.cellNext = new Int32Array(n);
     this.groupId = new Int32Array(n);
     this.prevGroupId = new Int32Array(n);
@@ -162,6 +217,8 @@ class SPH {
     this.sumFry = new Float32Array(K);
     this.blobZ = new Float32Array(K);
     this.blobSizeSmooth = new Float32Array(K);
+    this._capAcc = new Float64Array(K * 8);
+    this._sqrtSize = new Float32Array(K);   // √max(1, blob size), per frame
 
     this._rootSizeKeys = new Int32Array(n);
     this._rootSizeVals = new Int32Array(n);
@@ -251,6 +308,11 @@ class SPH {
       }
     }
     this.nFixed = this.n;
+    // Snapshot anchor positions for the pool oscillator.
+    for (let i = 0; i < this.nFixed; i++) {
+      this.homeX[i] = this.x[i];
+      this.homeY[i] = this.y[i];
+    }
 
     // 2) Place fluid particles above the pool
     const targetSpacing = this.h * 0.55;
@@ -401,6 +463,8 @@ class SPH {
     // Tighter connect distance for fluid-fluid pairs in the mid-bulb
     const fluidCD = this.connectDist * 0.82;
     const fluidCD2 = fluidCD * fluidCD;
+    const ruptureD2 = this.ruptureDist * this.ruptureDist;
+    const prevGid = this.prevGroupId;
     const poolZoneTop = this.poolZoneTop;
     const nFixed = this.nFixed;
     const cellSize = this.cellSize;
@@ -432,7 +496,13 @@ class SPH {
               // Near the pool, use full connect distance so blobs absorb;
               // in the mid-bulb, use tighter threshold to prevent merging.
               const nearPool = (yi > poolZoneTop || py[j] > poolZoneTop);
-              const effCD2 = (isWallI || isWallJ || nearPool) ? cd2 : fluidCD2;
+              let effCD2 = (isWallI || isWallJ || nearPool) ? cd2 : fluidCD2;
+              // Same blob last frame → stays linked until the neck ruptures.
+              // (prevGid 0 only occurs right after reset.)
+              if (!isWallI && !isWallJ && prevGid[i] === prevGid[j] &&
+                  prevGid[i] !== 0 && ruptureD2 > effCD2) {
+                effCD2 = ruptureD2;
+              }
               if (ddx*ddx + ddy*ddy < effCD2) {
                 if (isWallI || isWallJ) {
                   this._ufUnion(i, j);
@@ -626,6 +696,8 @@ class SPH {
     this._k2 = 0.030 + 0.010 * Math.sin(d3 * 0.9 + 2.1);
     this._k3 = 0.060 + 0.018 * Math.sin(d1 * 0.5 + 0.8);
 
+    for (let k = 0; k < this.MAX_BLOBS; k++) this._sqrtSize[k] = Math.sqrt(Math.max(1, this.cmn[k]));
+
     this._visc = this.viscosity * this.viscScale;
     this._repelPeak = this.interRepel * this.surfaceTension * this.cushionStrength;
     this._barrierWidth = this.cushionRange - this.connectDist;
@@ -659,6 +731,7 @@ class SPH {
     const cmn = this.cmn;
     const pden = this.density;
     const ppres = this.pressure;
+    const sqrtSize = this._sqrtSize;
 
     // 1) Density & pressure (inlined neighbor walk)
     for (let i = 0; i < n; i++) {
@@ -687,12 +760,8 @@ class SPH {
               if (gj === gi) {
                 rho += term;
               } else if (isFluidI && j >= nFixed) {
-                const zi = bz[gi];
-                const zj = bz[gj];
-                const absZ = Math.abs(zi - zj);
-                const sI = Math.max(1, cmn[gi]);
-                const sJ = Math.max(1, cmn[gj]);
-                const zReach = Math.min(0.55, (Math.sqrt(sI) + Math.sqrt(sJ)) * 0.07);
+                const absZ = Math.abs(bz[gi] - bz[gj]);
+                const zReach = Math.min(0.55, (sqrtSize[gi] + sqrtSize[gj]) * 0.07);
                 if (absZ < zReach) {
                   rho += 0.3 * (1 - absZ / zReach) * term;
                 }
@@ -706,7 +775,6 @@ class SPH {
       pden[i] = rho;
       ppres[i] = this.gasK * (rho - this.restDensity);
       // Compression ratio: 0 at rest density, rises as particle is squeezed.
-      // Capped at 3.0 to keep shader values sane.
       const cRaw = rho / this.restDensity - 1.0;
       this.compression[i] = cRaw > 3.0 ? 3.0 : (cRaw > 0 ? cRaw : 0);
     }
@@ -738,9 +806,21 @@ class SPH {
     const interRatio = this.interDiffRatio;
     const sumFrx = this.sumFrx, sumFry = this.sumFry;
     const zoneDwell = this.zoneDwell;
+
+    // Pool-spring cosine ramp: spring stiffness blends from 1.0×
+    // above poolSpringLo to (1-atten)× below poolSpringHi.
     const POOL_LO = this.poolSpringLo, POOL_HI = this.poolSpringHi, POOL_INV = 1.0 / (POOL_HI - POOL_LO);
     const poolSpringAtten = this.poolSpringAtten;
-
+    // exp(-(d_i+d_j)/(2τ)) = e_i·e_j with e = exp(-d/(2τ)): one exp per
+    // particle instead of one per pair. Same for the pool cosine ramp.
+    const dwellExp = this._dwellExp, poolRamp = this._poolRamp;
+    const halfInvTau = 0.5 / poolDwellTau;
+    for (let i = 0; i < n; i++) {
+      dwellExp[i] = Math.exp(-zoneDwell[i] * halfInvTau);
+      const sr = (py[i] - POOL_LO) * POOL_INV;
+      const sc = sr < 0 ? 0 : sr > 1 ? 1 : sr;
+      poolRamp[i] = 0.5 * (1 - Math.cos(Math.PI * sc));
+    }
     for (let i = 0; i < n; i++) {
       let fpx = 0, fpy = 0;
       let fvx = 0, fvy = 0;
@@ -748,15 +828,13 @@ class SPH {
       let frx = 0, fry = 0;
       let dTsum = 0, neighCount = 0;
       const xi = px[i], yi = py[i];
+      const poolI = poolRamp[i];
+      const dwellI = dwellExp[i];
       const vxi = pvx[i], vyi = pvy[i];
       const Pi = ppres[i];
       const rhoi = pden[i];
       const Ti = ptemp[i];
       const gi = gid[i];
-      // Per-particle pool ramp for spring attenuation
-      const _siRaw = (yi - POOL_LO) * POOL_INV;
-      const _si = _siRaw < 0 ? 0 : _siRaw > 1 ? 1 : _siRaw;
-      const poolI = 0.5 * (1 - Math.cos(Math.PI * _si));
 
       const cxI = Math.max(0, Math.min(gridW - 1, ((xi / cellSize) | 0) + 2));
       const cyI = Math.max(0, Math.min(gridH - 1, ((yi / cellSize) | 0) + 2));
@@ -781,18 +859,13 @@ class SPH {
                   const tDelta = Math.abs(Ti - ptemp[j]);
                   const tBoost = 1.0 + tempRepel * tDelta;
                   const u = (repelOuter - r) / barrierWidth;
-                  const dwell = (zoneDwell[i] + zoneDwell[j]) * 0.5;
-                  const dwellFactor = poolBarrierFloor + (1.0 - poolBarrierFloor) * Math.exp(-dwell / poolDwellTau);
+                  const dwellFactor = poolBarrierFloor + (1.0 - poolBarrierFloor) * dwellI * dwellExp[j];
                   let zFactor = 1.0;
                   if (i >= nFixed && j >= nFixed) {
-                    const zi = bz[gi];
                     const gj = gid[j];
-                    const zj = bz[gj];
-                    const zDiff = zi - zj;
+                    const zDiff = bz[gi] - bz[gj];
                     const absZ = Math.abs(zDiff);
-                    const sI = Math.max(1, cmn[gi]);
-                    const sJ = Math.max(1, cmn[gj]);
-                    const zReach = Math.min(0.55, (Math.sqrt(sI) + Math.sqrt(sJ)) * 0.07);
+                    const zReach = Math.min(0.55, (sqrtSize[gi] + sqrtSize[gj]) * 0.07);
                     if (absZ >= zReach) {
                       zFactor = 0;
                     } else {
@@ -845,11 +918,9 @@ class SPH {
                   const dvx = vxi - pvx[j];
                   const dvy = vyi - pvy[j];
                   const vAxial = (dvx * dx + dvy * dy) / r;
-                  // Per-particle cosine ramp: full spring above POOL_LO, half at POOL_HI
-                  const _sjRaw = (py[j] - POOL_LO) * POOL_INV;
-                  const _sj = _sjRaw < 0 ? 0 : _sjRaw > 1 ? 1 : _sjRaw;
-                  const poolJ = 0.5 * (1 - Math.cos(Math.PI * _sj));
-                  const effSpringK = springK * (1 - poolSpringAtten * poolI * poolJ);
+                  // Smoothly attenuate spring force as BOTH particles enter the
+                  // pool zone. effSpringK glides 1.0× → 0.5× as poolI·poolJ → 1.
+                  const effSpringK = springK * (1 - poolSpringAtten * poolI * poolRamp[j]);
                   if (r > springRest) {
                     const rawStretch = r - springRest;
                     const stretch = rawStretch < springMaxStretch ? rawStretch : springMaxStretch;
@@ -901,7 +972,44 @@ class SPH {
       }
     }
 
-    // 3) Integrate (fluid only — walls are pinned)
+    // Surface tension on each blob's elliptical (n = 2) capillary mode.
+    if (this.capSigma > 0) this._applyCapillaryMode();
+
+    // 3a) Integrate pool/wall particles via heavily-damped harmonic
+    // oscillator anchored at each particle's home position. Forces from the
+    // fluid are honored, but the spring + heavy velocity damping + hard
+    // clamp keep displacement to a few pixels.
+    {
+      const wallK    = this.wallSpringK;
+      const wallDamp = this.wallDampFactor;
+      const wallMaxD = this.wallMaxDisplace;
+      const wallMaxD2 = wallMaxD * wallMaxD;
+      const homeX = this.homeX, homeY = this.homeY;
+      const invMassW = 1.0 / this.mass;
+      for (let i = 0; i < nFixed; i++) {
+        const dxh = px[i] - homeX[i];
+        const dyh = py[i] - homeY[i];
+        const fxw = this.fx[i] - wallK * dxh;
+        const fyw = this.fy[i] - wallK * dyh;
+        pvx[i] = (pvx[i] + fxw * dt * invMassW) * wallDamp;
+        pvy[i] = (pvy[i] + fyw * dt * invMassW) * wallDamp;
+        px[i] += pvx[i] * dt;
+        py[i] += pvy[i] * dt;
+        // Hard clamp: never let a pool particle drift far from home.
+        const ndx = px[i] - homeX[i];
+        const ndy = py[i] - homeY[i];
+        const nd2 = ndx * ndx + ndy * ndy;
+        if (nd2 > wallMaxD2) {
+          const s = wallMaxD / Math.sqrt(nd2);
+          px[i] = homeX[i] + ndx * s;
+          py[i] = homeY[i] + ndy * s;
+          pvx[i] = 0;
+          pvy[i] = 0;
+        }
+      }
+    }
+
+    // 3b) Integrate fluid particles
     const fluidBotY = SIM_H * 0.92;
     const stickyTop = fluidBotY - this.stickyHeight;
     const stickyDt = this.stickyStrength * dt;
@@ -1013,6 +1121,187 @@ class SPH {
         pvx[i] = Math.abs(pvx[i]) * 0.3;
       }
     }
+  }
+
+  // ---- Capillary restoring force on the n = 2 shape mode ----------
+  //
+  // Particle-level SPH surface tension (e.g. Akinci et al. 2013) needs the
+  // interface to span many kernel widths; our blobs are 5-40 particles,
+  // under two kernels across, and its curvature estimate is noise that
+  // shatters them. So surface tension is applied where the shape IS
+  // resolved: each free blob's lowest deformation mode.
+  //
+  // A 2-D blob of area A = πR² deformed into an ellipse a = R·eˢ, b = R·e⁻ˢ
+  // (area-preserving) has surface energy E(s) = σ·P(s), with Ramanujan's
+  // perimeter P = πR·f(s),  f(s) = 6·cosh s − √(6·cosh 2s + 10).
+  // The potential-flow mode shape of that deformation is the linear field
+  // u = ṡ·(x', −y') in the principal frame, so the mode's inertia is
+  // M_s = Σ m|d|² and Lagrange's equation gives
+  //     s̈ = −σ π R f'(s) / (ρ Σ V|d|²),   ρ·V = m.
+  // For small s, f'(s) → 3s and a uniform disc has Σ V|d|² = πR⁴/2, which
+  // recovers Rayleigh's capillary frequency ω₂² = 6σ/(ρR³) exactly. Large
+  // blobs are softer (∝ R⁻³), just like real drops.
+  //
+  // The force is applied as that modal acceleration on each particle,
+  // a_i = s̈·((d·e₁)e₁ − (d·e₂)e₂). Because Σd = 0 and the field is
+  // symmetric, it exerts no net force or torque. Damping is left to the
+  // SPH viscosity — the ratio of the two (Ohnesorge number) decides
+  // whether a disturbed blob wobbles or oozes back.
+  _applyCapillaryMode() {
+    const K = this.MAX_BLOBS;
+    const n = this.n, nFixed = this.nFixed;
+    const px = this.x, py = this.y, gid = this.groupId;
+    const acc = this._capAcc;     // per group: N, Σx, Σy, Σxx, Σyy, Σxy, -, -
+    acc.fill(0);
+    for (let i = nFixed; i < n; i++) {
+      const o = gid[i] << 3;
+      const x = px[i], y = py[i];
+      acc[o] += 1; acc[o + 1] += x; acc[o + 2] += y;
+      acc[o + 3] += x * x; acc[o + 4] += y * y; acc[o + 5] += x * y;
+    }
+    // Walls belong to the pool body, which is not a free drop.
+    const skipA = nFixed > 0 ? gid[0] : -1;
+    const skipB = this._poolBlobId;
+    const V0 = this.mass / this.restDensity;       // area per particle
+    const sig = this.capSigma * this.surfaceTensionScale;
+    for (let g = 0; g < K; g++) {
+      const o = g << 3;
+      const N = acc[o];
+      acc[o + 6] = 0;
+      if (N < this.capMinN || g === skipA || g === skipB) continue;
+      const cx = acc[o + 1] / N, cy = acc[o + 2] / N;
+      const a = acc[o + 3] / N - cx * cx;
+      const b = acc[o + 4] / N - cy * cy;
+      const c = acc[o + 5] / N - cx * cy;
+      const disc = Math.sqrt(0.25 * (a - b) * (a - b) + c * c);
+      const l1 = 0.5 * (a + b) + disc;
+      const l2 = Math.max(0.5 * (a + b) - disc, l1 * 1e-4);
+      if (l1 <= 1e-6 || disc < 1e-9) continue;     // already round
+      // semi-axis ratio a/b = √(λ1/λ2) = e^{2s}
+      const sMode = 0.25 * Math.log(l1 / l2);
+      const R = Math.sqrt(N * V0 / Math.PI);
+      const ch2 = Math.cosh(2 * sMode);
+      const fPrime = 6 * Math.sinh(sMode) - 6 * Math.sinh(2 * sMode) / Math.sqrt(6 * ch2 + 10);
+      const sumD2 = N * (a + b);
+      const sdd = -sig * Math.PI * R * fPrime / (V0 * sumD2);
+      // principal axis e1
+      let ex = l1 - b, ey = c;
+      if (Math.abs(ex) + Math.abs(ey) < 1e-12) { ex = c; ey = l1 - a; }
+      const inv = 1 / Math.hypot(ex, ey);
+      acc[o + 1] = cx; acc[o + 2] = cy;
+      acc[o + 3] = ex * inv; acc[o + 4] = ey * inv;
+      acc[o + 6] = sdd * this.mass;               // force = m·a
+    }
+    const fx = this.fx, fy = this.fy;
+    for (let i = nFixed; i < n; i++) {
+      const o = gid[i] << 3;
+      const k = acc[o + 6];
+      if (k === 0) continue;
+      const dx = px[i] - acc[o + 1], dy = py[i] - acc[o + 2];
+      const e1x = acc[o + 3], e1y = acc[o + 4];
+      const p1 = dx * e1x + dy * e1y;             // along e1
+      const p2 = -dx * e1y + dy * e1x;            // along e2 = (-e1y, e1x)
+      fx[i] += k * (p1 * e1x + p2 * e1y);
+      fy[i] += k * (p1 * e1y - p2 * e1x);
+    }
+  }
+
+  // --- Mouse "grab" interaction ---------------------------------
+  // Pull captured particles toward a *smoothed* target (which lags
+  // behind the raw cursor for drag-feel). Each particle carries a
+  // Gaussian weight `w` baked in at pickup time — far-edge particles
+  // are gently nudged; central ones are tugged firmly. Called once
+  // per sub-step after step(), so the impulse stacks with the regular
+  // SPH integration and the result is clamped by the next step()'s
+  // boundary pass.
+  applyGrab(dt) {
+    const g = this.grab;
+    if (!g.active || g.particles.length === 0) return;
+    // 1) Drive the smoothed target toward the raw cursor. The longer
+    //    the time constant, the more lag the user feels.
+    const sBlend = 1.0 - Math.exp(-g.targetSmoothK * dt);
+    g.stx += (g.tx - g.stx) * sBlend;
+    g.sty += (g.ty - g.sty) * sBlend;
+
+    const stx = g.stx, sty = g.sty;
+    const tvx = g.tvx, tvy = g.tvy;
+    const springK = g.springK;
+    const damp = g.damp;
+    const vCouple = g.vCouple;
+    const nFixed = this.nFixed;
+    const px = this.x, py = this.y;
+    const pvx = this.vx, pvy = this.vy;
+    const list = g.particles;
+    for (let p = 0; p < list.length; p++) {
+      const rec = list[p];
+      const i = rec.idx;
+      if (i < nFixed || i >= this.n) continue;
+      const w = rec.w;
+      const dx = (stx + rec.offX) - px[i];
+      const dy = (sty + rec.offY) - py[i];
+      // Weighted spring pull toward the smoothed target.
+      const k = w * springK;
+      pvx[i] += k * dx * dt;
+      pvy[i] += k * dy * dt;
+      // Pure viscous damping toward zero — scaled by weight so far-edge
+      // particles barely feel it. This is what makes the grab "draggy":
+      // grabbed particles lose their own SPH momentum as they're held.
+      const decay = Math.exp(-damp * dt * w);
+      pvx[i] *= decay;
+      pvy[i] *= decay;
+      // Add a small fraction of the cursor's velocity back — so a quick
+      // flick still imparts momentum, but the dominant feel is drag.
+      const inject = (1.0 - decay) * vCouple;
+      pvx[i] += tvx * inject;
+      pvy[i] += tvy * inject;
+    }
+  }
+
+  // Pick up fluid particles near (sx, sy). Each captured particle keeps
+  // its offset from the click point (so the cluster keeps its shape
+  // while being dragged) and a Gaussian weight that smoothly fades the
+  // grab effect from centre to edge.
+  beginGrab(sx, sy) {
+    const g = this.grab;
+    const r2 = g.radius * g.radius;
+    const inv2s2 = 1.0 / (2.0 * g.sigma * g.sigma);
+    const thresh = g.weightThresh;
+    const list = [];
+    const cap = g.maxParticles;
+    for (let i = this.nFixed; i < this.n && list.length < cap; i++) {
+      const dx = this.x[i] - sx;
+      const dy = this.y[i] - sy;
+      const d2 = dx * dx + dy * dy;
+      if (d2 >= r2) continue;
+      const w = Math.exp(-d2 * inv2s2);
+      if (w < thresh) continue;
+      list.push({ idx: i, offX: dx, offY: dy, w });
+    }
+    g.particles = list;
+    g.tx = sx;  g.ty = sy;
+    g.stx = sx; g.sty = sy;        // start smoothed target at the click point
+    g.tvx = 0;  g.tvy = 0;
+    g.active = list.length > 0;
+    return g.active;
+  }
+
+  // Update the cursor target; newVx/newVy are the raw cursor velocity
+  // in sim px/s (caller supplies — easy to compute from dt). We
+  // additionally low-pass filter that here so jittery hand motion
+  // doesn't translate into pixel-scale velocity spikes.
+  updateGrab(sx, sy, newVx, newVy) {
+    const g = this.grab;
+    if (!g.active) return;
+    g.tx = sx; g.ty = sy;
+    const blend = 0.3;             // a touch heavier filter than before
+    g.tvx = g.tvx * (1 - blend) + newVx * blend;
+    g.tvy = g.tvy * (1 - blend) + newVy * blend;
+  }
+
+  endGrab() {
+    this.grab.active = false;
+    this.grab.particles.length = 0;
+    this.grab.tvx = 0; this.grab.tvy = 0;
   }
 }
 

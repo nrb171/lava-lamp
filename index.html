@@ -47,7 +47,9 @@
 
   /* Soft Gaussian-looking halo that appears at the cursor while a
      grab is active. No hard outline — the gradient mirrors the
-     weight falloff the simulation actually uses. */
+     weight falloff the simulation actually uses. (No blend mode or
+     CSS blur: over a canvas that repaints every frame those force the
+     compositor to redo the effect each frame, even while invisible.) */
   .grab-ring {
     position: absolute;
     top: 0;
@@ -64,11 +66,10 @@
         rgba(255,255,255,0.04) 60%,
         rgba(255,255,255,0.00) 90%);
     opacity: 0;
-    transition: opacity 0.15s ease-out;
-    mix-blend-mode: screen;
-    filter: blur(2px);
+    visibility: hidden;
+    transition: opacity 0.15s ease-out, visibility 0s linear 0.15s;
   }
-  .grab-ring.active { opacity: 1; }
+  .grab-ring.active { opacity: 1; visibility: visible; transition: opacity 0.15s ease-out; }
   .controls {
     background: var(--panel);
     border: 1px solid var(--panel-border);
@@ -157,8 +158,11 @@
   .preset:hover { color: var(--text); border-color: rgba(184,92,255,0.4); }
   @media (max-width: 760px) {
     body { padding: 12px; gap: 16px; }
-    canvas#lava { width: 320px; height: 580px; }
+    /* keep the sim's 380:700 aspect so the lamp isn't stretched */
+    canvas#lava { width: min(320px, calc(100vw - 24px)); height: auto; aspect-ratio: 380 / 700; }
     .controls { width: 100%; max-width: 320px; }
+    /* backdrop blur is expensive on phones; the panel sits on plain black */
+    .controls { backdrop-filter: none; -webkit-backdrop-filter: none; }
   }
 
   /* Floating toolbar (fullscreen + panel toggle) */
@@ -175,7 +179,10 @@
     height: 36px;
     padding: 0;
     border-radius: 9px;
-    background: rgba(255,255,255,0.05);
+    /* Solid tint instead of backdrop-filter: these buttons float over the
+       canvas, which changes every frame, so a backdrop blur would be
+       recomputed every frame. */
+    background: rgba(24, 16, 36, 0.78);
     border: 1px solid rgba(255,255,255,0.10);
     color: var(--text);
     font-size: 18px;
@@ -184,8 +191,6 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
     transition: background 0.15s;
   }
   .toolbar button:hover { background: rgba(184, 92, 255, 0.20); }
@@ -301,8 +306,8 @@
   </div>
 
   <div class="control">
-    <label>Surface tension <span class="val" id="stenVal">1.60</span></label>
-    <input type="range" id="sten" min="0" max="4.0" step="0.05" value="1.60" />
+    <label>Surface tension <span class="val" id="stenVal">2.20</span></label>
+    <input type="range" id="sten" min="0" max="4.0" step="0.05" value="2.20" />
   </div>
 
   <div class="control">
@@ -352,8 +357,8 @@
   </div>
 
   <div class="control">
-    <label>Viscosity <span class="val" id="viscVal">1.00</span></label>
-    <input type="range" id="visc" min="0" max="6.0" step="0.05" value="1.00" />
+    <label>Viscosity <span class="val" id="viscVal">0.50</span></label>
+    <input type="range" id="visc" min="0" max="6.0" step="0.05" value="0.50" />
   </div>
 
   <div class="control">
@@ -374,1577 +379,61 @@
   </div>
 </div>
 
-<script>
-// ============================================================
-//  Lava-lamp SPH simulation — physics module
-//  Separated from index.html for modularity and headless use.
-// ============================================================
-
-const SIM_W = 380;
-const SIM_H = 700;
-
-function bottleHalfFrac(t) {
-  if (t < 0.03) return 0.0;
-  if (t < 0.06) {
-    const u = (t - 0.03) / 0.03;
-    return 0.247 * (u * u * (3 - 2 * u));
-  }
-  if (t < 0.82) {
-    const u = (t - 0.06) / 0.76;
-    const e = u * u * (3 - 2 * u);
-    return 0.247 + (0.50 - 0.247) * e;
-  }
-  if (t < 0.93) {
-    const u = (t - 0.82) / 0.11;
-    const e = u * u * (3 - 2 * u);
-    return 0.50 + (0.40 - 0.50) * e;
-  }
-  if (t < 0.96) {
-    const u = (t - 0.93) / 0.03;
-    const e = u * u * (3 - 2 * u);
-    return 0.40 + (0.32 - 0.40) * e;
-  }
-  if (t < 0.99) {
-    const u = (t - 0.96) / 0.03;
-    return 0.32 * (1 - u);
-  }
-  return 0.0;
-}
-
-function bottleHalfWidth(y) {
-  return bottleHalfFrac(y / SIM_H) * SIM_W;
-}
-
-class SPH {
-  constructor(opts = {}) {
-    this.numParticles = opts.numParticles || 160;
-
-    // Kernel and core fluid params
-    this.h = 26;                  // smoothing radius (px)
-    this.mass = 0.9;
-    this.gasK = 2400 * 3.00;      // pressure stiffness
-    this.viscosity = 0.2 / 26;    // base kinematic viscosity
-    this.viscScale = 1.00;        // user multiplier
-    this.cohesion = 0.55;
-    this.surfaceTensionScale = 1.60;
-
-    // Distinct masses ("blobs")
-    this.MAX_BLOBS = 32;
-    this.surfaceTension = 1.00;    // user multiplier for inter-blob repulsion
-    this.interRepel = 60;
-    this.tempRepelMult = 0.05;
-    this.connectDist = this.h * 0.82;
-
-    // Pair-wise spring binding
-    this.springRest = this.h * 0.55;
-    this.springK = 400;
-    this.springDamp = 0.08;
-    this.springMaxStretch = this.h * 0.4;
-    this.springMin = this.h * 0.4;
-    this.springReach = this.h * 1.3;
-    this.springScale = 6.00 / 2000;
-
-    // Pool-zone spring attenuation band (y-space)
-    this.poolSpringLo = 480;   // spring starts fading here
-    this.poolSpringHi = 580;   // spring is at minimum here
-    this.poolSpringAtten = 0.6; // multiply spring by this in pool (0.6 = 60%)
-
-    // Sticky bottom layer
-    this.stickyHeight = 90;
-    this.stickyStrength = 0.15;
-    this.stickyPull = 2.00;
-
-    // Pool-zone barrier attenuation
-    this.poolZoneTop = SIM_H * 0.83;
-    this.poolZoneFloor = SIM_H * 0.92;
-    this.poolDwellTau = 3.0;
-    this.poolBarrierFloor = 0.05;
-
-    // Pool/wall particles — anchored by a heavily-damped harmonic oscillator
-    // (no longer fully pinned). Each particle is pulled back to its home
-    // position (set in reset()) by a stiff spring; per-substep velocity is
-    // multiplied by wallDampFactor so motion stays small and well-controlled.
-    this.MAX_FIXED = 60;
-    this.wallSpringK    = 1500;   // restoring stiffness toward home
-    this.wallDampFactor = 0.30;   // velocity retained per substep (heavy)
-    this.wallMaxDisplace = 4.0;   // hard clamp on displacement (sim px)
-
-    // Cushion zone
-    this.cushionRange = this.h * 1.35;
-    this.cushionStrength = 1.50;
-
-    // Mouse "grab" — when the user clicks and holds, fluid particles
-    // near the cursor are pulled toward an (offset-preserved) target
-    // with a per-particle Gaussian-weighted spring + damping. The
-    // weight falls off smoothly with distance from the click point,
-    // so the centre of the cluster is tugged firmly while the fringes
-    // are only nudged. A separately-smoothed "soft target" lags a bit
-    // behind the raw cursor, giving the whole interaction a draggy
-    // feel rather than snapping rigidly to the mouse.
-    this.grab = {
-      active: false,
-      tx: 0,  ty: 0,         // raw target (cursor) position, sim coords
-      stx: 0, sty: 0,        // smoothed target — what the spring pulls to
-      tvx: 0, tvy: 0,        // low-pass cursor velocity, sim px/s
-      springK: 90,           // spring stiffness (acc / sim px), per-particle scaled by w
-      damp: 14,              // PURE friction toward zero (1/s) — higher = more drag
-      vCouple: 0.30,         // 0..1 — how much cursor velocity transfers to grabbed particles
-      targetSmoothK: 9,      // how fast stx,sty chase tx,ty (1/s); lower = more drag
-      radius: 40,            // outer pickup cutoff (sim px) — hard zero past this
-      sigma: 22,             // Gaussian std-dev for the weight falloff
-      weightThresh: 0.02,    // ignore particles whose weight is below this
-      maxParticles: 100,     // safety cap on how many to grab at once
-      particles: [],         // [{idx, offX, offY, w}]
-    };
-
-    // Time scale
-    this.timeScale = 1.0;
-
-    // Visual particle size
-    this.renderScale = 1.30;
-
-    // Physics
-    this.gravity = 240;
-    this.coolDensityExcess = 0.030;
-    this.hotDensityDeficit = 0.045;
-    this.gravityScale = 1.00;
-    this.buoyancyExp = 4.0;
-    this.coolMassRef = 8;
-
-    // Heat
-    this.tAmbient = 0.18;
-    this.heatScale = 3.00;
-    this.heatRate = 0.05;
-    this.heatDiff = 0.05;
-    this.heatDiffScale = 5.00;
-    this.interDiffRatio = 0.03;
-    this.ambientCool = 0.01;
-    this.ambientCoolScale = 1.10;
-    this.heatNoise = 0.50;
-    this.simTime = 0;
-    this.bulbHeight = 58;
-    this.edgeFactor = 0.80;
-
-    this.restDensity = 1;
-
-    // Spatial hash grid
-    this.cellSize = this.h;
-    this.gridW = Math.ceil(SIM_W / this.cellSize) + 4;
-    this.gridH = Math.ceil(SIM_H / this.cellSize) + 4;
-    this.gridCount = this.gridW * this.gridH;
-    this.cellHead = new Int32Array(this.gridCount);
-    this.cellNext = new Int32Array(0);
-
-    this.allocate(this.numParticles + this.MAX_FIXED);
-    this.reset();
-  }
-
-  allocate(n) {
-    this.n = 0;
-    this.cap = n;
-    this.x  = new Float32Array(n);
-    this.y  = new Float32Array(n);
-    // Home (anchor) position for pool/wall particles; fluid particles ignore.
-    this.homeX = new Float32Array(n);
-    this.homeY = new Float32Array(n);
-    this.vx = new Float32Array(n);
-    this.vy = new Float32Array(n);
-    this.fx = new Float32Array(n);
-    this.fy = new Float32Array(n);
-    this.density  = new Float32Array(n);
-    this.compression = new Float32Array(n);  // per-particle compression ratio
-    this.pressure = new Float32Array(n);
-    this.temp = new Float32Array(n);
-    this.dT   = new Float32Array(n);
-    this.zoneDwell = new Float32Array(n);
-    this.cellNext = new Int32Array(n);
-    this.groupId = new Int32Array(n);
-    this.prevGroupId = new Int32Array(n);
-    this.uf = new Int32Array(n);
-
-    const K = this.MAX_BLOBS || 8;
-    this.cmx = new Float32Array(K);
-    this.cmy = new Float32Array(K);
-    this.cmn = new Int32Array(K);
-    this.sumRoundX = new Float32Array(K);
-    this.sumRoundY = new Float32Array(K);
-    this.sumFrx = new Float32Array(K);
-    this.sumFry = new Float32Array(K);
-    this.blobZ = new Float32Array(K);
-    this.blobSizeSmooth = new Float32Array(K);
-
-    this._rootSizeKeys = new Int32Array(n);
-    this._rootSizeVals = new Int32Array(n);
-    this._rootSorted   = new Int32Array(n);
-    this._rootIdMap    = new Int32Array(n);
-
-    this._groupSize   = new Int32Array(K);
-    this._majPrev     = new Int32Array(K);
-    this._newBlobZ    = new Float32Array(K);
-    this._handled     = new Uint8Array(K);
-    this._prevTally   = new Int32Array(K * K);
-    this._claimBuckets = new Int32Array(K * K);
-    this._claimCounts  = new Int32Array(K);
-
-    // Precomputed SPH kernel constants (depend only on h)
-    const h = this.h;
-    this.POLY6      =  4 / (Math.PI * Math.pow(h, 8));
-    this.SPIKY_GRAD = -30 / (Math.PI * Math.pow(h, 5));
-    this.VISC_LAP   =  40 / (Math.PI * Math.pow(h, 4));
-  }
-
-  // ---- Union-find helpers ----
-  _ufFind(i) {
-    let r = i;
-    while (this.uf[r] !== r) r = this.uf[r];
-    while (this.uf[i] !== r) { const next = this.uf[i]; this.uf[i] = r; i = next; }
-    return r;
-  }
-  _ufUnion(a, b) {
-    const ra = this._ufFind(a), rb = this._ufFind(b);
-    if (ra !== rb) this.uf[ra] = rb;
-  }
-
-  computeCentroids() {
-    const K = this.MAX_BLOBS;
-    for (let k = 0; k < K; k++) { this.cmx[k] = 0; this.cmy[k] = 0; this.cmn[k] = 0; }
-    for (let i = 0; i < this.n; i++) {
-      const g = this.groupId[i];
-      this.cmx[g] += this.x[i];
-      this.cmy[g] += this.y[i];
-      this.cmn[g]++;
-    }
-    for (let k = 0; k < K; k++) {
-      if (this.cmn[k] > 0) {
-        this.cmx[k] /= this.cmn[k];
-        this.cmy[k] /= this.cmn[k];
-      }
-    }
-  }
-
-  setNumParticles(n) {
-    const total = n + this.MAX_FIXED;
-    if (total !== this.cap) this.allocate(total);
-    this.numParticles = n;
-    this.reset();
-  }
-
-  reset() {
-    this.n = 0;
-    // 1) Permanent pool: pinned wall particles
-    const wallSpacingX = this.h * 0.55;
-    const wallSpacingY = this.h * 0.48;
-    const wallBaseY = SIM_H * 0.93;
-    const numRows = 2;
-    const perRow = Math.floor(this.MAX_FIXED / numRows);
-    for (let row = 0; row < numRows; row++) {
-      const wy = wallBaseY - row * wallSpacingY;
-      const halfW = bottleHalfWidth(wy) - 6;
-      if (halfW < 8) continue;
-      const offsetX = (row % 2 === 1) ? wallSpacingX * 0.5 : 0;
-      const fitsInRow = Math.floor((2 * halfW) / wallSpacingX);
-      const numCol = Math.min(perRow, fitsInRow);
-      if (numCol < 2) continue;
-      const totalSpan = (numCol - 1) * wallSpacingX;
-      const startX = SIM_W * 0.5 - totalSpan * 0.5;
-      for (let i = 0; i < numCol; i++) {
-        if (this.n >= this.MAX_FIXED) break;
-        const wx = startX + i * wallSpacingX + offsetX;
-        if (Math.abs(wx - SIM_W * 0.5) > halfW) continue;
-        this.x[this.n] = wx;
-        this.y[this.n] = wy;
-        this.vx[this.n] = 0;
-        this.vy[this.n] = 0;
-        this.temp[this.n] = this.tAmbient;
-        this.groupId[this.n] = 0;
-        this.n++;
-      }
-    }
-    this.nFixed = this.n;
-    // Snapshot anchor positions for the pool oscillator.
-    for (let i = 0; i < this.nFixed; i++) {
-      this.homeX[i] = this.x[i];
-      this.homeY[i] = this.y[i];
-    }
-
-    // 2) Place fluid particles above the pool
-    const targetSpacing = this.h * 0.55;
-    const minSpacing2 = (targetSpacing * 0.7) * (targetSpacing * 0.7);
-    let placed = 0;
-    let attempts = 0;
-    const maxAttempts = this.numParticles * 400;
-    const wallTopY = wallBaseY - wallSpacingY * (numRows - 1);
-    while (placed < this.numParticles && attempts < maxAttempts) {
-      attempts++;
-      const y = wallTopY - 4 - Math.random() * 110;
-      if (y < SIM_H * 0.10) continue;
-      const halfW = bottleHalfWidth(y);
-      if (halfW < 8) continue;
-      const cx = SIM_W * 0.5;
-      const x = cx + (Math.random() * 2 - 1) * (halfW - 6);
-      let ok = true;
-      for (let i = 0; i < this.n; i++) {
-        const dx = this.x[i] - x;
-        const dy = this.y[i] - y;
-        if (dx*dx + dy*dy < minSpacing2) {
-          ok = false; break;
-        }
-      }
-      if (!ok) continue;
-      this.x[this.n] = x;
-      this.y[this.n] = y;
-      this.vx[this.n] = (Math.random()-0.5) * 2;
-      this.vy[this.n] = (Math.random()-0.5) * 2;
-      this.temp[this.n] = this.tAmbient + (Math.random()-0.5) * 0.05;
-      this.n++;
-      placed++;
-    }
-
-    this.rebuildGrid();
-    this.prevGroupId.fill(0);
-    this.blobZ.fill(0);
-    this.blobSizeSmooth.fill(0);
-    this.recomputeGroups();
-    this._updateBlobZ();
-    this.computeCentroids();
-    this.computeDensities();
-    const densSlice = this.density.slice(0, this.n);
-    densSlice.sort();
-    const median = densSlice[Math.floor(densSlice.length / 2)] || 1;
-    this.restDensity = median * 0.92;
-  }
-
-  cellIndex(x, y) {
-    let cx = (x / this.cellSize) | 0;
-    let cy = (y / this.cellSize) | 0;
-    cx = Math.max(0, Math.min(this.gridW - 1, cx + 2));
-    cy = Math.max(0, Math.min(this.gridH - 1, cy + 2));
-    return cy * this.gridW + cx;
-  }
-
-  rebuildGrid() {
-    this.cellHead.fill(-1);
-    for (let i = 0; i < this.n; i++) {
-      const idx = this.cellIndex(this.x[i], this.y[i]);
-      this.cellNext[i] = this.cellHead[idx];
-      this.cellHead[idx] = i;
-    }
-  }
-
-  forNeighbors(i, fn) {
-    const cx = Math.max(0, Math.min(this.gridW - 1, ((this.x[i] / this.cellSize) | 0) + 2));
-    const cy = Math.max(0, Math.min(this.gridH - 1, ((this.y[i] / this.cellSize) | 0) + 2));
-    for (let dy = -1; dy <= 1; dy++) {
-      const ny = cy + dy;
-      if (ny < 0 || ny >= this.gridH) continue;
-      for (let dx = -1; dx <= 1; dx++) {
-        const nx = cx + dx;
-        if (nx < 0 || nx >= this.gridW) continue;
-        let j = this.cellHead[ny * this.gridW + nx];
-        while (j !== -1) {
-          fn(j);
-          j = this.cellNext[j];
-        }
-      }
-    }
-  }
-
-  computeDensities() {
-    const n = this.n;
-    const h = this.h, h2 = h * h;
-    const POLY6 = this.POLY6;
-    const m = this.mass;
-    const nFixed = this.nFixed;
-    const cellSize = this.cellSize;
-    const gridW = this.gridW, gridH = this.gridH;
-    const cellHead = this.cellHead, cellNext = this.cellNext;
-    const px = this.x, py = this.y;
-    const gid = this.groupId;
-    const bz = this.blobZ;
-    const cmn = this.cmn;
-
-    for (let i = 0; i < n; i++) {
-      let rho = 0;
-      const xi = px[i], yi = py[i];
-      const gi = gid[i];
-      const isFluidI = i >= nFixed;
-
-      const cxI = Math.max(0, Math.min(gridW - 1, ((xi / cellSize) | 0) + 2));
-      const cyI = Math.max(0, Math.min(gridH - 1, ((yi / cellSize) | 0) + 2));
-      for (let dy = -1; dy <= 1; dy++) {
-        const ny = cyI + dy;
-        if (ny < 0 || ny >= gridH) continue;
-        for (let dx = -1; dx <= 1; dx++) {
-          const nx = cxI + dx;
-          if (nx < 0 || nx >= gridW) continue;
-          let j = cellHead[ny * gridW + nx];
-          while (j !== -1) {
-            const ddx = xi - px[j];
-            const ddy = yi - py[j];
-            const r2 = ddx*ddx + ddy*ddy;
-            if (r2 < h2) {
-              const w = h2 - r2;
-              const term = m * POLY6 * w * w * w;
-              const gj = gid[j];
-              if (gj === gi) {
-                rho += term;
-              } else if (isFluidI && j >= nFixed) {
-                const zi = bz[gi];
-                const zj = bz[gj];
-                const absZ = Math.abs(zi - zj);
-                const sI = Math.max(1, cmn[gi]);
-                const sJ = Math.max(1, cmn[gj]);
-                const zReach = Math.min(0.55, (Math.sqrt(sI) + Math.sqrt(sJ)) * 0.07);
-                if (absZ < zReach) {
-                  rho += 0.3 * (1 - absZ / zReach) * term;
-                }
-              }
-            }
-            j = cellNext[j];
-          }
-        }
-      }
-      this.density[i] = rho;
-    }
-  }
-
-  recomputeGroups() {
-    const n = this.n;
-    if (n === 0) return;
-    for (let i = 0; i < n; i++) this.uf[i] = i;
-    const cd2 = this.connectDist * this.connectDist;
-    // Tighter connect distance for fluid-fluid pairs in the mid-bulb
-    const fluidCD = this.connectDist * 0.82;
-    const fluidCD2 = fluidCD * fluidCD;
-    const poolZoneTop = this.poolZoneTop;
-    const nFixed = this.nFixed;
-    const cellSize = this.cellSize;
-    const gridW = this.gridW, gridH = this.gridH;
-    const cellHead = this.cellHead, cellNext = this.cellNext;
-    const px = this.x, py = this.y;
-
-    for (let i = 0; i < n; i++) {
-      const xi = px[i], yi = py[i];
-      const gi = this.groupId[i];
-      const zi = this.blobZ[gi];
-      const sizeI = Math.max(1, this.cmn[gi]);
-      const isWallI = i < nFixed;
-
-      const cxI = Math.max(0, Math.min(gridW - 1, ((xi / cellSize) | 0) + 2));
-      const cyI = Math.max(0, Math.min(gridH - 1, ((yi / cellSize) | 0) + 2));
-      for (let dy = -1; dy <= 1; dy++) {
-        const ny = cyI + dy;
-        if (ny < 0 || ny >= gridH) continue;
-        for (let dx = -1; dx <= 1; dx++) {
-          const nx = cxI + dx;
-          if (nx < 0 || nx >= gridW) continue;
-          let j = cellHead[ny * gridW + nx];
-          while (j !== -1) {
-            if (j > i) {
-              const ddx = xi - px[j];
-              const ddy = yi - py[j];
-              const isWallJ = j < nFixed;
-              // Near the pool, use full connect distance so blobs absorb;
-              // in the mid-bulb, use tighter threshold to prevent merging.
-              const nearPool = (yi > poolZoneTop || py[j] > poolZoneTop);
-              const effCD2 = (isWallI || isWallJ || nearPool) ? cd2 : fluidCD2;
-              if (ddx*ddx + ddy*ddy < effCD2) {
-                if (isWallI || isWallJ) {
-                  this._ufUnion(i, j);
-                } else {
-                  const gj = this.groupId[j];
-                  const zj = this.blobZ[gj];
-                  const sizeJ = Math.max(1, this.cmn[gj]);
-                  const sizeMin = Math.min(sizeI, sizeJ);
-                  const zMerge = Math.max(0.10, 0.25 / Math.sqrt(sizeMin));
-                  if (Math.abs(zi - zj) < zMerge) {
-                    this._ufUnion(i, j);
-                  }
-                }
-              }
-            }
-            j = cellNext[j];
-          }
-        }
-      }
-    }
-
-    // Count component sizes by root
-    const rootSizeVals = this._rootSizeVals;
-    const rootIdMap = this._rootIdMap;
-    rootSizeVals.fill(0);
-    let numRoots = 0;
-    const rootSizeKeys = this._rootSizeKeys;
-    rootIdMap.fill(-1);
-
-    for (let i = 0; i < n; i++) {
-      const r = this._ufFind(i);
-      if (rootIdMap[r] === -1) {
-        rootIdMap[r] = numRoots;
-        rootSizeKeys[numRoots] = r;
-        numRoots++;
-      }
-      rootSizeVals[rootIdMap[r]]++;
-    }
-
-    // Sort roots by descending size
-    const sorted = this._rootSorted;
-    for (let i = 0; i < numRoots; i++) sorted[i] = i;
-    for (let i = 1; i < numRoots; i++) {
-      const key = sorted[i];
-      const keyVal = rootSizeVals[key];
-      let j = i - 1;
-      while (j >= 0 && rootSizeVals[sorted[j]] < keyVal) {
-        sorted[j + 1] = sorted[j];
-        j--;
-      }
-      sorted[j + 1] = key;
-    }
-
-    const cap = this.MAX_BLOBS;
-    rootIdMap.fill(0);
-    for (let k = 0; k < numRoots; k++) {
-      const rootIdx = sorted[k];
-      rootIdMap[rootSizeKeys[rootIdx]] = Math.min(k + 1, cap - 1);
-    }
-    for (let i = 0; i < n; i++) {
-      this.groupId[i] = rootIdMap[this._ufFind(i)];
-    }
-  }
-
-  _updateBlobZ() {
-    const n = this.n;
-    const K = this.MAX_BLOBS;
-
-    const groupSize = this._groupSize;
-    const prevTally = this._prevTally;
-    groupSize.fill(0);
-    prevTally.fill(0);
-    for (let i = 0; i < n; i++) {
-      const cur = this.groupId[i];
-      const prev = this.prevGroupId[i];
-      groupSize[cur]++;
-      prevTally[cur * K + prev]++;
-    }
-
-    const majPrev = this._majPrev;
-    for (let c = 0; c < K; c++) {
-      if (groupSize[c] === 0) { majPrev[c] = -1; continue; }
-      let bestP = -1, bestCnt = 0;
-      const base = c * K;
-      for (let p = 1; p < K; p++) {
-        const cnt = prevTally[base + p];
-        if (cnt > bestCnt) { bestCnt = cnt; bestP = p; }
-      }
-      majPrev[c] = bestP;
-    }
-
-    const claimBuckets = this._claimBuckets;
-    const claimCounts = this._claimCounts;
-    claimCounts.fill(0);
-    for (let c = 1; c < K; c++) {
-      if (groupSize[c] === 0) continue;
-      const p = majPrev[c];
-      if (p < 0) continue;
-      claimBuckets[p * K + claimCounts[p]] = c;
-      claimCounts[p]++;
-    }
-
-    const newBlobZ = this._newBlobZ;
-    const handled = this._handled;
-    newBlobZ.fill(0);
-    handled.fill(0);
-    for (let p = 0; p < K; p++) {
-      const cnt = claimCounts[p];
-      if (cnt === 0) continue;
-      const base = p * K;
-      for (let a = 1; a < cnt; a++) {
-        const key = claimBuckets[base + a];
-        const keySize = groupSize[key];
-        let b = a - 1;
-        while (b >= 0 && groupSize[claimBuckets[base + b]] < keySize) {
-          claimBuckets[base + b + 1] = claimBuckets[base + b];
-          b--;
-        }
-        claimBuckets[base + b + 1] = key;
-      }
-      newBlobZ[claimBuckets[base]] = this.blobZ[p];
-      handled[claimBuckets[base]] = 1;
-      for (let k = 1; k < cnt; k++) {
-        newBlobZ[claimBuckets[base + k]] = Math.random();
-        handled[claimBuckets[base + k]] = 1;
-      }
-    }
-    for (let c = 1; c < K; c++) {
-      if (groupSize[c] > 0 && !handled[c]) {
-        newBlobZ[c] = Math.random();
-      }
-    }
-
-    for (let k = 0; k < K; k++) this.blobZ[k] = newBlobZ[k];
-    for (let i = 0; i < this.nFixed; i++) {
-      this.blobZ[this.groupId[i]] = 0.5;
-    }
-
-    // Smooth blob sizes
-    const prevSmooth = this.blobSizeSmooth;
-    const cmn = this.cmn;
-    let maxN = 1;
-    for (let k = 0; k < K; k++) if (cmn[k] > maxN) maxN = cmn[k];
-
-    const newSmooth = this._newBlobZ;
-    newSmooth.fill(0);
-    for (let c = 1; c < K; c++) {
-      if (groupSize[c] === 0) continue;
-      const target = cmn[c] / maxN;
-      const p = majPrev[c];
-      if (p >= 0 && prevSmooth[p] > 0.001) {
-        const inherited = prevSmooth[p];
-        const rate = (target < inherited) ? 0.04 : 0.12;
-        newSmooth[c] = inherited + (target - inherited) * rate;
-      } else {
-        newSmooth[c] = cmn[c] / maxN;
-      }
-    }
-    for (let k = 0; k < K; k++) this.blobSizeSmooth[k] = newSmooth[k];
-  }
-
-  // Called once per frame — handles group computation, blob z, centroids,
-  // and heat noise pre-computation. These don't need to run every substep.
-  stepFrame(totalDt) {
-    if (this.n === 0) return;
-    this.rebuildGrid();
-    this.prevGroupId.set(this.groupId);
-    this.recomputeGroups();
-    this._updateBlobZ();
-    this.computeCentroids();
-
-    // Identify the pool blob — largest group with centroid below poolZoneFloor
-    let poolBlobId = -1, poolBlobSize = 0;
-    for (let k = 1; k < this.MAX_BLOBS; k++) {
-      if (this.cmn[k] > poolBlobSize && this.cmy[k] > this.poolZoneFloor) {
-        poolBlobSize = this.cmn[k];
-        poolBlobId = k;
-      }
-    }
-    this._poolBlobId = poolBlobId;
-
-    const T = this.simTime + totalDt;
-    const d1 = T * 0.071, d2 = T * 0.103, d3 = T * 0.047;
-    this._ph1 = T * 0.13;
-    this._ph2 = T * 0.09;
-    this._ph3 = T * 0.17;
-    this._a1 = 0.30 + 0.30 * Math.sin(d1 * 1.3);
-    this._a2 = 0.25 + 0.25 * Math.sin(d2 * 0.8 + 0.4);
-    this._a3 = 0.20 + 0.20 * Math.sin(d3 * 1.5 + 1.2);
-    this._k1 = 0.045 + 0.012 * Math.sin(d2 * 0.7);
-    this._k2 = 0.030 + 0.010 * Math.sin(d3 * 0.9 + 2.1);
-    this._k3 = 0.060 + 0.018 * Math.sin(d1 * 0.5 + 0.8);
-
-    this._visc = this.viscosity * this.viscScale;
-    this._repelPeak = this.interRepel * this.surfaceTension * this.cushionStrength;
-    this._barrierWidth = this.cushionRange - this.connectDist;
-    const cohBoost = 1.0 + 0.6 * Math.max(0, 1.0 - this.viscScale);
-    this._cohScale = this.cohesion * this.surfaceTensionScale * cohBoost;
-    this._buoDenom = Math.exp(this.buoyancyExp) - 1;
-    this._buoTotal = this.coolDensityExcess + this.hotDensityDeficit;
-    this._springK = this.springK * this.springScale;
-    this._springDamp = this.springDamp * this.springScale;
-  }
-
-  step(dt) {
-    if (this.n === 0) return;
-    this.rebuildGrid();
-
-    const n = this.n;
-    const h = this.h, h2 = h * h;
-    const POLY6      = this.POLY6;
-    const SPIKY_GRAD = this.SPIKY_GRAD;
-    const VISC_LAP   = this.VISC_LAP;
-    const m = this.mass;
-    const nFixed = this.nFixed;
-    const cellSize = this.cellSize;
-    const gridW = this.gridW, gridH = this.gridH;
-    const cellHead = this.cellHead, cellNextArr = this.cellNext;
-    const px = this.x, py = this.y;
-    const pvx = this.vx, pvy = this.vy;
-    const ptemp = this.temp;
-    const gid = this.groupId;
-    const bz = this.blobZ;
-    const cmn = this.cmn;
-    const pden = this.density;
-    const ppres = this.pressure;
-
-    // 1) Density & pressure (inlined neighbor walk)
-    for (let i = 0; i < n; i++) {
-      let rho = 0;
-      const xi = px[i], yi = py[i];
-      const gi = gid[i];
-      const isFluidI = i >= nFixed;
-
-      const cxI = Math.max(0, Math.min(gridW - 1, ((xi / cellSize) | 0) + 2));
-      const cyI = Math.max(0, Math.min(gridH - 1, ((yi / cellSize) | 0) + 2));
-      for (let ddy = -1; ddy <= 1; ddy++) {
-        const ny = cyI + ddy;
-        if (ny < 0 || ny >= gridH) continue;
-        for (let ddx = -1; ddx <= 1; ddx++) {
-          const nx = cxI + ddx;
-          if (nx < 0 || nx >= gridW) continue;
-          let j = cellHead[ny * gridW + nx];
-          while (j !== -1) {
-            const dx = xi - px[j];
-            const dy = yi - py[j];
-            const r2 = dx*dx + dy*dy;
-            if (r2 < h2) {
-              const w = h2 - r2;
-              const term = m * POLY6 * w * w * w;
-              const gj = gid[j];
-              if (gj === gi) {
-                rho += term;
-              } else if (isFluidI && j >= nFixed) {
-                const zi = bz[gi];
-                const zj = bz[gj];
-                const absZ = Math.abs(zi - zj);
-                const sI = Math.max(1, cmn[gi]);
-                const sJ = Math.max(1, cmn[gj]);
-                const zReach = Math.min(0.55, (Math.sqrt(sI) + Math.sqrt(sJ)) * 0.07);
-                if (absZ < zReach) {
-                  rho += 0.3 * (1 - absZ / zReach) * term;
-                }
-              }
-            }
-            j = cellNextArr[j];
-          }
-        }
-      }
-      if (rho < this.restDensity) rho = this.restDensity;
-      pden[i] = rho;
-      ppres[i] = this.gasK * (rho - this.restDensity);
-      // Compression ratio: 0 at rest density, rises as particle is squeezed.
-      const cRaw = rho / this.restDensity - 1.0;
-      this.compression[i] = cRaw > 3.0 ? 3.0 : (cRaw > 0 ? cRaw : 0);
-    }
-
-    // Reset per-blob inter-blob force accumulators
-    this.sumFrx.fill(0);
-    this.sumFry.fill(0);
-
-    // 2) Forces + heat exchange (inlined neighbor walk)
-    const visc = this._visc;
-    const repelPeak = this._repelPeak;
-    const repelOuter = this.cushionRange;
-    const repelOuter2 = repelOuter * repelOuter;
-    const barrierWidth = this._barrierWidth;
-    const cohScale = this._cohScale;
-    const tempRepel = this.tempRepelMult;
-    const poolDwellTau = this.poolDwellTau;
-    const poolBarrierFloor = this.poolBarrierFloor;
-    const buoK = this.buoyancyExp;
-    const buoDenom = this._buoDenom;
-    const buoTotal = this._buoTotal;
-    const localFraction = this._optLocalFraction !== undefined ? this._optLocalFraction : 0.33;
-    const springRest = this.springRest;
-    const springK = this._springK;
-    const springDamp = this._springDamp;
-    const springMaxStretch = this.springMaxStretch;
-    const springMin = this.springMin;
-    const springReach2 = this.springReach * this.springReach;
-    const interRatio = this.interDiffRatio;
-    const sumFrx = this.sumFrx, sumFry = this.sumFry;
-    const zoneDwell = this.zoneDwell;
-
-    // Pool-spring cosine ramp: spring stiffness blends from 1.0×
-    // above poolSpringLo to (1-atten)× below poolSpringHi.
-    const POOL_LO = this.poolSpringLo, POOL_HI = this.poolSpringHi, POOL_INV = 1.0 / (POOL_HI - POOL_LO);
-    const poolSpringAtten = this.poolSpringAtten;
-    for (let i = 0; i < n; i++) {
-      let fpx = 0, fpy = 0;
-      let fvx = 0, fvy = 0;
-      let fcx = 0, fcy = 0;
-      let frx = 0, fry = 0;
-      let dTsum = 0, neighCount = 0;
-      const xi = px[i], yi = py[i];
-      // Per-i "poolness" (cosine ramp on yi). Computed once outside the j-loop.
-      const _siRaw = (yi - POOL_LO) * POOL_INV;
-      const _si = _siRaw < 0 ? 0 : _siRaw > 1 ? 1 : _siRaw;
-      const poolI = 0.5 * (1 - Math.cos(Math.PI * _si));
-      const vxi = pvx[i], vyi = pvy[i];
-      const Pi = ppres[i];
-      const rhoi = pden[i];
-      const Ti = ptemp[i];
-      const gi = gid[i];
-
-      const cxI = Math.max(0, Math.min(gridW - 1, ((xi / cellSize) | 0) + 2));
-      const cyI = Math.max(0, Math.min(gridH - 1, ((yi / cellSize) | 0) + 2));
-      for (let ddy = -1; ddy <= 1; ddy++) {
-        const ny = cyI + ddy;
-        if (ny < 0 || ny >= gridH) continue;
-        for (let ddx = -1; ddx <= 1; ddx++) {
-          const nx = cxI + ddx;
-          if (nx < 0 || nx >= gridW) continue;
-          let j = cellHead[ny * gridW + nx];
-          while (j !== -1) {
-            if (j !== i) {
-              const dx = xi - px[j];
-              const dy = yi - py[j];
-              const r2 = dx*dx + dy*dy;
-              if (r2 < repelOuter2 && r2 > 1e-6) {
-                const r = Math.sqrt(r2);
-                const sameGroupJ = (gid[j] === gi);
-
-                // Inter-blob repulsion
-                if (!sameGroupJ) {
-                  const tDelta = Math.abs(Ti - ptemp[j]);
-                  const tBoost = 1.0 + tempRepel * tDelta;
-                  const u = (repelOuter - r) / barrierWidth;
-                  const dwell = (zoneDwell[i] + zoneDwell[j]) * 0.5;
-                  const dwellFactor = poolBarrierFloor + (1.0 - poolBarrierFloor) * Math.exp(-dwell / poolDwellTau);
-                  let zFactor = 1.0;
-                  if (i >= nFixed && j >= nFixed) {
-                    const zi = bz[gi];
-                    const gj = gid[j];
-                    const zj = bz[gj];
-                    const zDiff = zi - zj;
-                    const absZ = Math.abs(zDiff);
-                    const sI = Math.max(1, cmn[gi]);
-                    const sJ = Math.max(1, cmn[gj]);
-                    const zReach = Math.min(0.55, (Math.sqrt(sI) + Math.sqrt(sJ)) * 0.07);
-                    if (absZ >= zReach) {
-                      zFactor = 0;
-                    } else {
-                      const fade = 1 - absZ / zReach;
-                      zFactor = fade * (1 - 0.5 * zDiff / zReach);
-                    }
-                  }
-                  // Closing-speed boost
-                  const dvxR = vxi - pvx[j], dvyR = vyi - pvy[j];
-                  const closingSpeed = -(dvxR * dx + dvyR * dy) / r;
-                  const speedBoost = 1.0 + Math.max(0, closingSpeed) * 0.030;
-                  const forceMag = repelPeak * tBoost * dwellFactor * zFactor * speedBoost * u * u;
-                  const force = forceMag / r;
-                  const fdx = force * dx, fdy = force * dy;
-                  frx += localFraction * fdx;
-                  fry += localFraction * fdy;
-                  sumFrx[gi] += (1 - localFraction) * fdx;
-                  sumFry[gi] += (1 - localFraction) * fdy;
-                }
-
-                // Standard SPH at r < h
-                if (r2 < h2) {
-                  let diffWeight;
-                  if (sameGroupJ) {
-                    const rhoj = pden[j];
-                    const pTerm = -m * (Pi + ppres[j]) / (2 * rhoj) * SPIKY_GRAD * (h - r) * (h - r) / r;
-                    fpx += pTerm * dx;
-                    fpy += pTerm * dy;
-                    const vTerm = visc * m / rhoj * VISC_LAP * (h - r);
-                    fvx += vTerm * (pvx[j] - vxi);
-                    fvy += vTerm * (pvy[j] - vyi);
-                    const q = r / h;
-                    let C;
-                    if (q < 0.5) C = 2 * (1-q)*(1-q)*(1-q) * q*q*q - 1.0/64.0;
-                    else         C = (1-q)*(1-q)*(1-q) * q*q*q;
-                    const cTerm = -cohScale * m * 380 * C / r;
-                    fcx += cTerm * dx;
-                    fcy += cTerm * dy;
-                    diffWeight = 1.0;
-                  } else {
-                    diffWeight = interRatio;
-                  }
-                  const wT = (h - r) / h;
-                  dTsum += (ptemp[j] - Ti) * wT * diffWeight;
-                  neighCount++;
-                }
-
-                // Long-reach spring (same-group only)
-                if (sameGroupJ && r2 < springReach2) {
-                  const dvx = vxi - pvx[j];
-                  const dvy = vyi - pvy[j];
-                  const vAxial = (dvx * dx + dvy * dy) / r;
-                  // Smoothly attenuate spring force as BOTH particles enter the
-                  // pool zone. effSpringK glides 1.0× → 0.5× as poolI·poolJ → 1.
-                  const _sjRaw = (py[j] - POOL_LO) * POOL_INV;
-                  const _sj = _sjRaw < 0 ? 0 : _sjRaw > 1 ? 1 : _sjRaw;
-                  const poolJ = 0.5 * (1 - Math.cos(Math.PI * _sj));
-                  const effSpringK = springK * (1 - poolSpringAtten * poolI * poolJ);
-                  if (r > springRest) {
-                    const rawStretch = r - springRest;
-                    const stretch = rawStretch < springMaxStretch ? rawStretch : springMaxStretch;
-                    const sdMag = -effSpringK * stretch * stretch / springMaxStretch - springDamp * vAxial;
-                    fcx += sdMag * dx / r;
-                    fcy += sdMag * dy / r;
-                  } else if (r < springMin) {
-                    const compress = springMin - r;
-                    const sdMag = effSpringK * compress * compress / springMaxStretch - springDamp * vAxial;
-                    fcx += sdMag * dx / r;
-                    fcy += sdMag * dy / r;
-                  }
-                }
-              }
-            }
-            j = cellNextArr[j];
-          }
-        }
-      }
-
-      // Buoyancy
-      const tNorm = Math.max(0, Math.min(1, (Ti - this.tAmbient) / (1.0 - this.tAmbient)));
-      const riseFactor = (Math.exp(buoK * tNorm) - 1) / buoDenom;
-      const densRatio = this.coolDensityExcess - buoTotal * riseFactor;
-      const effG = this.gravity * densRatio * this.gravityScale;
-
-      this.fx[i] = (fpx + fvx) / rhoi + fcx + frx;
-      this.fy[i] = (fpy + fvy) / rhoi + fcy + effG + fry;
-      this.dT[i] = (neighCount > 0 ? dTsum / neighCount : 0) * (this.heatDiff * this.heatDiffScale);
-    }
-
-    // Per-blob redistribution
-    {
-      const K = this.MAX_BLOBS;
-      const fX = this.sumRoundX, fY = this.sumRoundY;
-      for (let k = 0; k < K; k++) {
-        const cnt = cmn[k];
-        if (cnt > 0) {
-          fX[k] = sumFrx[k] / cnt;
-          fY[k] = sumFry[k] / cnt;
-        } else {
-          fX[k] = 0; fY[k] = 0;
-        }
-      }
-      for (let i = nFixed; i < n; i++) {
-        const g = gid[i];
-        this.fx[i] += fX[g];
-        this.fy[i] += fY[g];
-      }
-    }
-
-    // 3a) Integrate pool/wall particles via heavily-damped harmonic
-    // oscillator anchored at each particle's home position. Forces from the
-    // fluid are honored, but the spring + heavy velocity damping + hard
-    // clamp keep displacement to a few pixels.
-    {
-      const wallK    = this.wallSpringK;
-      const wallDamp = this.wallDampFactor;
-      const wallMaxD = this.wallMaxDisplace;
-      const wallMaxD2 = wallMaxD * wallMaxD;
-      const homeX = this.homeX, homeY = this.homeY;
-      const invMassW = 1.0 / this.mass;
-      for (let i = 0; i < nFixed; i++) {
-        const dxh = px[i] - homeX[i];
-        const dyh = py[i] - homeY[i];
-        const fxw = this.fx[i] - wallK * dxh;
-        const fyw = this.fy[i] - wallK * dyh;
-        pvx[i] = (pvx[i] + fxw * dt * invMassW) * wallDamp;
-        pvy[i] = (pvy[i] + fyw * dt * invMassW) * wallDamp;
-        px[i] += pvx[i] * dt;
-        py[i] += pvy[i] * dt;
-        // Hard clamp: never let a pool particle drift far from home.
-        const ndx = px[i] - homeX[i];
-        const ndy = py[i] - homeY[i];
-        const nd2 = ndx * ndx + ndy * ndy;
-        if (nd2 > wallMaxD2) {
-          const s = wallMaxD / Math.sqrt(nd2);
-          px[i] = homeX[i] + ndx * s;
-          py[i] = homeY[i] + ndy * s;
-          pvx[i] = 0;
-          pvy[i] = 0;
-        }
-      }
-    }
-
-    // 3b) Integrate fluid particles
-    const fluidBotY = SIM_H * 0.92;
-    const stickyTop = fluidBotY - this.stickyHeight;
-    const stickyDt = this.stickyStrength * dt;
-    const stickyPullDt = this.stickyPull * this.stickyStrength * dt;
-    // Ceiling cushion — back-pressure from incompressible fluid at top
-    const ceilHeight = 60;
-    const ceilBot = SIM_H * 0.07 + ceilHeight;
-    const ceilDrag = 0.30;
-    const ceilPush = 8.0;
-    const ceilDragDt = ceilDrag * dt;
-    const ceilPushDt = ceilPush * dt;
-    const invMass = 1.0 / this.mass;
-    for (let i = nFixed; i < n; i++) {
-      pvx[i] += this.fx[i] * dt * invMass;
-      pvy[i] += this.fy[i] * dt * invMass;
-      pvx[i] *= 0.9995;
-      pvy[i] *= 0.9995;
-      if (py[i] > stickyTop) {
-        const t = Math.min(1, (py[i] - stickyTop) / this.stickyHeight);
-        const drag = Math.max(0, 1 - stickyDt * t);
-        pvx[i] *= drag;
-        pvy[i] *= drag;
-        pvy[i] += stickyPullDt * t;
-      }
-      // Ceiling cushion: y-only drag + downward nudge
-      if (py[i] < ceilBot) {
-        const t = Math.min(1, (ceilBot - py[i]) / ceilHeight);
-        const drag = Math.max(0, 1 - ceilDragDt * t);
-        pvy[i] *= drag;
-        pvy[i] += ceilPushDt * t;
-      }
-      const vmax = 600;
-      const vlen2 = pvx[i]*pvx[i] + pvy[i]*pvy[i];
-      if (vlen2 > vmax*vmax) {
-        const s = vmax / Math.sqrt(vlen2);
-        pvx[i] *= s; pvy[i] *= s;
-      }
-      px[i] += pvx[i] * dt;
-      py[i] += pvy[i] * dt;
-    }
-
-    // 4) Heat sources & diffusion
-    const hr = this.heatRate * this.heatScale;
-    const bulbY = SIM_H * 0.93;
-    const bH = this.bulbHeight;
-    const cxFluid = SIM_W * 0.5;
-    const edgeF = this.edgeFactor;
-    this.simTime += dt;
-    const nAmt = this.heatNoise;
-    const ph1 = this._ph1, ph2 = this._ph2, ph3 = this._ph3;
-    const a1 = this._a1, a2 = this._a2, a3 = this._a3;
-    const k1 = this._k1, k2 = this._k2, k3 = this._k3;
-
-    for (let i = 0; i < n; i++) {
-      const distAbove = bulbY - py[i];
-      if (distAbove > -10 && distAbove < bH) {
-        const v = 1 - Math.max(0, distAbove) / bH;
-        const halfW = Math.max(20, bottleHalfWidth(py[i]));
-        const xNorm = Math.min(1, Math.abs(px[i] - cxFluid) / halfW);
-        const hFactor = 1 - (1 - edgeF) * xNorm * xNorm;
-        let noiseMul = 1.0;
-        if (nAmt > 0) {
-          const sn = (
-            a1 * Math.sin(px[i] * k1 + ph1) +
-            a2 * Math.sin(px[i] * k2 - py[i] * 0.012 + ph2) +
-            a3 * Math.sin(px[i] * k3 + py[i] * 0.018 + ph3)
-          );
-          noiseMul = Math.max(0, 1 + nAmt * sn);
-        }
-        ptemp[i] += hr * v * v * hFactor * noiseMul * dt;
-      }
-      const blobN = Math.max(1, cmn[gid[i]]);
-      const massFactor = Math.max(0.5, Math.sqrt(blobN / this.coolMassRef));
-      const ambEff = this.ambientCool * this.ambientCoolScale;
-      ptemp[i] -= (ambEff / massFactor) * (ptemp[i] - this.tAmbient) * dt;
-      ptemp[i] += this.dT[i] * dt;
-      if (ptemp[i] < 0) ptemp[i] = 0;
-      if (ptemp[i] > 1.5) ptemp[i] = 1.5;
-
-      if (py[i] > this.poolZoneTop) {
-        const z = Math.min(1, (py[i] - this.poolZoneTop) / (this.poolZoneFloor - this.poolZoneTop));
-        zoneDwell[i] += z * dt;
-      } else {
-        zoneDwell[i] = 0;
-      }
-    }
-
-    // 5) Boundary handling
-    const fluidTop = SIM_H * 0.07;
-    const fluidBot = SIM_H * 0.92;
-    for (let i = nFixed; i < n; i++) {
-      if (py[i] < fluidTop) {
-        py[i] = fluidTop;
-        pvy[i] = Math.abs(pvy[i]) * 0.3;
-      } else if (py[i] > fluidBot) {
-        py[i] = fluidBot;
-        pvy[i] = -Math.abs(pvy[i]) * 0.3;
-      }
-      const halfW = bottleHalfWidth(py[i]);
-      const cx = SIM_W * 0.5;
-      const limit = halfW - 4;
-      if (limit < 4) continue;
-      const off = px[i] - cx;
-      if (off > limit) {
-        px[i] = cx + limit;
-        pvx[i] = -Math.abs(pvx[i]) * 0.3;
-      } else if (off < -limit) {
-        px[i] = cx - limit;
-        pvx[i] = Math.abs(pvx[i]) * 0.3;
-      }
-    }
-  }
-
-  // --- Mouse "grab" interaction ---------------------------------
-  // Pull captured particles toward a *smoothed* target (which lags
-  // behind the raw cursor for drag-feel). Each particle carries a
-  // Gaussian weight `w` baked in at pickup time — far-edge particles
-  // are gently nudged; central ones are tugged firmly. Called once
-  // per sub-step after step(), so the impulse stacks with the regular
-  // SPH integration and the result is clamped by the next step()'s
-  // boundary pass.
-  applyGrab(dt) {
-    const g = this.grab;
-    if (!g.active || g.particles.length === 0) return;
-    // 1) Drive the smoothed target toward the raw cursor. The longer
-    //    the time constant, the more lag the user feels.
-    const sBlend = 1.0 - Math.exp(-g.targetSmoothK * dt);
-    g.stx += (g.tx - g.stx) * sBlend;
-    g.sty += (g.ty - g.sty) * sBlend;
-
-    const stx = g.stx, sty = g.sty;
-    const tvx = g.tvx, tvy = g.tvy;
-    const springK = g.springK;
-    const damp = g.damp;
-    const vCouple = g.vCouple;
-    const nFixed = this.nFixed;
-    const px = this.x, py = this.y;
-    const pvx = this.vx, pvy = this.vy;
-    const list = g.particles;
-    for (let p = 0; p < list.length; p++) {
-      const rec = list[p];
-      const i = rec.idx;
-      if (i < nFixed || i >= this.n) continue;
-      const w = rec.w;
-      const dx = (stx + rec.offX) - px[i];
-      const dy = (sty + rec.offY) - py[i];
-      // Weighted spring pull toward the smoothed target.
-      const k = w * springK;
-      pvx[i] += k * dx * dt;
-      pvy[i] += k * dy * dt;
-      // Pure viscous damping toward zero — scaled by weight so far-edge
-      // particles barely feel it. This is what makes the grab "draggy":
-      // grabbed particles lose their own SPH momentum as they're held.
-      const decay = Math.exp(-damp * dt * w);
-      pvx[i] *= decay;
-      pvy[i] *= decay;
-      // Add a small fraction of the cursor's velocity back — so a quick
-      // flick still imparts momentum, but the dominant feel is drag.
-      const inject = (1.0 - decay) * vCouple;
-      pvx[i] += tvx * inject;
-      pvy[i] += tvy * inject;
-    }
-  }
-
-  // Pick up fluid particles near (sx, sy). Each captured particle keeps
-  // its offset from the click point (so the cluster keeps its shape
-  // while being dragged) and a Gaussian weight that smoothly fades the
-  // grab effect from centre to edge.
-  beginGrab(sx, sy) {
-    const g = this.grab;
-    const r2 = g.radius * g.radius;
-    const inv2s2 = 1.0 / (2.0 * g.sigma * g.sigma);
-    const thresh = g.weightThresh;
-    const list = [];
-    const cap = g.maxParticles;
-    for (let i = this.nFixed; i < this.n && list.length < cap; i++) {
-      const dx = this.x[i] - sx;
-      const dy = this.y[i] - sy;
-      const d2 = dx * dx + dy * dy;
-      if (d2 >= r2) continue;
-      const w = Math.exp(-d2 * inv2s2);
-      if (w < thresh) continue;
-      list.push({ idx: i, offX: dx, offY: dy, w });
-    }
-    g.particles = list;
-    g.tx = sx;  g.ty = sy;
-    g.stx = sx; g.sty = sy;        // start smoothed target at the click point
-    g.tvx = 0;  g.tvy = 0;
-    g.active = list.length > 0;
-    return g.active;
-  }
-
-  // Update the cursor target; newVx/newVy are the raw cursor velocity
-  // in sim px/s (caller supplies — easy to compute from dt). We
-  // additionally low-pass filter that here so jittery hand motion
-  // doesn't translate into pixel-scale velocity spikes.
-  updateGrab(sx, sy, newVx, newVy) {
-    const g = this.grab;
-    if (!g.active) return;
-    g.tx = sx; g.ty = sy;
-    const blend = 0.3;             // a touch heavier filter than before
-    g.tvx = g.tvx * (1 - blend) + newVx * blend;
-    g.tvy = g.tvy * (1 - blend) + newVy * blend;
-  }
-
-  endGrab() {
-    this.grab.active = false;
-    this.grab.particles.length = 0;
-    this.grab.tvx = 0; this.grab.tvy = 0;
-  }
-}
-
-// UMD export — works as both Node module and browser script
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { SPH, SIM_W, SIM_H, bottleHalfFrac, bottleHalfWidth };
-}
-</script>
-<script>
-// ============================================================
-//  Lava-lamp WebGL shaders — separated for modularity
-//  Includes physically-based paraffin wax refractivity (n ≈ 1.43)
-// ============================================================
-
-const VERTEX_SHADER = `#version 300 es
-in vec2 a_pos;
-void main(){ gl_Position = vec4(a_pos, 0.0, 1.0); }`;
-
-function fragmentShaderSource() {
-  return `#version 300 es
-precision highp float;
-
-uniform sampler2D uParticles;
-uniform sampler2D uCellRange;   // RGBA32F: r=start, g=count per grid cell
-uniform int   uCount;
-uniform vec2  uSim;     // simulation domain (px)
-uniform vec2  uRes;     // canvas size (px)
-uniform float uH;       // smoothing radius (sim px) — also = cellSize
-uniform ivec2 uGridDim; // active grid (cells wide, cells tall)
-uniform vec3  uBg;
-uniform vec3  uCold;
-uniform vec3  uHot;
-uniform float uGlow;
-uniform float uTime;
-uniform float uBlobZ[32];
-uniform float uBlobSize[32];
-uniform int   uPoolGroupId;
-uniform vec3  uCompressColor;  // accent color for high-compression zones
-uniform sampler2D uColMass;   // 2D mass grid (NUM_COLS × NUM_ROWS), normalized 0-1
-uniform int   uNumCols;       // grid columns (50)
-uniform int   uNumRows;       // grid rows (30)
-
-out vec4 fragColor;
-
-// -------- Physical constants --------
-// Refractive index of liquid paraffin wax at ~100°C
-const float N_WAX = 1.43;
-// Surrounding fluid (water/glycol mixture) — approximately
-const float N_FLUID = 1.34;
-// Relative index at the wax-fluid interface
-const float N_REL = N_WAX / N_FLUID;
-
-// Schlick's approximation for Fresnel reflectance
-// R0 = ((n1 - n2) / (n1 + n2))^2
-const float R0 = ((N_WAX - N_FLUID) * (N_WAX - N_FLUID)) /
-                 ((N_WAX + N_FLUID) * (N_WAX + N_FLUID));
-
-float fresnelSchlick(float cosTheta) {
-  float x = 1.0 - cosTheta;
-  return R0 + (1.0 - R0) * x * x * x * x * x;
-}
-
-// Snell's law refraction amount — returns cos(theta_t)
-// for simulating the visual compression of internal features
-float snellRefract(float cosI) {
-  float sinI2 = 1.0 - cosI * cosI;
-  float sinT2 = sinI2 / (N_REL * N_REL);
-  if (sinT2 >= 1.0) return 0.0; // total internal reflection
-  return sqrt(1.0 - sinT2);
-}
-
-// Match JS bottleHalfFrac exactly
-float bottleHalfFrac(float t) {
-  if (t < 0.03) return 0.0;
-  if (t < 0.06) {
-    float u = (t - 0.03) / 0.03;
-    return 0.247 * (u * u * (3.0 - 2.0 * u));
-  }
-  if (t < 0.82) {
-    float u = (t - 0.06) / 0.76;
-    float e = u * u * (3.0 - 2.0 * u);
-    return mix(0.247, 0.50, e);
-  }
-  if (t < 0.93) {
-    float u = (t - 0.82) / 0.11;
-    float e = u * u * (3.0 - 2.0 * u);
-    return mix(0.50, 0.40, e);
-  }
-  if (t < 0.96) {
-    float u = (t - 0.93) / 0.03;
-    float e = u * u * (3.0 - 2.0 * u);
-    return mix(0.40, 0.32, e);
-  }
-  if (t < 0.99) {
-    float u = (t - 0.96) / 0.03;
-    return 0.32 * (1.0 - u);
-  }
-  return 0.0;
-}
-
-float hash(vec2 p) {
-  p = fract(p * vec2(123.34, 456.21));
-  p += dot(p, p + 45.32);
-  return fract(p.x * p.y);
-}
-
-void main() {
-  vec2 pix = gl_FragCoord.xy;
-  vec2 simPos = vec2(pix.x, uRes.y - pix.y) * (uSim / uRes);
-
-  float t = simPos.y / uSim.y;
-  float halfFrac = bottleHalfFrac(t);
-  float halfW = halfFrac * uSim.x;
-  float cx = uSim.x * 0.5;
-  float distFromCenter = abs(simPos.x - cx);
-
-  // -------- Per-blob metaball field, temperature & compression ---------
-  const int MAX_G = 32;
-  float fields[MAX_G];
-  float wtemps[MAX_G];
-  float wcomps[MAX_G];  // weighted compression per group
-  for (int g = 0; g < MAX_G; g++) { fields[g] = 0.0; wtemps[g] = 0.0; wcomps[g] = 0.0; }
-  float h2 = uH * uH;
-
-  // Spatial-grid lookup: only visit particles in the 3x3 cell neighborhood
-  // around this pixel. cellSize == uH, so any particle within the kernel
-  // radius is guaranteed to live in one of these 9 cells.
-  ivec2 cellHere = ivec2(floor(simPos / uH));
-  for (int dy = -1; dy <= 1; dy++) {
-    for (int dx = -1; dx <= 1; dx++) {
-      ivec2 c = cellHere + ivec2(dx, dy);
-      if (c.x < 0 || c.y < 0 || c.x >= uGridDim.x || c.y >= uGridDim.y) continue;
-      vec2 range = texelFetch(uCellRange, c, 0).rg;
-      int start = int(range.x);
-      int count = int(range.y);
-      // Inner bound is the global particle cap so the GLSL compiler is
-      // happy with a static loop bound; the early break is the real exit.
-      for (int j = 0; j < 700; j++) {
-        if (j >= count) break;
-        int idx = start + j;
-        vec4 part = texelFetch(uParticles, ivec2(idx, 0), 0);
-        float comp = texelFetch(uParticles, ivec2(idx, 1), 0).r;  // compression from row 1
-        vec2 d = simPos - part.xy;
-        float r2 = dot(d, d);
-        if (r2 < h2) {
-          float w = 1.0 - r2 / h2;
-          float k = w * w * w;
-          int g = int(part.w + 0.5);
-          g = clamp(g, 0, MAX_G - 1);
-          fields[g] += k;
-          wtemps[g] += k * part.z;
-          wcomps[g] += k * comp;
-        }
-      }
-    }
-  }
-
-  // Pick the dominant blob at this pixel
-  const float SHOW_THRESH = 0.55;
-  int dom = 0;
-  float maxF = 0.0;
-  for (int g = 0; g < MAX_G; g++) {
-    if (fields[g] > maxF) { maxF = fields[g]; dom = g; }
-  }
-  // Override by z among blobs that are "visible"
-  int frontDom = -1;
-  float frontZ = -1.0;
-  int otherDom = -1;
-  float otherF = 0.0;
-  for (int g = 1; g < MAX_G; g++) {
-    if (fields[g] > SHOW_THRESH) {
-      if (uBlobZ[g] > frontZ) {
-        otherDom = frontDom; otherF = (frontDom >= 0) ? fields[frontDom] : 0.0;
-        frontDom = g; frontZ = uBlobZ[g];
-      } else if (fields[g] > otherF) {
-        otherDom = g; otherF = fields[g];
-      }
-    }
-  }
-  if (frontDom >= 0) dom = frontDom;
-  float field = fields[dom];
-  float temp = field > 0.001 ? (wtemps[dom] / field) : 0.18;
-  // Average compression for the dominant blob at this pixel
-  float compAvg = field > 0.001 ? (wcomps[dom] / field) : 0.0;
-  // Smooth onset: ramp from 0 at comp=0.3 to 1 at comp=1.5
-  // Log scale: compresses high values so medium blobs are visible
-  // but large blobs don't blow out. Range: ~0 at rest → ~0.7 at heavy compression.
-  float compRaw = max(compAvg - 0.2, 0.0);  // dead zone below 0.2
-  float compIntensity = log(1.0 + compRaw * 3.0) / log(4.0);
-
-  // -------- Bottle / fluid masks ---------
-  float glassEdgeSoft = 1.5;
-  float insideGlass = 1.0 - smoothstep(halfW - glassEdgeSoft, halfW + glassEdgeSoft, distFromCenter);
-  insideGlass *= step(0.001, halfFrac);
-
-  // -------- Background inside glass ---------
-  float bottomT = clamp((t - 0.55) / 0.40, 0.0, 1.0);
-  float bulb = pow(clamp((t - 0.78) / 0.16, 0.0, 1.0), 1.7) * uGlow;
-  float horiz = 1.0 - smoothstep(0.0, halfW * 0.95, distFromCenter);
-  bulb *= mix(0.35, 1.0, horiz);
-
-  vec3 warmTint = mix(uCold, uHot, 0.65) * 1.2;
-  vec3 fluidBg = mix(uBg, uBg * 1.4 + warmTint * 0.35, bottomT);
-  fluidBg = mix(fluidBg, warmTint, bulb * 0.55);
-  fluidBg *= mix(0.85, 1.0, smoothstep(0.0, 1.0, t));
-
-  // Permanent opaque pool block
-  float poolBlockMask = smoothstep(0.89, 0.90, t);
-  vec3 poolBlockColor = mix(uCold, uHot, 0.45) * mix(0.55, 1.15, pow(t, 1.4));
-  fluidBg = mix(fluidBg, poolBlockColor, poolBlockMask);
-
-  // -------- Volumetric light from below ---------
-  // The texture holds per-column light intensity: bright where light from
-  // the pool passes through unobstructed, dark where wax blocks it.
-  // Horizontally blurred on CPU with mass-dependent kernel for refraction.
-  if (uNumCols > 0 && uNumRows > 0) {
-    float colU = simPos.x / uSim.x;
-    float colV = 1.0 - t;   // texV: 0=top of lamp, 1=bottom
-    float light = texture(uColMass, vec2(colU, colV)).r;
-
-    // God ray: additive warm glow scaled by bulb glow slider
-    vec3 rayColor = mix(uHot, vec3(1.0, 0.97, 0.90), 0.3);
-    // Envelope: strong in lower-mid bulb, gentler fade toward top
-    float envelope = smoothstep(0.93, 0.65, t) * smoothstep(0.02, 0.15, t);
-    float glowScale = uGlow / 0.38;  // normalized so default glow=0.55 → 1.0
-    fluidBg += rayColor * light * envelope * 0.80 * glowScale;
-
-    // Darken where light is blocked (1 - light = shadow)
-    float shadow = (1.0 - light) * envelope * 0.45 * glowScale;
-    fluidBg *= 1.0 - shadow;
-  }
-
-  // -------- Wax shading from temperature ---------
-  float tempN = clamp((temp - 0.18) / 0.85, 0.0, 1.0);
-  vec3 waxColor = mix(uCold, uHot, smoothstep(0.0, 1.0, tempN));
-  float lightFromBelow = mix(0.55, 1.15, pow(t, 1.4));
-  waxColor *= lightFromBelow;
-  waxColor = pow(waxColor, vec3(0.95));
-
-  // -------- Compression: boost existing color ---------
-  // Under pressure, brighten and saturate the current wax color
-  // rather than injecting a foreign accent. This looks natural
-  // at any temperature — hot wax glows hotter, cool wax gets richer.
-  float compLuma = dot(waxColor, vec3(0.299, 0.587, 0.114));
-  vec3 compSaturated = waxColor / max(compLuma, 0.01) * compLuma;
-  // Boost: brighten by up to 40% and increase saturation
-  waxColor = mix(waxColor, waxColor * 1.4 + (waxColor - vec3(compLuma)) * 0.5, compIntensity * 0.6);
-
-  // -------- Physically-based spherical refractivity ---------
-  float blobSz = clamp(uBlobSize[dom], 0.0, 1.0);
-
-  float threshold = 0.55;
-  float alpha = smoothstep(threshold - 0.18, threshold + 0.04, field);
-
-  // shell: 1 at the metaball boundary, 0 deep inside
-  float centerness = smoothstep(threshold + 0.20, threshold + 0.55, field);
-  float shell = 1.0 - centerness;
-
-  // cosTheta: 1 at center (looking straight through), 0 at rim (glancing)
-  float cosTheta = centerness;
-
-  // ---- Fresnel reflectance at the wax-fluid interface ----
-  float fresnel = fresnelSchlick(cosTheta);
-
-  // ---- Pressure rim glow ----
-  // Under compression, the rim brightens with the wax's own color
-  // instead of going dark from Fresnel — like the wax is glowing hot.
-  float pressureRim = shell * compIntensity * 1.8;
-  waxColor += waxColor * pressureRim * 0.5;
-
-  // Edge darkening from Fresnel — reduced under compression.
-  float edgeDarken = 1.0 - fresnel * 0.6 * blobSz * (1.0 - compIntensity * 0.7);
-  waxColor *= edgeDarken;
-
-  // ---- Refraction-based specular highlight ----
-  float cosRefracted = snellRefract(cosTheta);
-  float causticConcentration = cosTheta / max(0.01, cosRefracted);
-  // Under compression: specular intensifies
-  float compSpecBoost = 1.0 + compIntensity * 1.5;
-  float specBase = pow(centerness, mix(5.0, 2.5, blobSz) * (1.0 - compIntensity * 0.15));
-  float specStrength = mix(0.08, 0.25, blobSz) * compSpecBoost;
-  float highlight = specBase * specStrength * (1.0 - fresnel) *
-                    min(2.0, causticConcentration);
-  // Specular tinted by the wax color itself — warm highlight on warm wax,
-  // cool highlight on cool wax.
-  vec3 specTint = mix(vec3(1.0, 0.95, 0.85), waxColor * 2.0 + vec3(0.3), compIntensity * 0.6);
-  waxColor += specTint * highlight;
-
-  // ---- Uniform translucency + pressure opacity ----
-  // Base 10% transparency, plus a soft center fade so the core
-  // of each blob feels translucent rather than a solid disc.
-  alpha *= 0.82;
-  alpha *= 1.0 - centerness * 0.30;
-  alpha *= max(1.0 - compIntensity * 0.65, 0.40);  // clip at 60% transparency
-
-  // Inner core detail
-  float coreAlpha = smoothstep(threshold + 0.05, threshold + 0.55, field);
-  vec3 inner = mix(waxColor, waxColor * 1.25 + uHot * 0.18 * tempN, coreAlpha);
-
-  // Overlap layering: front blob over back blob
-  if (otherDom >= 0) {
-    float otherFieldRaw = fields[otherDom];
-    float otherTemp = otherFieldRaw > 0.001 ? (wtemps[otherDom] / otherFieldRaw) : 0.18;
-    float otherTempN = clamp((otherTemp - 0.18) / 0.85, 0.0, 1.0);
-    vec3 otherWax = mix(uCold, uHot, smoothstep(0.0, 1.0, otherTempN)) * lightFromBelow;
-    float otherAlpha = smoothstep(threshold - 0.18, threshold + 0.04, otherFieldRaw);
-    otherAlpha *= 0.90;
-    fluidBg = mix(fluidBg, otherWax, otherAlpha);
-  }
-
-  // Mix wax over fluid bg
-  vec3 inside = mix(fluidBg, inner, alpha);
-
-  // -------- Bottle frame ---------
-  float capTop  = smoothstep(0.05, 0.045, t);
-  float capBot  = smoothstep(0.95, 0.955, t);
-
-  vec3 topCapCol = vec3(0.06, 0.05, 0.10);
-  float neckBand = smoothstep(0.030, 0.035, t) * (1.0 - smoothstep(0.045, 0.050, t));
-  topCapCol += vec3(0.10, 0.08, 0.14) * neckBand;
-  float capLight = smoothstep(0.4, 0.0, distFromCenter / (uSim.x * 0.3));
-  topCapCol *= mix(1.0, 1.5, capLight * (1.0 - smoothstep(0.0, 0.05, t)));
-
-  vec3 botCapCol = mix(vec3(0.07, 0.04, 0.09), vec3(0.16, 0.10, 0.13), smoothstep(0.95, 1.00, t));
-  float baseGlow = smoothstep(0.99, 0.95, t) * uGlow;
-  botCapCol += uHot * baseGlow * 0.4;
-  botCapCol += uCold * baseGlow * 0.18;
-  float slit = smoothstep(0.948, 0.955, t) * (1.0 - smoothstep(0.955, 0.962, t));
-  botCapCol += uHot * slit * uGlow * 1.4;
-
-  vec3 frameOut = vec3(0.0);
-
-  vec3 col;
-  if (t < 0.05) {
-    col = topCapCol;
-  } else if (t > 0.95) {
-    col = botCapCol;
-  } else {
-    col = mix(frameOut, inside, insideGlass);
-    float rimDist = halfW - distFromCenter;
-    float rim = smoothstep(0.0, 1.5, rimDist) * (1.0 - smoothstep(1.5, 4.0, rimDist));
-    col += vec3(0.22, 0.18, 0.30) * rim * 0.45;
-    float streakX = clamp(1.0 - abs((simPos.x - (cx - halfW * 0.55)) / 6.0), 0.0, 1.0);
-    float streakY = smoothstep(0.10, 0.40, t) * (1.0 - smoothstep(0.40, 0.62, t));
-    col += vec3(0.85, 0.80, 1.0) * streakX * streakY * 0.10 * insideGlass;
-  }
-
-  // Soft outer glow
-  float outerGlow = smoothstep(0.96, 0.55, t) * uGlow * 0.18;
-  outerGlow *= smoothstep(uSim.x * 0.9, 0.0, distFromCenter);
-  col += uHot * outerGlow * (1.0 - insideGlass) * 0.25;
-
-  // Vignette
-  vec2 ndc = (pix / uRes) - 0.5;
-  float vig = 1.0 - smoothstep(0.45, 0.95, length(ndc) * 1.2);
-  col *= mix(0.7, 1.0, vig);
-
-  // Film grain
-  float g = (hash(pix + uTime * 0.01) - 0.5) * 0.012;
-  col += g;
-
-  fragColor = vec4(col, 1.0);
-}
-`;
-}
-
-// UMD export
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { VERTEX_SHADER, fragmentShaderSource };
-}
-</script>
+<script src="sim.js"></script>
+<script src="shaders.js"></script>
 <script>
 "use strict";
 
 // SPH simulation imported from sim.js
 // Shaders imported from shaders.js
 
+// Variable-radius triangular blur along one row/column, O(1) per sample
+// via double prefix sums (a triangle filter is a box filter applied twice).
+// Equivalent to the direct sum
+//   dst[i] = Σ_{|d|<=R_i, 0<=i+d<n} (1-|d|/(R_i+1))·src[i+d] / Σ weights
+// but independent of R, so wide blurs cost the same as narrow ones.
+function makeTriBlur(n, maxR) {
+  const PAD = maxR + 2, L = n + 2 * PAD + 2;
+  const P1 = new Float64Array(L + 1), Q = new Float64Array(L + 2);
+  const den = new Float64Array((maxR + 1) * n);   // weight sums (src ≡ 1)
+  function prefix(src, off, stride) {
+    let acc = 0;
+    for (let e = 0; e <= L; e++) {
+      P1[e] = acc;                                  // Σ_{k < e-PAD} src[k]
+      const k = e - PAD;
+      if (k >= 0 && k < n) acc += src[off + k * stride];
+    }
+    let q = 0;
+    for (let e = 0; e <= L; e++) { Q[e] = q; q += P1[e]; }
+    Q[L + 1] = q;
+  }
+  const sumP1 = (a, b) => Q[b + PAD + 1] - Q[a + PAD];      // Σ_{j=a..b} P1[j]
+  const tri = (i, R) => sumP1(i + 1, i + R + 1) - sumP1(i - R, i);
+  const ones = new Float32Array(n).fill(1);
+  prefix(ones, 0, 1);
+  for (let R = 0; R <= maxR; R++) for (let i = 0; i < n; i++) den[R * n + i] = tri(i, R);
+  // radius: a number, or an Int array laid out like src
+  return function blur(src, off, stride, radius, dst) {
+    prefix(src, off, stride);
+    const fixedR = typeof radius === "number" ? radius : -1;
+    for (let i = 0; i < n; i++) {
+      const idx = off + i * stride;
+      const R = fixedR >= 0 ? fixedR : radius[idx];
+      dst[idx] = R === 0 ? src[idx] : tri(i, R) / den[R * n + i];
+    }
+  };
+}
+
 // ----------------- WebGL Renderer -----------------------------
 class MetaballRenderer {
   constructor(canvas, maxParticles) {
     this.canvas = canvas;
     this.maxParticles = maxParticles;
-    const gl = canvas.getContext("webgl2", { alpha: false, antialias: true });
+    // No MSAA: we draw a single fullscreen quad, so there are no geometry
+    // edges to antialias — it would only cost bandwidth on mobile GPUs.
+    const gl = canvas.getContext("webgl2", {
+      alpha: false, antialias: false, powerPreference: "high-performance",
+    });
     if (!gl) throw new Error("WebGL2 is required for this lava lamp.");
     // Need float textures (core in WebGL2; need EXT to actually use as samplable, but RGBA32F sampling NEAREST is core)
     if (!gl.getExtension("EXT_color_buffer_float") && !gl.getExtension("OES_texture_float_linear")) {
@@ -1988,9 +477,9 @@ class MetaballRenderer {
     gl.enableVertexAttribArray(aPos);
     gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
-    // Particle texture (2 rows):
-    //   Row 0: (x, y, temperature, groupId) per particle
-    //   Row 1: (compression, 0, 0, 0) per particle
+    // Particle texture (1 row): (x, y, temperature, groupId + compression/4)
+    // per particle. Compression (0..3) rides in the fractional part of the
+    // group id so the shader needs one texel fetch per particle, not two.
     // Particles are uploaded each frame in cell-sorted order so the
     // shader can do an O(1) range lookup per cell.
     this.tex = gl.createTexture();
@@ -1999,10 +488,9 @@ class MetaballRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, maxParticles, 2, 0, gl.RGBA, gl.FLOAT, null);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, maxParticles, 1, 0, gl.RGBA, gl.FLOAT, null);
 
     this.pixData = new Float32Array(maxParticles * 4);
-    this.compData = new Float32Array(maxParticles * 4);  // row 1: compression
 
     // -------- Spatial grid (CPU → shader) --------
     // cellSize equals the kernel radius h_render = sim.h * renderScale.
@@ -2055,13 +543,25 @@ class MetaballRenderer {
     this.colMassData = new Float32Array(this.NUM_COLS * this.NUM_ROWS * 4);
     // Smoothed 2D mass grid for temporal stability
     this.colMassSmooth = new Float32Array(this.NUM_COLS * this.NUM_ROWS);
+    // Per-frame scratch grids, allocated once (no per-frame GC churn).
+    const G = this.NUM_COLS * this.NUM_ROWS;
+    this.massRaw       = new Float32Array(G);
+    this.lightField    = new Float32Array(G);
+    this.massBelow     = new Float32Array(G);
+    this.blurRadius    = new Int32Array(G);
+    this.lightBlurred  = new Float32Array(G);
+    this.lightSmoothed = new Float32Array(G);
+    this.lightFinal    = new Float32Array(G);
+    this.VOL_MAX_RADIUS = 24;
+    this.VOL_SMOOTH_R = 4;
+    this.rowBlur = makeTriBlur(this.NUM_COLS, this.VOL_MAX_RADIUS);
+    this.colBlur = makeTriBlur(this.NUM_ROWS, this.VOL_SMOOTH_R);
 
     // Uniforms
     this.uloc = (n) => gl.getUniformLocation(prog, n);
     this.u = {
       particles:   this.uloc("uParticles"),
       cellRange:   this.uloc("uCellRange"),
-      count:       this.uloc("uCount"),
       sim:         this.uloc("uSim"),
       res:         this.uloc("uRes"),
       h:           this.uloc("uH"),
@@ -2073,8 +573,6 @@ class MetaballRenderer {
       time:        this.uloc("uTime"),
       blobZ:       this.uloc("uBlobZ"),
       blobSize:    this.uloc("uBlobSize"),
-      poolGroupId: this.uloc("uPoolGroupId"),
-      compressColor: this.uloc("uCompressColor"),
       colMass:       this.uloc("uColMass"),
       numCols:       this.uloc("uNumCols"),
       numRows:       this.uloc("uNumRows"),
@@ -2122,9 +620,8 @@ class MetaballRenderer {
       total += cellCount[c];
       tmpOffset[c] = 0;
     }
-    // (c) Scatter into cell-sorted particle data (row 0 + compression row 1)
+    // (c) Scatter into cell-sorted particle data
     const data = this.pixData;
-    const compRow = this.compData;
     const stemp = sim.temp, sgroup = sim.groupId;
     const scomp = sim.compression;
     for (let i = 0; i < n; i++) {
@@ -2134,12 +631,8 @@ class MetaballRenderer {
       data[dst    ] = sx[i];
       data[dst + 1] = sy[i];
       data[dst + 2] = stemp[i];
-      data[dst + 3] = sgroup[i];
-      // Row 1: compression in R channel
-      compRow[dst    ] = scomp[i];
-      compRow[dst + 1] = 0;
-      compRow[dst + 2] = 0;
-      compRow[dst + 3] = 0;
+      const cmp = scomp[i];
+      data[dst + 3] = sgroup[i] + (cmp < 3 ? cmp : 2.999) * 0.25;
       tmpOffset[c]++;
     }
     // (d) Build cellRange texture (RGBA32F: r=start, g=count, b/a unused)
@@ -2175,7 +668,8 @@ class MetaballRenderer {
     const colW = SIM_W / NC;
     const rowH = SIM_H / NR;
     const gridSize = NC * NR;
-    const massRaw = new Float32Array(gridSize);
+    const massRaw = this.massRaw;
+    massRaw.fill(0);
     const nFixed = sim.nFixed;
     for (let i = nFixed; i < n; i++) {
       const ci = (sx[i] / colW) | 0;
@@ -2195,7 +689,7 @@ class MetaballRenderer {
     // Pool particles would absorb everything, so we begin the transport
     // at the pool boundary row and ignore mass below it.
     // Pool surface is at t ≈ 0.85 → sim y ≈ 0.85 * SIM_H.
-    const lightField = new Float32Array(gridSize);
+    const lightField = this.lightField;
     const ABSORB_RATE = 0.18;  // absorption per unit mass (tuned for ~160 particles)
     const poolRow = Math.floor(0.82 * NR);  // row index of pool surface
     for (let c = 0; c < NC; c++) {
@@ -2225,7 +719,7 @@ class MetaballRenderer {
     // For each cell, sum mass in the same column over LOOK_BELOW rows
     // below it. This determines how much horizontal smoothing to apply.
     const LOOK_BELOW = 10;
-    const massBelow = new Float32Array(gridSize);
+    const massBelow = this.massBelow;
     for (let c = 0; c < NC; c++) {
       // Running sum with a sliding window (bottom to top)
       let runSum = 0;
@@ -2250,67 +744,28 @@ class MetaballRenderer {
     // Step 4: Mass-dependent horizontal blur of the light field.
     // High massBelow → narrow blur (shadow stays sharp).
     // Low massBelow → wide blur (light scatters/refracts).
-    const lightBlurred = new Float32Array(gridSize);
-    const MAX_RADIUS = 24;
-    const MIN_RADIUS = 0;
+    const lightBlurred = this.lightBlurred;
+    const MAX_RADIUS = this.VOL_MAX_RADIUS;
+    const blurRadius = this.blurRadius;
+    for (let k = 0; k < gridSize; k++) {
+      const massFactor = Math.min(massBelow[k] / 10.0, 1.0);
+      blurRadius[k] = Math.round(MAX_RADIUS * (1.0 - massFactor));
+    }
     for (let r = 0; r < NR; r++) {
-      const rowOff = r * NC;
-      for (let c = 0; c < NC; c++) {
-        const mb = massBelow[rowOff + c];
-        const massFactor = Math.min(mb / 10.0, 1.0);
-        const radius = Math.round(MAX_RADIUS * (1.0 - massFactor) + MIN_RADIUS * massFactor);
-        if (radius === 0) {
-          lightBlurred[rowOff + c] = lightField[rowOff + c];
-          continue;
-        }
-        let sum = 0, weight = 0;
-        for (let dc = -radius; dc <= radius; dc++) {
-          const cc = c + dc;
-          if (cc >= 0 && cc < NC) {
-            const w = 1.0 - Math.abs(dc) / (radius + 1);
-            sum += lightField[rowOff + cc] * w;
-            weight += w;
-          }
-        }
-        lightBlurred[rowOff + c] = weight > 0 ? sum / weight : 0;
-      }
+      this.rowBlur(lightField, r * NC, 1, blurRadius, lightBlurred);
     }
 
     // Step 5: Universal spatial blur — smooth the entire light field
-    // with a fixed-radius Gaussian-ish kernel so small mass changes
-    // don't cause the light to jump around.
-    const SMOOTH_R = 4;  // fixed blur radius (in grid cells)
-    const lightSmoothed = new Float32Array(gridSize);
+    // with a fixed-radius triangle kernel (horizontal, then vertical) so
+    // small mass changes don't cause the light to jump around.
+    const SMOOTH_R = this.VOL_SMOOTH_R;
+    const lightSmoothed = this.lightSmoothed;
     for (let r = 0; r < NR; r++) {
-      const rowOff = r * NC;
-      for (let c = 0; c < NC; c++) {
-        let sum = 0, wt = 0;
-        for (let dc = -SMOOTH_R; dc <= SMOOTH_R; dc++) {
-          const cc = c + dc;
-          if (cc >= 0 && cc < NC) {
-            const w = 1.0 - Math.abs(dc) / (SMOOTH_R + 1);
-            sum += lightBlurred[rowOff + cc] * w;
-            wt += w;
-          }
-        }
-        lightSmoothed[rowOff + c] = wt > 0 ? sum / wt : 0;
-      }
+      this.rowBlur(lightBlurred, r * NC, 1, SMOOTH_R, lightSmoothed);
     }
-    // Also blur vertically with same kernel
-    const lightFinal = new Float32Array(gridSize);
+    const lightFinal = this.lightFinal;
     for (let c = 0; c < NC; c++) {
-      for (let r = 0; r < NR; r++) {
-        let sum = 0, wt = 0;
-        for (let dr = -SMOOTH_R; dr <= SMOOTH_R; dr++) {
-          const rr = r + dr;
-          if (rr >= 0 && rr < NR) {
-            const w = 1.0 - Math.abs(dr) / (SMOOTH_R + 1);
-            sum += lightSmoothed[rr * NC + c] * w;
-            wt += w;
-          }
-        }
-        lightFinal[r * NC + c] = wt > 0 ? sum / wt : 0;
-      }
+      this.colBlur(lightSmoothed, c, NC, SMOOTH_R, lightFinal);
     }
 
     // Step 6: Temporal smoothing (EMA) — no normalization needed,
@@ -2341,8 +796,6 @@ class MetaballRenderer {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, n, 1, gl.RGBA, gl.FLOAT, data, 0);
-    // Row 1: compression data
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 1, n, 1, gl.RGBA, gl.FLOAT, compRow, 0);
 
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.cellRangeTex);
@@ -2360,7 +813,6 @@ class MetaballRenderer {
     // Textures are already bound on units 0/1 from the upload above.
     gl.uniform1i(this.u.particles, 0);
     if (this.u.cellRange) gl.uniform1i(this.u.cellRange, 1);
-    gl.uniform1i(this.u.count, n);
     gl.uniform2f(this.u.sim, SIM_W, SIM_H);
     gl.uniform2f(this.u.res, this.canvas.width, this.canvas.height);
     gl.uniform1f(this.u.h, hRender);
@@ -2378,12 +830,6 @@ class MetaballRenderer {
     if (this.u.blobSize) {
       gl.uniform1fv(this.u.blobSize, sim.blobSizeSmooth);
     }
-    // Pool group id (so the shader knows which blob to render on top
-    // unconditionally). Walls always share a single group, so any
-    // wall's groupId works; pass -1 if no pool.
-    const poolGid = sim.nFixed > 0 ? sim.groupId[0] : -1;
-    if (this.u.poolGroupId) gl.uniform1i(this.u.poolGroupId, poolGid);
-    if (this.u.compressColor) gl.uniform3fv(this.u.compressColor, params.compressColor);
     if (this.u.colMass) { gl.uniform1i(this.u.colMass, 2); }
     if (this.u.numCols) gl.uniform1i(this.u.numCols, params.volAbsorb !== false ? this.NUM_COLS : 0);
     if (this.u.numRows) gl.uniform1i(this.u.numRows, params.volAbsorb !== false ? this.NUM_ROWS : 0);
@@ -2393,10 +839,35 @@ class MetaballRenderer {
 
 // ----------------- App glue ----------------------------------
 const canvas = document.getElementById("lava");
-// Scale internal resolution for crisp rendering on retina, capped to 2x
-const dpr = Math.min(window.devicePixelRatio || 1, 2);
-canvas.width  = Math.floor(380 * dpr);
-canvas.height = Math.floor(700 * dpr);
+
+// ---- Render resolution ----
+// The backing store follows the canvas's *displayed* size × devicePixelRatio
+// (capped at 2×) × a quality scale, so a phone showing a 320-px-wide lamp
+// doesn't shade a 760×1400 buffer. MAX_PIXELS caps big fullscreen windows.
+// The quality scale adapts to measured frame time unless ?scale=<0.3-1>
+// pins it (handy for benchmarking).
+const MAX_PIXELS = 760 * 1400;
+const MIN_SCALE = 0.45;
+const pinnedScale = parseFloat(new URLSearchParams(location.search).get("scale"));
+let renderScale = pinnedScale > 0 ? Math.min(1, Math.max(0.3, pinnedScale)) : 1.0;
+
+function sizeCanvas() {
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width < 1 || rect.height < 1) return;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  let w = rect.width * dpr * renderScale;
+  let h = rect.height * dpr * renderScale;
+  const over = Math.sqrt((w * h) / MAX_PIXELS);
+  if (over > 1) { w /= over; h /= over; }
+  w = Math.max(1, Math.round(w));
+  h = Math.max(1, Math.round(h));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+}
+sizeCanvas();
+new ResizeObserver(sizeCanvas).observe(canvas);
 
 const MAX_P = 700;   // fluid (slider max 600) + wall budget (~40)
 const sim = new SPH({ numParticles: 160 });
@@ -2735,6 +1206,44 @@ let frames = 0;
 let fpsTime = last;
 let paused = false;
 
+// Adaptive quality: every ~1 s look at the average frame interval. Too slow
+// → shade fewer pixels; comfortably at 60 fps for a while → try more. After
+// a downgrade we wait before probing upward again; if a probe fails right
+// away the wait doubles (up to ~1 min), so a device sitting on the edge
+// doesn't stutter every few seconds.
+const FRAME_MS = 1000 / 60;
+const quality = { sum: 0, count: 0, goodWindows: 0, holdOff: 0, warmup: 30,
+                  backoff: 8, sinceUpgrade: 99 };
+let nextFrameAt = 0;
+function adaptQuality(frameMs) {
+  if (pinnedScale > 0) return;
+  if (quality.warmup > 0) { quality.warmup--; return; }   // shader compile, JIT
+  quality.sum += frameMs;
+  quality.count++;
+  if (quality.sum < 1000) return;
+  const avg = quality.sum / quality.count;
+  quality.sum = 0; quality.count = 0;
+  if (quality.holdOff > 0) quality.holdOff--;
+  quality.sinceUpgrade++;
+  if (avg > FRAME_MS * 1.1 && renderScale > MIN_SCALE) {        // under ~54 fps
+    renderScale = Math.max(MIN_SCALE, renderScale * 0.85);
+    quality.goodWindows = 0;
+    quality.backoff = quality.sinceUpgrade <= 2 ? Math.min(64, quality.backoff * 2) : 8;
+    quality.holdOff = quality.backoff;
+    sizeCanvas();
+  } else if (avg < FRAME_MS * 1.06) {
+    quality.goodWindows++;
+    if (quality.goodWindows >= 3 && quality.holdOff === 0 && renderScale < 1) {
+      renderScale = Math.min(1, renderScale * 1.1);
+      quality.goodWindows = 0;
+      quality.sinceUpgrade = 0;
+      sizeCanvas();
+    }
+  } else {
+    quality.goodWindows = 0;
+  }
+}
+
 // Pause simulation when tab is hidden to save CPU/GPU
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
@@ -2742,12 +1251,20 @@ document.addEventListener("visibilitychange", () => {
   } else {
     paused = false;
     last = performance.now(); // reset dt so we don't get a huge jump
+    nextFrameAt = 0;
+    quality.sum = 0; quality.count = 0; quality.warmup = 10;
   }
 });
 
 function frame(now) {
   if (paused) { requestAnimationFrame(frame); return; }
+  // Cap at ~60 fps: on 90/120 Hz screens rAF fires more often, which would
+  // multiply the sim + shading work for no visible benefit. Pacing against
+  // a schedule (rather than "skip if < 16 ms") averages 60 fps at 90 Hz too.
+  if (now < nextFrameAt - 1) { requestAnimationFrame(frame); return; }
+  nextFrameAt = Math.max(nextFrameAt + FRAME_MS, now - FRAME_MS);
   const rawDt = (now - last) / 1000;
+  adaptQuality(now - last);
   last = now;
   // Clamp per-frame dt and split into substeps for SPH stability.
   const dt = Math.min(0.033, rawDt) * sim.timeScale;
@@ -2766,7 +1283,7 @@ function frame(now) {
   frames++;
   if (now - fpsTime > 500) {
     const fps = Math.round((frames * 1000) / (now - fpsTime));
-    $("fpsText").textContent = fps + " fps";
+    $("fpsText").textContent = fps + " fps · " + Math.round(renderScale * 100) + "% res";
     $("partText").textContent = sim.n + " particles";
     frames = 0;
     fpsTime = now;
