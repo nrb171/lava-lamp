@@ -203,7 +203,7 @@ uniform sampler2D uCaus;
 uniform sampler2D uCaus2;
 uniform float uCausMix;
 uniform float uCausGpu;       // 1 = use uCaus; 0 = the CPU grid's G/B channels
-uniform float uEdgeScale;     // → light at the glass relative to its clear-lamp mean
+uniform sampler2D uCausEdge;  // light at the glass per row: x = 0 left, 1 right (CAUS_EDGE_FS)
 uniform int   uNumCols;       // grid columns (50)
 uniform int   uNumRows;       // grid rows (30)
 
@@ -496,24 +496,11 @@ void main() {
       if (uCausGpu > 0.5) {
         vec2 cz = mix(texture(uCaus, vec2(colU, colV)).rg, texture(uCaus2, vec2(colU, colV)).rg, uCausMix);
         excess = cz.r;
-        // Glass-edge light: light arriving near the glass on this side
-        // (a band 8-20 px in from the glass, ±8 px in height), relative to
-        // its mean along a clear lamp's glass: ≈1 on average, a few × where
-        // blobs focus light onto it.
-        // Both sides, blended across the middle (the limb term is small
-        // there but not zero, and a hard switch would show as a seam).
-        vec2 er = vec2(0.0);
-        for (int k = 0; k < 6; k++) {
-          float dxi = max(halfW - 8.0 - 12.0 * float(k % 2), 0.0);
-          float dyi = (float(k / 2) - 1.0) * 8.0;
-          float v = colV - dyi / uSim.y;
-          vec2 uL = vec2((cx - dxi) / uSim.x, v), uR = vec2((cx + dxi) / uSim.x, v);
-          vec2 cl = mix(texture(uCaus, uL).rg, texture(uCaus2, uL).rg, uCausMix);
-          vec2 cr = mix(texture(uCaus, uR).rg, texture(uCaus2, uR).rg, uCausMix);
-          er += vec2(cl.r + cl.g, cr.r + cr.g);          // traced = reference + excess
-        }
-        float sideT = smoothstep(-0.5 * halfW, 0.5 * halfW, simPos.x - cx);
-        wallIrr = max(mix(er.x, er.y, sideT) / 6.0, 0.0) * uEdgeScale;
+        // Glass-edge light (CAUS_EDGE_FS), both sides blended across the
+        // middle: the limb term is small there but not zero, and a hard
+        // switch would show as a seam.
+        float eL = texture(uCausEdge, vec2(0.25, colV)).r, eR = texture(uCausEdge, vec2(0.75, colV)).r;
+        wallIrr = mix(eL, eR, smoothstep(-0.5 * halfW, 0.5 * halfW, simPos.x - cx));
       }
       fluidBg += scatterCol * clamp(excess, -0.6, 2.0) * 0.3 * causticEnv * beer;
     }
@@ -655,9 +642,6 @@ void main() {
     col = botCapCol;
   } else {
     col = mix(frameOut, inside, insideGlass);
-    float rimDist = halfW - distFromCenter;
-    float rim = smoothstep(0.0, 1.5, rimDist) * (1.0 - smoothstep(1.5, 4.0, rimDist));
-    col += LIN(vec3(0.22, 0.18, 0.30)) * rim * 0.45;
     // Glass edge lit by the light striking it. Seen edge-on, a shell of
     // thickness tau has line-of-sight length
     //   L(b) = 2(√(R² − b²) − √((R − tau)² − b²))
@@ -673,9 +657,6 @@ void main() {
       // soft response: irradiance is ~1 on average, a few × at hot spots
       col += edgeCol * (1.0 - exp(-0.7 * wallIrr)) * L * 0.32 * step(b, R);
     }
-    float streakX = clamp(1.0 - abs((simPos.x - (cx - halfW * 0.55)) / 6.0), 0.0, 1.0);
-    float streakY = smoothstep(0.10, 0.40, t) * (1.0 - smoothstep(0.40, 0.62, t));
-    col += LIN(vec3(0.85, 0.80, 1.0)) * streakX * streakY * 0.10 * insideGlass;
   }
 
   // Soft outer glow
@@ -701,11 +682,11 @@ if (typeof module !== 'undefined' && module.exports) {
 //  Lamp light on the GPU: caustics in the liquid and on the wall behind
 //
 //  One ray tracer (LIGHT_TRACE_FS) follows the lamp's light:
-//   • it leaves the pool's top surface — a height field built each trace
-//     from the pool particles, bumps and necks included. The pool wax is
-//     translucent and scatters the bulb's light, so its surface glows
-//     diffusely: points spread over it emit Lambertian about the local
-//     surface normal;
+//   • it starts at the bulb — one diffuse (Lambertian) source at the
+//     centre of the base, a small disc — and passes up through the pool wax, dimmed
+//     along the way, to the pool's top surface: a height field built each
+//     trace from the pool particles, bumps and necks included, which
+//     refracts it (wax → liquid, Fresnel, total internal reflection);
 //   • refracts into and out of the wax blobs (ellipsoids),
 //   • and leaves through the curved glass (Fresnel, TIR) to the wall.
 //  Mode 0 writes where each ray lands on the wall; mode 1 writes the
@@ -721,10 +702,10 @@ if (typeof module !== 'undefined' && module.exports) {
 //  Liquid: CAUS_TUBE_* does the same between successive planes: a tube's
 //          light scattered out in that slab (power × path length) is spread
 //          over the band it spans in the view — as traced and without the
-//          wax lenses (the reference), for the tubes a blob touched (the
-//          rest cancel). The full reference changes slowly and is rebuilt
-//          one emitting point per update. CAUS_UPDATE_FS filters and
-//          normalises.
+//          wax lenses and pool bumps (the reference), for the tubes a blob
+//          or bump touched (the rest cancel). The full reference changes
+//          slowly and is rebuilt every few updates. CAUS_UPDATE_FS filters
+//          and normalises.
 // ============================================================
 
 const LIGHT_TRACE_FS = `#version 300 es
@@ -736,7 +717,9 @@ uniform float uGlow;
 uniform float uRayScale;    // power per ray (keeps totals independent of ray count)
 uniform ivec3 uRayDim;      // rays: azimuth × polar × sources
 uniform float uAzSpan;      // azimuths covered: π (toward the wall) or 2π
-uniform float uSrcR;        // radius of the disc of emitting points on the pool
+uniform float uYSrc;        // the bulb: centre of the base (sim px)
+uniform float uSrcR;        // … and its radius
+uniform float uMuPool;      // attenuation in the pool wax (per sim px)
 uniform int   uNB;
 uniform vec4  uWB0[40];     // blob centre (x from the axis, y, z), lens strength
 uniform vec4  uWB1[40];     // blob semi-axes
@@ -760,10 +743,17 @@ const float ETA_G = 1.34;             // liquid → air
 const float NW = 1.43 / 1.34;         // wax / liquid
 float Rof(float y) { return bottleHalfFrac(clamp(y / uSim.y, 0.0, 1.0)) * uSim.x; }
 float Rsl(float y) { return 0.5 * (Rof(y + 1.0) - Rof(y - 1.0)); }
-float poolRow(int row, float u) {     // linear lookup, u in texels
+// Smooth (cubic B-spline) lookup, u in texels. Caustics follow the
+// surface's curvature: linear interpolation makes the slope jump at every
+// texel, and Catmull-Rom the curvature, each drawing a line on the wall
+// per texel. The B-spline's curvature is continuous.
+float poolAt(int row, int i) { return texelFetch(uPool, ivec2(clamp(i, 0, uPoolN - 1), row), 0).r; }
+float poolRow(int row, float u) {
   float x = clamp(u, 0.0, float(uPoolN - 1));
-  int i = int(floor(x)); int j = min(i + 1, uPoolN - 1);
-  return mix(texelFetch(uPool, ivec2(i, row), 0).r, texelFetch(uPool, ivec2(j, row), 0).r, x - float(i));
+  int i = int(floor(x)); float f = x - float(i), g = 1.0 - f;
+  float w0 = g * g * g / 6.0, w1 = (4.0 - 6.0 * f * f + 3.0 * f * f * f) / 6.0;
+  float w2 = (4.0 - 6.0 * g * g + 3.0 * g * g * g) / 6.0, w3 = f * f * f / 6.0;
+  return w0 * poolAt(row, i - 1) + w1 * poolAt(row, i) + w2 * poolAt(row, i + 1) + w3 * poolAt(row, i + 2);
 }
 // y of the pool's top surface above (x, z) (x from the axis)
 float poolTop(vec2 xz) {
@@ -820,28 +810,72 @@ void main() {
   if (uMode == 1) { ia = id.x / 2; kBase = 4 * (id.x - ia * 2); }
   for (int i = 0; i < 4; i++) pv[i] = vec4(0.0);
   int ip = id.y % uRayDim.y, src = id.y / uRayDim.y;
-  // emitting point: sunflower pattern over a disc (equal area each), on the
-  // pool's surface
-  float rs = uSrcR * sqrt((float(src) + 0.5) / float(uRayDim.z));
-  float th = float(src) * 2.39996323;
-  vec2 xz = rs * vec2(cos(th), sin(th));
-  float ys = poolTop(xz);
-  float e = 1.5;
-  float gx = (poolTop(xz + vec2(e, 0.0)) - poolTop(xz - vec2(e, 0.0))) / (2.0 * e);
-  float gz = (poolTop(xz + vec2(0.0, e)) - poolTop(xz - vec2(0.0, e))) / (2.0 * e);
-  vec3 n = normalize(vec3(gx, -1.0, gz));               // up, into the liquid
-  vec3 t1 = normalize(vec3(1.0, 0.0, 0.0) - n * n.x);
-  vec3 t2 = normalize(vec3(0.0, 0.0, 1.0) - n * n.z - t1 * dot(vec3(0.0, 0.0, 1.0), t1));
+  // The bulb: one diffuse (Lambertian) source at the centre of the base.
+  // It has a size, which softens its caustics (a point source through the
+  // round pool would focus a hard line up the lamp's axis): sampled at its
+  // centre and a ring, each point with its own coherent fan of rays.
   float cMin = cos(1.35);
   float c = 1.0 - (1.0 - cMin) * (float(ip) + 0.5) / float(uRayDim.y);
   float sph = sqrt(1.0 - c * c);
   float al = PI + uAzSpan * (float(ia) + 0.5) / float(uRayDim.x);   // from −x round through the back
-  vec3 d = normalize(sph * cos(al) * t1 + c * n + sph * sin(al) * t2);
-  vec3 p = vec3(xz.x, ys, xz.y) + n * 0.3;
-  float P = c * uGlow * uRayScale / float(uRayDim.z);            // Lambertian
+  vec3 d = vec3(sph * cos(al), -c, sph * sin(al));
+  vec2 s0 = vec2(0.0);
+  if (src > 0) { float an = float(src - 1) * 2.0 * PI / float(uRayDim.z - 1) + 0.3; s0 = uSrcR * vec2(cos(an), sin(an)); }
+  vec3 p = vec3(s0.x, uYSrc, s0.y);
+  float P = c * uGlow * uRayScale / float(uRayDim.z);                // Lambertian
   float P0 = P;                         // cut-offs are relative to this
   float h0, h1;
+
+  // ---- up through the pool wax to its surface ----
+  // The wax dims the light along its path; its top surface refracts it
+  // (wax → liquid), with Fresnel loss and total internal reflection.
+  bool out_ = p.y < poolTop(p.xz);      // no wax above the bulb
+  float poolLen = 0.0;
+  for (int bounce = 0; bounce < 3 && !out_ && P > 0.0; bounce++) {
+    float t = 0.0, tHit = -1.0;
+    for (int k = 0; k < 96; k++) {
+      float tn = t + 3.0;
+      vec3 pn = p + d * tn;
+      if (pn.y > 0.995 * uSim.y || dot(pn.xz, pn.xz) > Rof(pn.y) * Rof(pn.y)) { P = 0.0; break; }
+      if (pn.y < poolTop(pn.xz)) {
+        float lo = t, hi = tn;
+        for (int j = 0; j < 8; j++) {
+          float m = 0.5 * (lo + hi); vec3 pm = p + d * m;
+          if (pm.y < poolTop(pm.xz)) hi = m; else lo = m;
+        }
+        tHit = hi; break;
+      }
+      t = tn;
+    }
+    if (tHit < 0.0) { P = 0.0; break; }
+    p += d * tHit; poolLen += tHit;
+    float e = 3.0;
+    float gx = (poolTop(p.xz + vec2(e, 0.0)) - poolTop(p.xz - vec2(e, 0.0))) / (2.0 * e);
+    float gz = (poolTop(p.xz + vec2(0.0, e)) - poolTop(p.xz - vec2(0.0, e))) / (2.0 * e);
+    vec3 nUp = normalize(vec3(gx, -1.0, gz));          // up, into the liquid
+    float ci = dot(d, nUp);
+    vec3 r = refract(d, -nUp, 1.43 / 1.34);
+    if (ci > 0.0 && dot(r, r) > 0.0) {
+      P *= 1.0 - fresnelR(ci, 1.43, 1.34);
+      d = r; p += d * 0.05; out_ = true;
+    } else {
+      d -= 2.0 * ci * nUp; p -= nUp * 0.1; P *= 0.9;   // reflected back into the pool
+    }
+  }
+  P *= exp(-uMuPool * poolLen);
+  if (!out_) P = 0.0;
+  // a pool bump or neck here: the light differs from the reference's
+  if (uLensOn > 0.5 && abs(poolRow(1, (p.x + 0.5 * uSim.x) / uSim.x * float(uPoolN - 1))) > 1.5) hitBlob = true;
   rec(p, P);
+  if (P <= 0.0) {
+    if (uMode == 1) {
+      vec4 w[4];
+      for (int i = 0; i < 4; i++) w[i] = kBase + i < vc ? pv[i] : vec4(lastV.xyz, 0.0);
+      if (kBase == 4) w[3] = vec4(hitBlob ? 1.0 : 0.0, 0.0, 0.0, 0.0);
+      o = w[0]; o1 = w[1]; o2 = w[2]; o3 = w[3];
+    } else o = vec4(0.0);
+    return;
+  }
 
   // ---- through the liquid, blobs and glass ----
   int inB = -1, refl = 0;
@@ -1017,12 +1051,10 @@ void main() {
   oWall = vec4(s, 0.0, 1.0);
 }`;
 
-// Path vertices (up to 7) → where each path crosses each plane (planes go up from
-// uPlaneY0 in steps of uPlaneDY), with the power it carries there. The pool
-// glows continuously but our emitters are points, whose light is
-// concentrated right next to them, so a path's light fades in over its
-// first 40 px, where neighbouring points' light would have merged. A plane
-// below the path's start (inside the pool) gets the start, carrying ~0.
+// Path vertices (up to 7; vertex 0 is where the light leaves the pool) →
+// where each path crosses each plane (planes go up from uPlaneY0 in steps
+// of uPlaneDY), with the power it carries there. A plane below the path's
+// start (inside the pool) gets the start, carrying ~0.
 const CAUS_CROSS_FS = `#version 300 es
 precision highp float;
 uniform highp sampler2D uV0, uV1, uV2, uV3;   // vertex k: texture k % 4, column 2·ray + k / 4
@@ -1047,7 +1079,7 @@ void main() {
     vec4 b = vert(ray, k, id.y);
     if ((a.y - py) * (b.y - py) <= 0.0 && a.y != b.y) {
       vec3 q = mix(a.xyz, b.xyz, (py - a.y) / (b.y - a.y));
-      o = vec4(q, a.w * max(smoothstep(8.0, 40.0, distance(q, v0.xyz)), 1e-4));
+      o = vec4(q, a.w);
       return;
     }
     if (a.w <= 0.0) break;
@@ -1121,8 +1153,9 @@ void main() {
   if (uRefSrc >= 0) q = uRefSrc + uRayDim.z;
   row = q * uRayDim.y + ip;
   ib = (ia + 1) % uRayDim.x;
-  // Tubes whose rays met no blob are the same with and without the wax
-  // lenses and cancel in the difference: skip them (in both passes).
+  // Tubes whose rays met no blob or pool bump are the same with and
+  // without the lenses and cancel in the difference: skip them (in both
+  // passes).
   if (uRefSrc < 0) {
     int rt = row < uRowsLens ? row : row - uRowsLens;
     if (texelFetch(uFlag, ivec2(2 * ia + 1, rt), 0).x + texelFetch(uFlag, ivec2(2 * ib + 1, rt), 0).x
@@ -1192,4 +1225,34 @@ void main() {
   vec2 cur = vec2((v.r - v.g) / 16.0, g / gw) * uInvRef;
   vec2 s = uInit > 0.5 ? cur : mix(texelFetch(uPrev, p, 0).rg, cur, uSM);
   o = vec4(s, 0.0, 1.0);
+}`;
+
+// Light reaching the glass, per row and side (texel x = 0 left, 1 right),
+// for the lit glass edge: the traced light in the liquid (reference +
+// excess) over a band 6-26 px in from the glass and ±30 px in height,
+// relative to its clear-lamp mean along the glass.
+const CAUS_EDGE_FS = `#version 300 es
+precision highp float;
+uniform highp sampler2D uCaus;
+uniform vec2  uSim;
+uniform float uEdgeScale;
+out vec4 o;
+${BOTTLE_GLSL}
+void main() {
+  ivec2 id = ivec2(gl_FragCoord.xy);
+  ivec2 sz = textureSize(uCaus, 0);
+  float side = id.x == 0 ? -1.0 : 1.0;
+  float sum = 0.0, wsum = 0.0;
+  for (int j = -5; j <= 5; j++) {
+    float v = (float(id.y) + 0.5 + float(j) * 3.0) / float(sz.y);        // ±15 texels
+    float y = (1.0 - v) * uSim.y;
+    float hw = bottleHalfFrac(clamp(y / uSim.y, 0.0, 1.0)) * uSim.x;
+    float wj = float(6 - abs(j));
+    for (int i = 0; i < 6; i++) {
+      float x = 0.5 * uSim.x + side * max(hw - 6.0 - 4.0 * float(i), 0.0);
+      vec2 c = texture(uCaus, vec2(x / uSim.x, v)).rg;
+      sum += wj * (c.r + c.g); wsum += wj;
+    }
+  }
+  o = vec4(max(sum / wsum, 0.0) * uEdgeScale, 0.0, 0.0, 1.0);
 }`;
