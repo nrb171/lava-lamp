@@ -459,6 +459,11 @@ function fresnelR(ci, n1, n2) {
   return 0.5 * (rs * rs + rp * rp);
 }
 
+// The pool's resting surface, as a fraction of the lamp's height: the
+// lamp draws a solid pool below it (shaders: poolBlockMask), and the light
+// source sits on it.
+const POOL_REST_T = 0.89;
+
 // ----------------- WebGL Renderer -----------------------------
 class MetaballRenderer {
   constructor(canvas, maxParticles) {
@@ -1601,8 +1606,12 @@ class MetaballRenderer {
     gl.uniform1f(t.uViewT, VIEW_T);
     gl.uniform1f(t.uWallD, this.WALL_DIST);
     gl.uniform1f(t.uGlow, glow);
-    // the bulb, at the centre of the base, under the pool wax
-    gl.uniform1f(t.uYSrc, 0.96 * SIM_H);
+    // The light source sits at the pool's resting surface height (where the
+    // lamp draws its solid pool), on the axis. Under the wax at the base,
+    // all its light crossed the pool's surface, which moves as wax leaves
+    // and returns — shifting the whole light field in jerks. Here only real
+    // bumps and columns above that level bend it.
+    gl.uniform1f(t.uYSrc, POOL_REST_T * SIM_H);
     gl.uniform1f(t.uSrcR, 0);
     gl.uniform1f(t.uMuPool, 0.004);
     gl.uniform1f(t.uPoolYMin, this.poolYMin);
@@ -1818,7 +1827,9 @@ class MetaballRenderer {
     const CW = Math.round(SIM_W / cell), CH = Math.round(SIM_H / cell);
     const rows = NPH * NSRC;
     // planes from just above the pool to near the top
-    const yLo = 0.86 * SIM_H, yHi = 0.06 * SIM_H, dy = (yLo - yHi) / (J - 1);
+    // (from the pool's resting surface, so the field reaches the pool and
+    // fades out there rather than stopping on the first plane)
+    const yLo = POOL_REST_T * SIM_H, yHi = 0.06 * SIM_H, dy = (yLo - yHi) / (J - 1);
     // targets
     const pk = NAZ + "x" + rows + "x" + J;
     if (pk !== this.pathKey) {
