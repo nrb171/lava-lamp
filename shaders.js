@@ -512,7 +512,8 @@ void main() {
     // Caustics: light redirected by wax lenses and wall reflections, as a
     // fraction of clear-lamp light (+ concentrated, − pulled away).
     if (uCaustics > 0.5) {
-      float causticEnv = smoothstep(0.02, 0.10, t) * (1.0 - smoothstep(0.86, 0.89, t));
+      // down to the light source, just under the pool's resting surface
+      float causticEnv = smoothstep(0.02, 0.10, t) * (1.0 - smoothstep(0.895, 0.905, t));
       float excess = vol.g;
       wallIrr = vol.b;
       if (uCausGpu > 0.5) {
@@ -1119,6 +1120,7 @@ uniform highp sampler2D uIrr;   // 2× resolution
 uniform highp sampler2D uAvg;
 uniform highp sampler2D uPrev;
 uniform float uInvRef, uAlpha, uSM, uInit;
+uniform float uFull;            // 1: draw all the light on the wall, not just what's above the baseline
 layout(location = 0) out vec4 oAvg;
 layout(location = 1) out vec4 oWall;
 void main() {
@@ -1137,7 +1139,8 @@ void main() {
   vec2 a = uInit > 0.5 ? v : mix(texelFetch(uAvg, p, 0).rg, v, uAlpha);
   // (with TAA the ray grid is jittered every trace, so this history
   // averages several samplings of the light)
-  vec2 s = uInit > 0.5 ? vec2(0.0) : mix(texelFetch(uPrev, p, 0).rg, v - a, uSM);
+  vec2 target = uFull > 0.5 ? v : v - a;
+  vec2 s = uInit > 0.5 ? (uFull > 0.5 ? v : vec2(0.0)) : mix(texelFetch(uPrev, p, 0).rg, target, uSM);
   oAvg = vec4(a, 0.0, 1.0);
   oWall = vec4(s, 0.0, 1.0);
 }`;

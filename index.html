@@ -377,6 +377,10 @@
     <label for="wallLight" style="cursor:pointer">Light on wall behind</label>
   </div>
   <div class="control" style="display:flex;align-items:center;gap:6px">
+    <input type="checkbox" id="wallFull" />
+    <label for="wallFull" style="cursor:pointer">Show full wall light (not just changes)</label>
+  </div>
+  <div class="control" style="display:flex;align-items:center;gap:6px">
     <input type="checkbox" id="taa" checked />
     <label for="taa" style="cursor:pointer">Temporal smoothing (TAA)</label>
   </div>
@@ -707,7 +711,7 @@ class MetaballRenderer {
         this.wsU = L(this.wallSplatProg, ["uRays", "uRayDim", "uView", "uCell", "uMaxSpan"]);
         this.wbU = L(this.wallSubProg, ["uSubRays", "uSub", "uRayDim", "uView", "uCell", "uMaxSpan"]);
         this.subTex = gl.createTexture(); this.subKey = "";
-        this.wuU = L(this.wallUpdProg, ["uIrr", "uAvg", "uPrev", "uInvRef", "uAlpha", "uSM", "uInit"]);
+        this.wuU = L(this.wallUpdProg, ["uIrr", "uAvg", "uPrev", "uInvRef", "uAlpha", "uSM", "uInit", "uFull"]);
         this.ctU = L(this.causTubeProg, ["uPath", "uPathK", "uRayDim", "uRowsLens", "uSim", "uTgt", "uMaxW",
                                          "uFlag", "uRefSrc"]);
         this.cuU = L(this.causUpdProg, ["uAcc", "uRef", "uPrev", "uInvRef", "uSM", "uInit"]);
@@ -1809,6 +1813,7 @@ class MetaballRenderer {
     // the raw trace goes to the ring, whose mean is drawn
     gl.uniform1f(uU.uSM, this.taa ? 1 : 1 - Math.pow(0.707, dtTrace * 60));
     gl.uniform1f(uU.uInit, this.bdAvgInit ? 0 : 1);
+    gl.uniform1f(uU.uFull, this.wallFull ? 1 : 0);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
     if (this.taa) this.taaResolve(ring, this.bdTex[nxt]);
@@ -1828,9 +1833,9 @@ class MetaballRenderer {
     const CW = Math.round(SIM_W / cell), CH = Math.round(SIM_H / cell);
     const rows = NPH * NSRC;
     // planes from just above the pool to near the top
-    // (from the pool's resting surface, so the field reaches the pool and
-    // fades out there rather than stopping on the first plane)
-    const yLo = POOL_REST_T * SIM_H, yHi = 0.06 * SIM_H, dy = (yLo - yHi) / (J - 1);
+    // (from the light source up, so the field reaches right down to the
+    // pool rather than stopping on a line above it)
+    const yLo = LIGHT_SRC_T * SIM_H, yHi = 0.06 * SIM_H, dy = (yLo - yHi) / (J - 1);
     // targets
     const pk = NAZ + "x" + rows + "x" + J;
     if (pk !== this.pathKey) {
@@ -2315,6 +2320,7 @@ class MetaballRenderer {
     const lightGpu = causticsOn && this.wallGpu && params.lightCpu !== true;
     this.rayScale = params.rayScale || 1;
     this.taa = params.taa !== false;
+    this.wallFull = params.wallFull === true;
     this._lightGpuOn = lightGpu;
     if (lightGpu) {
       // Everything on the GPU (gpuLight); the CPU only builds the blob list
@@ -2723,6 +2729,7 @@ $("wallLight").onchange = (e) => params.wall = e.target.checked;
 params.rayScale = 1;
 $("rays").oninput = (e) => { params.rayScale = parseFloat(e.target.value); };
 $("taa").onchange = (e) => params.taa = e.target.checked;
+$("wallFull").onchange = (e) => params.wallFull = e.target.checked;
 function updateRaysLabel() {
   const r = renderer;
   if (!r.wallGpu) { $("raysVal").textContent = "CPU"; return; }
