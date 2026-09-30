@@ -377,7 +377,7 @@
     <label for="wallLight" style="cursor:pointer">Light on wall behind</label>
   </div>
   <div class="control" style="display:flex;align-items:center;gap:6px">
-    <input type="checkbox" id="wallFull" />
+    <input type="checkbox" id="wallFull" checked />
     <label for="wallFull" style="cursor:pointer">Show full wall light (not just changes)</label>
   </div>
   <div class="control" style="display:flex;align-items:center;gap:6px">
@@ -468,6 +468,13 @@ function fresnelR(ci, n1, n2) {
 // source sits just under it, in the top of the pool.
 const POOL_REST_T = 0.89;
 const LIGHT_SRC_T = POOL_REST_T + 0.015;
+// the bulb's light leaves the base from a Gaussian spot about the axis:
+// its σ, as a fraction of the lamp's width
+const BULB_SIGMA = 0.07;
+// width (σ, sim px) of each wall photon's splat
+const WALL_PHOTON_SIGMA = 8;
+// … and of each liquid photon's, across (sim px)
+const CAUS_PHOTON_SIGMA = 5;
 
 // ----------------- WebGL Renderer -----------------------------
 class MetaballRenderer {
@@ -693,11 +700,9 @@ class MetaballRenderer {
     if (gl.getExtension("EXT_color_buffer_float")) {
       try {
         this.lightProg = link(VS, LIGHT_TRACE_FS);
-        this.wallSplatProg = link(WALL_SPLAT_VS, WALL_SPLAT_FS);
-        this.wallSubProg = link(WALL_SUB_VS, WALL_SPLAT_FS);
+        this.wallPhotonProg = link(WALL_PHOTON_VS, WALL_PHOTON_FS);
         this.wallUpdProg = link(VS, WALL_UPDATE_FS);
-        this.causTubeProg = link(CAUS_TUBE_VS, CAUS_TUBE_FS);
-        this.causCrossProg = link(VS, CAUS_CROSS_FS);
+        this.causPhotonProg = link(CAUS_PHOTON_VS, CAUS_PHOTON_FS);
         this.causEdgeProg = link(VS, CAUS_EDGE_FS);
         this.ringAvgProg = link(VS, RING_AVG_FS);
         this.scratchFbo = gl.createFramebuffer();
@@ -705,27 +710,22 @@ class MetaballRenderer {
         this.causUpdProg = link(VS, CAUS_UPDATE_FS);
         const L = (p, names) => Object.fromEntries(names.map(n => [n, gl.getUniformLocation(p, n)]));
         this.ltU = L(this.lightProg, ["uSim", "uViewM", "uViewT", "uWallD", "uGlow", "uRayScale",
-                                      "uRayDim", "uAzSpan", "uYSrc", "uSrcR", "uMuPool", "uNB", "uWB0", "uWB1",
+                                      "uRayDim", "uAzSpan", "uYSrc", "uMuPool", "uNB", "uWB0", "uWB1",
                                       "uPool", "uPoolN", "uLensOn", "uMode", "uRowOff",
-                                      "uPoolYMin", "uSub", "uRays", "uMaxSpan", "uJitter"]);
-        this.wsU = L(this.wallSplatProg, ["uRays", "uRayDim", "uView", "uCell", "uMaxSpan"]);
-        this.wbU = L(this.wallSubProg, ["uSubRays", "uSub", "uRayDim", "uView", "uCell", "uMaxSpan"]);
-        this.subTex = gl.createTexture(); this.subKey = "";
+                                      "uPoolYMin", "uSrcSigma", "uSeed"]);
+        this.wpU = L(this.wallPhotonProg, ["uRays", "uRaySize", "uView", "uSigma"]);
         this.wuU = L(this.wallUpdProg, ["uIrr", "uAvg", "uPrev", "uInvRef", "uAlpha", "uSM", "uInit", "uFull"]);
-        this.ctU = L(this.causTubeProg, ["uPath", "uPathK", "uRayDim", "uRowsLens", "uSim", "uTgt", "uMaxW",
-                                         "uFlag", "uRefSrc"]);
+        this.cpU = L(this.causPhotonProg, ["uV0", "uV1", "uV2", "uV3", "uNAz", "uRowsLens", "uRefSrc", "uSim", "uTgt", "uSig"]);
         this.cuU = L(this.causUpdProg, ["uAcc", "uRef", "uPrev", "uInvRef", "uSM", "uInit"]);
         this.ceU = L(this.causEdgeProg, ["uCaus", "uSim", "uEdgeScale"]);
         this.raU = L(this.ringAvgProg, ["uRing", "uCount"]);
         this.causEdgeTex = gl.createTexture();
-        this.ccU = L(this.causCrossProg, ["uV0", "uV1", "uV2", "uV3", "uPlanes", "uPlaneY0", "uPlaneDY"]);
         this.emptyVao = gl.createVertexArray();     // the splat / line passes have no attributes
         this.avgTex = [gl.createTexture(), gl.createTexture()];
         this.irrTex = gl.createTexture();
         this.poolTex = gl.createTexture();
         this.rayTex = null; this.rayKey = "";
         this.pathTex = [0, 1, 2, 3].map(() => gl.createTexture()); this.pathKey = "";
-        this.crossTex = gl.createTexture();
         this.refTex = [gl.createTexture(), gl.createTexture()];
         this.refFbo = [null, null];
         this.causTex = [gl.createTexture(), gl.createTexture()];
@@ -1617,7 +1617,7 @@ class MetaballRenderer {
     // returns — shifting the whole light field in jerks. Here mostly real
     // bumps and columns above that level bend it.
     gl.uniform1f(t.uYSrc, LIGHT_SRC_T * SIM_H);
-    gl.uniform1f(t.uSrcR, 0);
+    gl.uniform1f(t.uSrcSigma, BULB_SIGMA * SIM_W);
     gl.uniform1f(t.uMuPool, 0.004);
     gl.uniform1f(t.uPoolYMin, this.poolYMin);
     gl.uniform1i(t.uNB, nb);
@@ -1653,12 +1653,14 @@ class MetaballRenderer {
     if (!this.taa) r.filled = 0;                // restart when TAA is turned back on
     return r;
   }
-  taaJitter(t, r) {
+  taaSeed(t, r) {
     const gl = this.gl;
-    if (!this.taa) { gl.uniform2f(t.uJitter, 0, 0); return; }
-    const k = r.slot + 1;
-    const halton = (i, b) => { let f = 1, q = 0; while (i > 0) { f /= b; q += f * (i % b); i = Math.floor(i / b); } return q; };
-    gl.uniform2f(t.uJitter, halton(k, 2) - 0.5, halton(k, 3) - 0.5);
+    // Random ray origins and directions (the wide bulb, LIGHT_TRACE_FS) are
+    // their own jitter: one seed per ring slot, so a still scene cycles
+    // through the same samples and its mean doesn't flicker. Without TAA,
+    // a new seed every trace.
+    this._seedN = (this._seedN || 0) + 1;
+    gl.uniform1f(t.uSeed, this.taa ? r.slot + 1 : this._seedN % 4096 + 1);
   }
   // after the update pass wrote this trace into layer r.slot: mean → out
   taaResolve(r, outTex) {
@@ -1683,7 +1685,7 @@ class MetaballRenderer {
   gpuWall(t, NSRC, dtTrace, lowQ) {
     const gl = this.gl;
     const rs = this.rayScale || 1;
-    const NPH = Math.max(8, Math.round((lowQ ? 40 : 128) * rs)), NAZ = Math.max(16, Math.round((lowQ ? 80 : 256) * rs));
+    const NPH = Math.max(8, Math.round((lowQ ? 128 : 384) * rs)), NAZ = Math.max(16, Math.round((lowQ ? 256 : 768) * rs));
     this.wallRays = NAZ * NPH * NSRC;
     if (!this.ensureRays(NAZ, NPH, NSRC)) { this.wallGpu = false; this.WG_W = 0; this.ensureWallGrid(); return; }
     // 1. rays → wall landing points
@@ -1700,67 +1702,32 @@ class MetaballRenderer {
     // normalisation, bdRef, divides the scale back out.)
     gl.uniform1f(t.uRayScale, 1e7 / (NPH * NAZ));
     gl.uniform3i(t.uRayDim, NAZ, NPH, NSRC);
-    gl.uniform1i(t.uSub, 0);
-    gl.uniform1f(t.uMaxSpan, 280);
     const ring = this.taaRing("wall", this.WG_W, this.WG_H, lowQ ? 4 : 8);
     gl.useProgram(this.lightProg);
-    this.taaJitter(t, ring);
+    this.taaSeed(t, ring);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-    // 1b. refinement: a finer grid of rays across each tube that touches a
-    //     blob or is broken (edges, folds) — blobs subtend only a few
-    //     degrees, and drawn from the main grid alone their images were a
-    //     few big triangles (spiky) with stair-stepped edges
-    const S = lowQ ? 3 : 4;
-    const SW = (NAZ - 1) * (S + 1), SH = (NPH - 1) * (S + 1) * NSRC;
-    const sk = SW + "x" + SH;
-    if (sk !== this.subKey) {
-      this.subFbo = this.gpuTarget(this.subTex, gl.RGBA32F, gl.RGBA, SW, SH, gl.NEAREST, this.subFbo);
-      this.subKey = sk;
-    }
-    gl.useProgram(this.lightProg);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.subFbo);
-    gl.viewport(0, 0, SW, SH);
-    gl.activeTexture(gl.TEXTURE6);
-    gl.bindTexture(gl.TEXTURE_2D, this.rayTex);
-    gl.uniform1i(t.uRays, 6);
-    gl.uniform1i(t.uSub, S);
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
-    gl.uniform1i(t.uSub, 0);
-
-    // 2. ray tubes → wall (2× grid), additively
+    // 2. photons → wall (2× grid), additively
     const GWc = this.WG_W, GHc = this.WG_H;
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.irrFbo);
     gl.viewport(0, 0, 2 * GWc, 2 * GHc);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.useProgram(this.wallSplatProg);
+    gl.useProgram(this.wallPhotonProg);
     gl.activeTexture(gl.TEXTURE6);
     gl.bindTexture(gl.TEXTURE_2D, this.rayTex);
-    const sU = this.wsU;
-    gl.uniform1i(sU.uRays, 6);
-    gl.uniform3i(sU.uRayDim, NAZ, NPH, NSRC);
-    gl.uniform2f(sU.uView, VIEW_W, VIEW_H);
-    gl.uniform2f(sU.uCell, VIEW_W / (2 * GWc), VIEW_H / (2 * GHc));
-    gl.uniform1f(sU.uMaxSpan, 280);
+    const pU = this.wpU;
+    gl.uniform1i(pU.uRays, 6);
+    gl.uniform2i(pU.uRaySize, NAZ, NPH * NSRC);
+    gl.uniform2f(pU.uView, VIEW_W, VIEW_H);
+    // kernel: a fixed width on the wall (sim px), in 2× grid texels
+    gl.uniform1f(pU.uSigma, Math.min(20, WALL_PHOTON_SIGMA * (lowQ ? 1.5 : 1) * 2 * GWc / VIEW_W));
     gl.enable(gl.BLEND);
     gl.blendEquation(gl.FUNC_ADD);
     gl.blendFunc(gl.ONE, gl.ONE);
     gl.bindVertexArray(this.emptyVao);
-    gl.drawArrays(gl.TRIANGLES, 0, (NAZ - 1) * (NPH - 1) * NSRC * 6);
-    // … and the refined tubes
-    gl.useProgram(this.wallSubProg);
-    gl.activeTexture(gl.TEXTURE6);
-    gl.bindTexture(gl.TEXTURE_2D, this.subTex);
-    const bU = this.wbU;
-    gl.uniform1i(bU.uSubRays, 6);
-    gl.uniform1i(bU.uSub, S);
-    gl.uniform3i(bU.uRayDim, NAZ, NPH, NSRC);
-    gl.uniform2f(bU.uView, VIEW_W, VIEW_H);
-    gl.uniform2f(bU.uCell, VIEW_W / (2 * GWc), VIEW_H / (2 * GHc));
-    gl.uniform1f(bU.uMaxSpan, 280);
-    gl.drawArrays(gl.TRIANGLES, 0, (NAZ - 1) * (NPH - 1) * NSRC * S * S * 6);
+    gl.drawArrays(gl.POINTS, 0, NAZ * NPH * NSRC);
     gl.disable(gl.BLEND);
 
     // Normalisation, once per grid: the mean wall light beside the lamp
@@ -1822,22 +1789,18 @@ class MetaballRenderer {
     this.wallFramesSince = 0;
   }
 
-  // Caustics in the liquid: path vertices → plane crossings → ray tubes →
-  // filtered field over the lamp.
+  // Caustics in the liquid: path vertices → photon bands → filtered field
+  // over the lamp.
   gpuCaustics(t, NSRC, glow, dtTrace, lowQ) {
     const gl = this.gl;
-    const rs = this.rayScale || 1, J = lowQ ? 20 : 40;
-    const NAZ = Math.max(16, Math.round((lowQ ? 64 : 128) * rs)), NPH = Math.max(6, Math.round((lowQ ? 24 : 48) * rs));
+    const rs = this.rayScale || 1;
+    const NAZ = Math.max(16, Math.round((lowQ ? 128 : 256) * rs)), NPH = Math.max(6, Math.round((lowQ ? 48 : 96) * rs));
     this.causRays = NAZ * NPH * NSRC;
     const cell = lowQ ? 4 : 2;
     const CW = Math.round(SIM_W / cell), CH = Math.round(SIM_H / cell);
     const rows = NPH * NSRC;
-    // planes from just above the pool to near the top
-    // (from the light source up, so the field reaches right down to the
-    // pool rather than stopping on a line above it)
-    const yLo = LIGHT_SRC_T * SIM_H, yHi = 0.06 * SIM_H, dy = (yLo - yHi) / (J - 1);
     // targets
-    const pk = NAZ + "x" + rows + "x" + J;
+    const pk = NAZ + "x" + rows;
     if (pk !== this.pathKey) {
       // path vertices: four targets written at once, two columns per ray
       this.pathTex.forEach((tx, i) => { const fb = this.gpuTarget(tx, gl.RGBA32F, gl.RGBA, NAZ * 2, 2 * rows, gl.NEAREST, null); if (fb) gl.deleteFramebuffer(fb); });
@@ -1848,7 +1811,6 @@ class MetaballRenderer {
       gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2, gl.COLOR_ATTACHMENT3]);
       if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) { gl.deleteFramebuffer(this.pathFbo); this.pathFbo = null; }
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      this.crossFbo = this.gpuTarget(this.crossTex, gl.RGBA32F, gl.RGBA, NAZ * J, 2 * rows, gl.NEAREST, this.crossFbo);
       this.pathKey = pk; this.refReady = false;
     }
     const ck = CW + "x" + CH;
@@ -1860,7 +1822,7 @@ class MetaballRenderer {
       this.causEdgeFbo = this.gpuTarget(this.causEdgeTex, gl.RG16F, gl.RG, 2, CH, gl.LINEAR, this.causEdgeFbo);
       this.causKey = ck; this.causRef = null; this.causInit = false; this.refReady = false;
     }
-    if (!this.pathFbo || !this.crossFbo || !this.causAccFbo || !this.causFbo[0] || !this.causFbo[1]
+    if (!this.pathFbo || !this.causAccFbo || !this.causFbo[0] || !this.causFbo[1]
         || !this.refFbo[0] || !this.refFbo[1] || !this.causEdgeFbo) {
       console.warn("GPU caustic targets incomplete, using the CPU");
       this.wallGpu = false; this.WG_W = 0; this.ensureWallGrid(); return;
@@ -1870,11 +1832,10 @@ class MetaballRenderer {
     gl.useProgram(this.lightProg);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.pathFbo);
     gl.uniform1i(t.uMode, 1);
-    gl.uniform1i(t.uSub, 0);
     gl.uniform1f(t.uAzSpan, 2 * Math.PI);
     const ring = this.taaRing("caus", CW, CH, lowQ ? 4 : 8);
     gl.useProgram(this.lightProg);
-    this.taaJitter(t, ring);
+    this.taaSeed(t, ring);
     gl.uniform1f(t.uRayScale, 1e3 / (NPH * NAZ));             // ~1 per texel: see gpuWall
     gl.uniform3i(t.uRayDim, NAZ, NPH, NSRC);
     gl.bindVertexArray(this.vao);
@@ -1884,55 +1845,34 @@ class MetaballRenderer {
       gl.uniform1f(t.uLensOn, pass === 0 ? 1 : 0);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
     }
-    // 1b. plane crossings
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.crossFbo);
-    gl.viewport(0, 0, NAZ * J, 2 * rows);
-    gl.useProgram(this.causCrossProg);
-    const xU = this.ccU;
+    // 2. photons → light, additively (path vertices on units 4-7)
+    gl.useProgram(this.causPhotonProg);
+    const pU = this.cpU;
     this.pathTex.forEach((tx, i) => { gl.activeTexture(gl.TEXTURE4 + i); gl.bindTexture(gl.TEXTURE_2D, tx); });
-    gl.uniform1i(xU.uV0, 4); gl.uniform1i(xU.uV1, 5); gl.uniform1i(xU.uV2, 6); gl.uniform1i(xU.uV3, 7);
-    gl.uniform1i(xU.uPlanes, J);
-    gl.uniform1f(xU.uPlaneY0, yLo);
-    gl.uniform1f(xU.uPlaneDY, dy);
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
-
-    // 2. tubes → light, additively (crossings on unit 6, blob flags on 7)
-    gl.useProgram(this.causTubeProg);
-    gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, this.crossTex);
-    gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, this.pathTex[3]);
-    const tU = this.ctU;
-    gl.uniform1i(tU.uPath, 6);
-    gl.uniform1i(tU.uFlag, 7);
-    gl.uniform1i(tU.uPathK, J);
-    gl.uniform3i(tU.uRayDim, NAZ, NPH, NSRC);
-    gl.uniform1i(tU.uRowsLens, rows);
-    gl.uniform2f(tU.uSim, SIM_W, SIM_H);
-    gl.uniform2f(tU.uTgt, CW, CH);
-    // widest believable tube: generous — light spreading out above a
-    // blob's focus is genuinely wide, and cutting it (this was 90 px) ended
-    // shafts on a flat line; tubes torn across different paths are
-    // already dropped by the path signature
-    gl.uniform1f(tU.uMaxW, 400);
+    gl.uniform1i(pU.uV0, 4); gl.uniform1i(pU.uV1, 5); gl.uniform1i(pU.uV2, 6); gl.uniform1i(pU.uV3, 7);
+    gl.uniform1i(pU.uNAz, NAZ);
+    gl.uniform1i(pU.uRowsLens, rows);
+    gl.uniform2f(pU.uSim, SIM_W, SIM_H);
+    gl.uniform2f(pU.uTgt, CW, CH);
+    gl.uniform1f(pU.uSig, Math.max(0.7, CAUS_PHOTON_SIGMA / cell));
     gl.viewport(0, 0, CW, CH);
     gl.clearColor(0, 0, 0, 0);
     gl.enable(gl.BLEND);
     gl.blendEquation(gl.FUNC_ADD);
     gl.blendFunc(gl.ONE, gl.ONE);
     gl.bindVertexArray(this.emptyVao);
-    // 2a. the tubes blobs (or pool bumps) touched, traced and reference
+    // 2a. the rays blobs (or pool bumps) touched, traced and reference
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.causAccFbo);
     gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.uniform1i(tU.uRefSrc, -1);
-    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 6, (J - 1) * NAZ * (NPH - 1) * 2 * NSRC);
+    gl.uniform1i(pU.uRefSrc, -1);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, 6 * NAZ * 2 * rows);
     // 2b. the full reference (changes slowly: every 4th update)
     if (!this.refReady || (this._refTick = ((this._refTick || 0) + 1) % 4) === 0) {
       const build = this.refReady ? this.refCur ^ 1 : 0;
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.refFbo[build]);
       gl.clear(gl.COLOR_BUFFER_BIT);
-      for (let src = 0; src < NSRC; src++) {
-        gl.uniform1i(tU.uRefSrc, src);
-        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 6, (J - 1) * NAZ * (NPH - 1));
-      }
+      gl.uniform1i(pU.uRefSrc, 0);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, 6 * NAZ * rows);
       this.refCur = build; this.refReady = true;
     }
     gl.disable(gl.BLEND);
@@ -2324,7 +2264,7 @@ class MetaballRenderer {
     const lightGpu = causticsOn && this.wallGpu && params.lightCpu !== true;
     this.rayScale = params.rayScale || 1;
     this.taa = params.taa !== false;
-    this.wallFull = params.wallFull === true;
+    this.wallFull = params.wallFull !== false;
     this._lightGpuOn = lightGpu;
     if (lightGpu) {
       // Everything on the GPU (gpuLight); the CPU only builds the blob list
