@@ -384,6 +384,10 @@
     <input type="checkbox" id="taa" checked />
     <label for="taa" style="cursor:pointer">Temporal smoothing (TAA)</label>
   </div>
+  <div class="control" style="display:flex;align-items:center;gap:6px">
+    <input type="checkbox" id="denoise" checked />
+    <label for="denoise" style="cursor:pointer">Denoise light (with TAA)</label>
+  </div>
   <div class="control">
     <label>Light rays <span class="val" id="raysVal">—</span></label>
     <input type="range" id="rays" min="0.25" max="2" step="0.05" value="1" />
@@ -705,6 +709,7 @@ class MetaballRenderer {
         this.causPhotonProg = link(CAUS_PHOTON_VS, CAUS_PHOTON_FS);
         this.causEdgeProg = link(VS, CAUS_EDGE_FS);
         this.ringAvgProg = link(VS, RING_AVG_FS);
+        this.denoiseProg = link(VS, DENOISE_FS);
         this.scratchFbo = gl.createFramebuffer();
         this.rings = {};
         this.causUpdProg = link(VS, CAUS_UPDATE_FS);
@@ -719,6 +724,7 @@ class MetaballRenderer {
         this.cuU = L(this.causUpdProg, ["uAcc", "uRef", "uPrev", "uInvRef", "uSM", "uInit"]);
         this.ceU = L(this.causEdgeProg, ["uCaus", "uSim", "uEdgeScale"]);
         this.raU = L(this.ringAvgProg, ["uRing", "uAcc", "uCount", "uSlot", "uHist"]);
+        this.dnU = L(this.denoiseProg, ["uSrc", "uAcc", "uStep", "uK"]);
         this.causEdgeTex = gl.createTexture();
         this.emptyVao = gl.createVertexArray();     // the splat / line passes have no attributes
         this.avgTex = [gl.createTexture(), gl.createTexture()];
@@ -1641,7 +1647,7 @@ class MetaballRenderer {
     const gl = this.gl;
     let r = this.rings[name];
     if (!r || r.W !== W || r.H !== H || r.N !== N) {
-      if (r) { gl.deleteTexture(r.tex); r.acc.forEach(t => gl.deleteTexture(t)); }
+      if (r) { gl.deleteTexture(r.tex); r.acc.forEach(t => gl.deleteTexture(t)); r.tmp.forEach(t => gl.deleteTexture(t)); }
       const tex = gl.createTexture();
       gl.activeTexture(gl.TEXTURE7);
       gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
@@ -1658,7 +1664,16 @@ class MetaballRenderer {
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, W, H, 0, gl.RGBA, gl.FLOAT, null);
         return a;
       });
-      r = this.rings[name] = { tex, acc, accCur: 0, W, H, N, slot: 0, filled: 0 };
+      // the denoiser's ping-pong pair (DENOISE_FS)
+      const tmp = [0, 1].map(() => {
+        const a = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, a);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG16F, W, H, 0, gl.RG, gl.FLOAT, null);
+        return a;
+      });
+      r = this.rings[name] = { tex, acc, tmp, accCur: 0, W, H, N, slot: 0, filled: 0 };
     }
     if (!this.taa) r.filled = 0;                // restart when TAA is turned back on
     return r;
@@ -1672,14 +1687,14 @@ class MetaballRenderer {
     gl.uniform1f(t.uSeed, this._seedN % 65536 + 1);
   }
   // after the update pass wrote this trace into layer r.slot: add it to the
-  // accumulator (restarting it where the light moved) → outTex
+  // accumulator (restarting it where the light moved), denoise → outTex
   taaResolve(r, outTex, hist) {
     const gl = this.gl;
     r.filled = Math.min(r.N, r.filled + 1);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchFbo);
     const an = r.accCur ^ 1;
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, r.acc[an], 0);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, outTex, 0);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, this.denoise ? r.tmp[0] : outTex, 0);
     gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
     gl.viewport(0, 0, r.W, r.H);
     gl.useProgram(this.ringAvgProg);
@@ -1697,6 +1712,25 @@ class MetaballRenderer {
     gl.drawArrays(gl.TRIANGLES, 0, 6);
     r.slot = (r.slot + 1) % r.N;
     r.accCur = an;
+    if (!this.denoise) return;
+    // à-trous passes, steps 1, 2, 4 …: tmp0 → tmp1 → tmp0 … → outTex
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, null, 0);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+    gl.useProgram(this.denoiseProg);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, r.acc[an]);
+    gl.uniform1i(this.dnU.uAcc, 2);
+    gl.uniform1i(this.dnU.uSrc, 3);
+    gl.uniform1f(this.dnU.uK, this.denoiseK || 6);
+    const passes = this.denoisePasses || 4;
+    for (let k = 0; k < passes; k++) {
+      const src = r.tmp[k & 1], dst = k === passes - 1 ? outTex : r.tmp[(k + 1) & 1];
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, dst, 0);
+      gl.activeTexture(gl.TEXTURE3);
+      gl.bindTexture(gl.TEXTURE_2D, src);
+      gl.uniform1i(this.dnU.uStep, 1 << k);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
   }
 
   gpuWall(t, NSRC, dtTrace, lowQ) {
@@ -2281,6 +2315,7 @@ class MetaballRenderer {
     const lightGpu = causticsOn && this.wallGpu && params.lightCpu !== true;
     this.rayScale = params.rayScale || 1;
     this.taa = params.taa !== false;
+    this.denoise = params.denoise !== false;
     this.wallFull = params.wallFull !== false;
     this._lightGpuOn = lightGpu;
     if (lightGpu) {
@@ -2690,6 +2725,7 @@ $("wallLight").onchange = (e) => params.wall = e.target.checked;
 params.rayScale = 1;
 $("rays").oninput = (e) => { params.rayScale = parseFloat(e.target.value); };
 $("taa").onchange = (e) => params.taa = e.target.checked;
+$("denoise").onchange = (e) => params.denoise = e.target.checked;
 $("wallFull").onchange = (e) => params.wallFull = e.target.checked;
 function updateRaysLabel() {
   const r = renderer;
