@@ -1833,7 +1833,7 @@ class MetaballRenderer {
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.causAccFbo);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.uniform1i(tU.uRefSrc, -1);
-    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, (J - 1) * NAZ * (NPH - 1) * 2 * NSRC);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 6, (J - 1) * NAZ * (NPH - 1) * 2 * NSRC);
     // 2b. the full reference (changes slowly: every 4th update)
     if (!this.refReady || (this._refTick = ((this._refTick || 0) + 1) % 4) === 0) {
       const build = this.refReady ? this.refCur ^ 1 : 0;
@@ -1841,7 +1841,7 @@ class MetaballRenderer {
       gl.clear(gl.COLOR_BUFFER_BIT);
       for (let src = 0; src < NSRC; src++) {
         gl.uniform1i(tU.uRefSrc, src);
-        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, (J - 1) * NAZ * (NPH - 1));
+        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 6, (J - 1) * NAZ * (NPH - 1));
       }
       this.refCur = build; this.refReady = true;
     }

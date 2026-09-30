@@ -1227,8 +1227,12 @@ float density(int m, int j) {
   return E / max(0.5 * (w0 + w1) * abs(y1 - y0) * s.y, 0.5);
 }
 void main() {
-  // one instance per tube slab, drawn as a 4-vertex strip:
-  // 0 lower-left, 1 lower-right, 2 upper-left, 3 upper-right
+  // One instance per tube slab, drawn as a 6-vertex strip: a tent across
+  // the tube's x range — 0 at twice the range's half-width from its
+  // centre, peaking at the centre (same light as a flat band over the
+  // range). Flat bands left parallel stripes where neighbouring tubes
+  // carry slightly different light; overlapping tents add up smoothly.
+  // Vertices: 0/1 left (lower/upper), 2/3 centre, 4/5 right.
   int q = gl_InstanceID, k = gl_VertexID;
   int nsl = uPathK - 1;
   int j = q % nsl; q /= nsl;
@@ -1260,7 +1264,7 @@ void main() {
   // The tube's light varies linearly through the slab, matching its
   // neighbouring slabs at the shared planes — a constant per slab would
   // make the field a staircase in height.
-  bool top = k >= 2;
+  bool top = (k & 1) == 1;
   float dn = top ? density(2, j + 1) : density(0, j - 1);
   float w = dn >= 0.0 ? 0.5 * (dn + dj) : dj;
   float x0, X0, y0, q0, p0, x1, X1, y1, q1, p1;
@@ -1269,8 +1273,10 @@ void main() {
   vec2 s = uTgt / uSim;
   float hw0 = 0.5 * max((X0 - x0) * s.x, 1.0) / s.x, hw1 = 0.5 * max((X1 - x1) * s.x, 1.0) / s.x;
   float cx0 = 0.5 * (x0 + X0), cx1 = 0.5 * (x1 + X1);
-  vec2 P = k == 0 ? vec2(cx0 - hw0, y0) : k == 1 ? vec2(cx0 + hw0, y0)
-         : k == 2 ? vec2(cx1 - hw1, y1) : vec2(cx1 + hw1, y1);
+  int col = k / 2;                                           // 0 left, 1 centre, 2 right
+  float side = float(col - 1) * 2.0;                         // −2, 0, +2 half-widths
+  vec2 P = top ? vec2(cx1 + side * hw1, y1) : vec2(cx0 + side * hw0, y0);
+  if (col != 1) w = 0.0;
   vW = row < uRowsLens ? vec2(w, 0.0) : vec2(0.0, w);
   vec2 t = P * s;
   gl_Position = dj >= 0.0 ? vec4(t.x / uTgt.x * 2.0 - 1.0, 1.0 - t.y / uTgt.y * 2.0, 0.0, 1.0)
