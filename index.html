@@ -376,6 +376,10 @@
     <input type="checkbox" id="wallLight" checked />
     <label for="wallLight" style="cursor:pointer">Light on wall behind</label>
   </div>
+  <div class="control" style="display:flex;align-items:center;gap:6px">
+    <input type="checkbox" id="taa" checked />
+    <label for="taa" style="cursor:pointer">Temporal smoothing (TAA)</label>
+  </div>
   <div class="control">
     <label>Light rays <span class="val" id="raysVal">—</span></label>
     <input type="range" id="rays" min="0.25" max="2" step="0.05" value="1" />
@@ -690,7 +694,7 @@ class MetaballRenderer {
         this.ltU = L(this.lightProg, ["uSim", "uViewM", "uViewT", "uWallD", "uGlow", "uRayScale",
                                       "uRayDim", "uAzSpan", "uYSrc", "uSrcR", "uMuPool", "uNB", "uWB0", "uWB1",
                                       "uPool", "uPoolN", "uLensOn", "uMode", "uRowOff",
-                                      "uPoolYMin", "uSub", "uRays", "uMaxSpan"]);
+                                      "uPoolYMin", "uSub", "uRays", "uMaxSpan", "uJitter"]);
         this.wsU = L(this.wallSplatProg, ["uRays", "uRayDim", "uView", "uCell", "uMaxSpan"]);
         this.wbU = L(this.wallSubProg, ["uSubRays", "uSub", "uRayDim", "uView", "uCell", "uMaxSpan"]);
         this.subTex = gl.createTexture(); this.subKey = "";
@@ -1598,6 +1602,13 @@ class MetaballRenderer {
     gl.uniform1f(t.uSrcR, 0);
     gl.uniform1f(t.uMuPool, 0.004);
     gl.uniform1f(t.uPoolYMin, this.poolYMin);
+    // TAA: offset the whole ray grid by a sub-ray step each trace (Halton
+    // 2,3 over 16 traces); the update passes average the samplings
+    if (this.taa) {
+      const k = (this._jitK = ((this._jitK || 0) + 1) % 16) + 1;
+      const halton = (i, b) => { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; };
+      gl.uniform2f(t.uJitter, halton(k, 2) - 0.5, halton(k, 3) - 0.5);
+    } else gl.uniform2f(t.uJitter, 0, 0);
     gl.uniform1i(t.uNB, nb);
     gl.uniform4fv(t.uWB0, w0);
     gl.uniform4fv(t.uWB1, w1);
@@ -1732,7 +1743,11 @@ class MetaballRenderer {
     gl.uniform1f(uU.uInvRef, 1 / this.bdRef);
     gl.uniform1f(uU.uAlpha, Math.min(1, dtTrace / tau));
     // light temporal smoothing: half-life of 2 frames
-    gl.uniform1f(uU.uSM, 1 - Math.pow(0.5, dtTrace / (2 / 60)));
+    // temporal smoothing, per frame of time: half-life 2 frames; with TAA
+    // (a jittered ray grid) ~3, to average its samplings. (No neighbourhood clamp:
+    // with light fields it snapped flat regions back to the noisy sample,
+    // and lava moves slowly enough that trails are negligible.)
+    gl.uniform1f(uU.uSM, 1 - Math.pow(this.taa ? 0.8 : 0.707, dtTrace * 60));
     gl.uniform1f(uU.uInit, this.bdAvgInit ? 0 : 1);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
@@ -1887,7 +1902,7 @@ class MetaballRenderer {
     const cU = this.cuU;
     gl.uniform1i(cU.uAcc, 5); gl.uniform1i(cU.uRef, 6); gl.uniform1i(cU.uPrev, 7);
     gl.uniform1f(cU.uInvRef, 1 / this.causRef.f);
-    gl.uniform1f(cU.uSM, 1 - Math.pow(0.3, dtTrace / (2 / 60)));
+    gl.uniform1f(cU.uSM, 1 - Math.pow(this.taa ? 0.8 : 0.548, dtTrace * 60));   // see gpuWall
     gl.uniform1f(cU.uInit, this.causInit ? 0 : 1);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
@@ -2227,6 +2242,7 @@ class MetaballRenderer {
     const causticsOn = params.caustics !== false;
     const lightGpu = causticsOn && this.wallGpu && params.lightCpu !== true;
     this.rayScale = params.rayScale || 1;
+    this.taa = params.taa !== false;
     this._lightGpuOn = lightGpu;
     if (lightGpu) {
       // Everything on the GPU (gpuLight); the CPU only builds the blob list
@@ -2634,6 +2650,7 @@ $("wallLight").onchange = (e) => params.wall = e.target.checked;
 // and liquid; the label shows how many rays are traced
 params.rayScale = 1;
 $("rays").oninput = (e) => { params.rayScale = parseFloat(e.target.value); };
+$("taa").onchange = (e) => params.taa = e.target.checked;
 function updateRaysLabel() {
   const r = renderer;
   if (!r.wallGpu) { $("raysVal").textContent = "CPU"; return; }

@@ -757,6 +757,7 @@ uniform float uPoolYMin;
 // across it; other tubes output nothing.
 uniform int   uSub;
 uniform highp sampler2D uRays;  // the main wall trace
+uniform vec2  uJitter;      // sub-ray offset of the whole ray grid (TAA), in ray steps
 uniform float uMaxSpan;    // highest point of the pool surface (smallest y)
 uniform int   uRowOff;
 // mode 0: wall x, wall y (view px), power, signature + wax share (o only)
@@ -868,6 +869,7 @@ void main() {
     fip = float(p) + float(j) / float(uSub);
     subW = 1.0 / float(uSub * uSub);
   }
+  fia += uJitter.x; fip += uJitter.y;
   // The bulb: one diffuse (Lambertian) source at the centre of the base.
   // (uRayDim.z > 1 would add points on a ring of radius uSrcR — but each
   // point casts its own image of every blob, so one blob would show as
@@ -1131,6 +1133,8 @@ void main() {
   // 16 weight × 4 texels per tap (the 2×2 average), per grid cell (4 texels)
   v *= uInvRef * 4.0 / 16.0;
   vec2 a = uInit > 0.5 ? v : mix(texelFetch(uAvg, p, 0).rg, v, uAlpha);
+  // (with TAA the ray grid is jittered every trace, so this history
+  // averages several samplings of the light)
   vec2 s = uInit > 0.5 ? vec2(0.0) : mix(texelFetch(uPrev, p, 0).rg, v - a, uSM);
   oAvg = vec4(a, 0.0, 1.0);
   oWall = vec4(s, 0.0, 1.0);
@@ -1320,6 +1324,8 @@ void main() {
     }
   }
   vec2 cur = vec2((v.r - v.g) / 16.0, g / gw) * uInvRef;
+  // (with TAA the ray grid is jittered every trace, so this history
+  // averages several samplings of the light)
   vec2 s = uInit > 0.5 ? cur : mix(texelFetch(uPrev, p, 0).rg, cur, uSM);
   o = vec4(s, 0.0, 1.0);
 }`;
