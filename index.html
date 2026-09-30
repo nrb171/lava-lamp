@@ -376,6 +376,10 @@
     <input type="checkbox" id="wallLight" checked />
     <label for="wallLight" style="cursor:pointer">Light on wall behind</label>
   </div>
+  <div class="control">
+    <label>Light rays <span class="val" id="raysVal">—</span></label>
+    <input type="range" id="rays" min="0.25" max="2" step="0.05" value="1" />
+  </div>
 
   <button id="reset">Reset simulation</button>
 
@@ -1606,7 +1610,9 @@ class MetaballRenderer {
 
   gpuWall(t, NSRC, dtTrace, lowQ) {
     const gl = this.gl;
-    const NPH = lowQ ? 40 : 128, NAZ = lowQ ? 80 : 256;
+    const rs = this.rayScale || 1;
+    const NPH = Math.max(8, Math.round((lowQ ? 40 : 128) * rs)), NAZ = Math.max(16, Math.round((lowQ ? 80 : 256) * rs));
+    this.wallRays = NAZ * NPH * NSRC;
     if (!this.ensureRays(NAZ, NPH, NSRC)) { this.wallGpu = false; this.WG_W = 0; this.ensureWallGrid(); return; }
     // 1. rays → wall landing points
     gl.useProgram(this.lightProg);
@@ -1733,7 +1739,9 @@ class MetaballRenderer {
   // filtered field over the lamp.
   gpuCaustics(t, NSRC, glow, dtTrace, lowQ) {
     const gl = this.gl;
-    const J = lowQ ? 20 : 40, NAZ = lowQ ? 64 : 128, NPH = lowQ ? 24 : 48;
+    const rs = this.rayScale || 1, J = lowQ ? 20 : 40;
+    const NAZ = Math.max(16, Math.round((lowQ ? 64 : 128) * rs)), NPH = Math.max(6, Math.round((lowQ ? 24 : 48) * rs));
+    this.causRays = NAZ * NPH * NSRC;
     const cell = lowQ ? 4 : 2;
     const CW = Math.round(SIM_W / cell), CH = Math.round(SIM_H / cell);
     const rows = NPH * NSRC;
@@ -2212,6 +2220,7 @@ class MetaballRenderer {
     // Step 2b: caustics from wax lensing + wall reflection (see traceCaustics).
     const causticsOn = params.caustics !== false;
     const lightGpu = causticsOn && this.wallGpu && params.lightCpu !== true;
+    this.rayScale = params.rayScale || 1;
     this._lightGpuOn = lightGpu;
     if (lightGpu) {
       // Everything on the GPU (gpuLight); the CPU only builds the blob list
@@ -2614,6 +2623,17 @@ $("caustics").onchange = (e) => params.caustics = e.target.checked;
 $("glassLens").onchange = (e) => params.lens = e.target.checked;
 $("bloom").onchange = (e) => params.bloom = e.target.checked;
 $("wallLight").onchange = (e) => params.wall = e.target.checked;
+
+// Light rays: scales the GPU light trace's ray grids (both axes), wall
+// and liquid; the label shows how many rays are traced
+params.rayScale = 1;
+$("rays").oninput = (e) => { params.rayScale = parseFloat(e.target.value); };
+function updateRaysLabel() {
+  const r = renderer;
+  if (!r.wallGpu) { $("raysVal").textContent = "CPU"; return; }
+  const n = (params.wall !== false ? (r.wallRays || 0) : 0) + (r.causRays || 0);
+  $("raysVal").textContent = "×" + params.rayScale.toFixed(2) + " · " + (n >= 1000 ? Math.round(n / 1000) + "k" : n);
+}
 
 $("glow").oninput = (e) => {
   params.glow = parseFloat(e.target.value);
@@ -3047,6 +3067,7 @@ function frame(now) {
     const fps = Math.round((frames * 1000) / (now - fpsTime));
     $("fpsText").textContent = fps + " fps · " + Math.round(renderScale * 100) + "% res";
     $("partText").textContent = sim.n + " particles";
+    updateRaysLabel();
     frames = 0;
     fpsTime = now;
   }
