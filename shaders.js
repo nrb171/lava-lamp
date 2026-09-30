@@ -492,7 +492,12 @@ void main() {
     float colU = sp.x / uSim.x;
     float colV = 1.0 - t;   // texV: 0=top of lamp, 1=bottom
     vec4 vol = texture(uColMass, vec2(colU, colV));
-    float light = vol.r;
+    // The CPU grid's per-column shadowing (light walking up from a fixed
+    // row, dimmed by the wax mass above it) is only a fallback: with the
+    // GPU trace, blob shadows are in its caustic difference, and this
+    // model also shadowed the liquid above a thick pool with the pool's
+    // own wax — a dark fan with a flat bottom.
+    float light = uCausGpu > 0.5 ? 1.0 : vol.r;
 
     // God ray: additive warm glow scaled by bulb glow slider
     vec3 rayColor = mix(uHot, LIN(vec3(1.0, 0.97, 0.90)), 0.3);
