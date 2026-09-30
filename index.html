@@ -376,6 +376,22 @@
     <input type="checkbox" id="wallLight" checked />
     <label for="wallLight" style="cursor:pointer">Light on wall behind</label>
   </div>
+  <div class="control" style="display:flex;align-items:center;gap:6px">
+    <input type="checkbox" id="wallFull" checked />
+    <label for="wallFull" style="cursor:pointer">Show full wall light (not just changes)</label>
+  </div>
+  <div class="control" style="display:flex;align-items:center;gap:6px">
+    <input type="checkbox" id="taa" checked />
+    <label for="taa" style="cursor:pointer">Temporal smoothing (TAA)</label>
+  </div>
+  <div class="control" style="display:flex;align-items:center;gap:6px">
+    <input type="checkbox" id="denoise" checked />
+    <label for="denoise" style="cursor:pointer">Denoise light (with TAA)</label>
+  </div>
+  <div class="control">
+    <label>Light rays <span class="val" id="raysVal">—</span></label>
+    <input type="range" id="rays" min="0.25" max="2" step="0.05" value="1" />
+  </div>
 
   <button id="reset">Reset simulation</button>
 
@@ -450,6 +466,19 @@ function fresnelR(ci, n1, n2) {
   const rp = (n1 * ct - n2 * ci) / (n1 * ct + n2 * ci);
   return 0.5 * (rs * rs + rp * rp);
 }
+
+// The pool's resting surface, as a fraction of the lamp's height: the
+// lamp draws a solid pool below it (shaders: poolBlockMask). The light
+// source sits just under it, in the top of the pool.
+const POOL_REST_T = 0.89;
+const LIGHT_SRC_T = POOL_REST_T + 0.015;
+// the bulb's light leaves the base from a Gaussian spot about the axis:
+// its σ, as a fraction of the lamp's width
+const BULB_SIGMA = 0.07;
+// width (σ, sim px) of each wall photon's splat
+const WALL_PHOTON_SIGMA = 8;
+// … and of each liquid photon's, across (sim px)
+const CAUS_PHOTON_SIGMA = 5;
 
 // ----------------- WebGL Renderer -----------------------------
 class MetaballRenderer {
@@ -652,7 +681,10 @@ class MetaballRenderer {
     // Wall behind the lamp (see traceWall3D): light from the bulb that
     // reaches the wall through the globe, split into liquid-path and
     // wax-path light, on a square-celled grid spanning the view.
-    this.WALL_DIST = 200;                  // wall plane behind the axis (sim px)
+    // wall plane behind the axis (sim px): about 0.6 lamp heights — close
+    // enough to catch the light, far enough for it to spread and fall off
+    this.WALL_DIST = 400;
+    this.WALL_DIST_REF = 200;              // brightness is normalised as if the wall were here
     // Two wall textures (previous and newest trace); the shader blends
     // between them every frame, so the CPU only touches the wall grid on
     // the frames it traces.
@@ -672,32 +704,34 @@ class MetaballRenderer {
     if (gl.getExtension("EXT_color_buffer_float")) {
       try {
         this.lightProg = link(VS, LIGHT_TRACE_FS);
-        this.wallSplatProg = link(WALL_SPLAT_VS, WALL_SPLAT_FS);
+        this.wallPhotonProg = link(WALL_PHOTON_VS, WALL_PHOTON_FS);
         this.wallUpdProg = link(VS, WALL_UPDATE_FS);
-        this.causTubeProg = link(CAUS_TUBE_VS, CAUS_TUBE_FS);
-        this.causCrossProg = link(VS, CAUS_CROSS_FS);
+        this.causPhotonProg = link(CAUS_PHOTON_VS, CAUS_PHOTON_FS);
         this.causEdgeProg = link(VS, CAUS_EDGE_FS);
+        this.ringAvgProg = link(VS, RING_AVG_FS);
+        this.denoiseProg = link(VS, DENOISE_FS);
+        this.scratchFbo = gl.createFramebuffer();
+        this.rings = {};
         this.causUpdProg = link(VS, CAUS_UPDATE_FS);
         const L = (p, names) => Object.fromEntries(names.map(n => [n, gl.getUniformLocation(p, n)]));
         this.ltU = L(this.lightProg, ["uSim", "uViewM", "uViewT", "uWallD", "uGlow", "uRayScale",
-                                      "uRayDim", "uAzSpan", "uYSrc", "uSrcR", "uMuPool", "uNB", "uWB0", "uWB1",
-                                      "uPool", "uPoolN", "uBumpZ", "uLensOn", "uMode", "uRowOff",
-                                      "uPoolYMin"]);
-        this.wsU = L(this.wallSplatProg, ["uRays", "uRayDim", "uView", "uCell", "uMaxSpan"]);
-        this.wuU = L(this.wallUpdProg, ["uIrr", "uAvg", "uPrev", "uInvRef", "uAlpha", "uSM", "uInit"]);
-        this.ctU = L(this.causTubeProg, ["uPath", "uPathK", "uRayDim", "uRowsLens", "uSim", "uTgt", "uMaxW",
-                                         "uFlag", "uRefSrc"]);
+                                      "uRayDim", "uAzSpan", "uYSrc", "uMuPool", "uNB", "uWB0", "uWB1",
+                                      "uPool", "uPoolN", "uLensOn", "uMode", "uRowOff",
+                                      "uPoolYMin", "uSrcSigma", "uSeed"]);
+        this.wpU = L(this.wallPhotonProg, ["uRays", "uRaySize", "uView", "uSigma"]);
+        this.wuU = L(this.wallUpdProg, ["uIrr", "uAvg", "uPrev", "uInvRef", "uAlpha", "uSM", "uInit", "uFull"]);
+        this.cpU = L(this.causPhotonProg, ["uV0", "uV1", "uV2", "uV3", "uNAz", "uRowsLens", "uRefSrc", "uSim", "uTgt", "uSig"]);
         this.cuU = L(this.causUpdProg, ["uAcc", "uRef", "uPrev", "uInvRef", "uSM", "uInit"]);
         this.ceU = L(this.causEdgeProg, ["uCaus", "uSim", "uEdgeScale"]);
+        this.raU = L(this.ringAvgProg, ["uRing", "uAcc", "uCount", "uSlot", "uHist"]);
+        this.dnU = L(this.denoiseProg, ["uSrc", "uAcc", "uStep", "uK"]);
         this.causEdgeTex = gl.createTexture();
-        this.ccU = L(this.causCrossProg, ["uV0", "uV1", "uV2", "uV3", "uPlanes", "uPlaneY0", "uPlaneDY"]);
         this.emptyVao = gl.createVertexArray();     // the splat / line passes have no attributes
         this.avgTex = [gl.createTexture(), gl.createTexture()];
         this.irrTex = gl.createTexture();
         this.poolTex = gl.createTexture();
         this.rayTex = null; this.rayKey = "";
         this.pathTex = [0, 1, 2, 3].map(() => gl.createTexture()); this.pathKey = "";
-        this.crossTex = gl.createTexture();
         this.refTex = [gl.createTexture(), gl.createTexture()];
         this.refFbo = [null, null];
         this.causTex = [gl.createTexture(), gl.createTexture()];
@@ -1378,14 +1412,19 @@ class MetaballRenderer {
     return ok ? fb : null;
   }
 
-  // The pool's top surface, for LIGHT_TRACE_FS. Each particle adds its
-  // area (2-D sim) to the wax thickness over its x, weighted by how much it
-  // belongs to the pool: 1 in the pool; a blob breaking free fades out over
-  // the same 0.8 s its own lens fades in; a merging blob (ghost) fades in as
-  // its lens fades out — so the light never switches between the two.
-  // Thickness = broad part (the pool's dome, made round about the lamp's
-  // axis) + detail (bumps and necks), the detail being round bumps
-  // uBumpZ across. Row 0: top y vs radius; row 1: detail vs x.
+  // The pool, for LIGHT_TRACE_FS: a smooth base surface (a height field)
+  // plus its bumps and columns as wax ellipsoids (addPoolBumps), like the
+  // free blobs. (Bumps in the height field made a rising column a steep
+  // mound that bent light to extremes, then switched to a blob's ellipsoid
+  // when it pinched off: a pop.)
+  //
+  // Each particle adds its area (2-D sim) to the wax thickness over its x,
+  // weighted by how much it belongs to the pool: 1 in the pool; a blob
+  // breaking free fades out over the same 0.8 s its own lens fades in; a
+  // merging blob (ghost) fades in as its lens fades out. Pass 1 finds the
+  // base; particles more than ~10 px above it are bumps; pass 2 rebuilds
+  // the base without them. The base is made round about the lamp's axis;
+  // row 0 of the texture is its top y vs radius.
   buildPoolTex(sim, px, py, dt) {
     const gl = this.gl, N = 128, half = SIM_W / 2, dxs = SIM_W / (N - 1);
     if (!this._poolFloor) {
@@ -1409,8 +1448,10 @@ class MetaballRenderer {
       this._hbSlow = new Float64Array(N); this._hbInit = false;
       this._poolData = new Float32Array(2 * N);
     }
-    const h2 = this._h2, hb = this._hb, floor = this._poolFloor;
-    h2.fill(0);
+    if (!this._pw || this._pw.length < sim.n) {
+      this._pw = new Float32Array(sim.cap); this._bm = new Float32Array(sim.cap); this._bump = new Int32Array(sim.cap);
+    }
+    const h2 = this._h2, hb = this._hb, floor = this._poolFloor, pw = this._pw;
     const a0 = sim.mass / sim.restDensity, sig = 0.5 * sim.h;
     const inv = 1 / (2 * sig * sig), norm = a0 / (Math.sqrt(2 * Math.PI) * sig);
     const gPool = sim.nFixed > 0 ? sim.groupId[0] : -1;
@@ -1421,24 +1462,49 @@ class MetaballRenderer {
       if (gh >= 0) w = this.ghostMix[gh];
       else if (sim.groupId[i] === gPool) w = 1;
       else { const a = Math.min(1, freeAge[i] / 0.8); w = 1 - a * a * (3 - 2 * a); }
-      if (w <= 1e-3) continue;
-      const xi = px[i];
-      const j0 = Math.max(0, Math.floor((xi - 3 * sig) / dxs)), j1 = Math.min(N - 1, Math.ceil((xi + 3 * sig) / dxs));
-      for (let j = j0; j <= j1; j++) { const d = j * dxs - xi; h2[j] += w * norm * Math.exp(-d * d * inv); }
+      pw[i] = w > 1e-3 ? w : 0;
     }
-    // broad part: Gaussian, σ = 40 px
-    const sj = 40 / dxs, R = Math.ceil(3 * sj);
-    for (let j = 0; j < N; j++) {
-      let s = 0, ws = 0;
-      for (let k = Math.max(0, j - R); k <= Math.min(N - 1, j + R); k++) {
-        const w = Math.exp(-0.5 * ((k - j) / sj) ** 2); s += w * h2[k]; ws += w;
+    const bm = this._bm;
+    const thickness = (skipBumps) => {
+      h2.fill(0);
+      for (let i = 0; i < sim.n; i++) {
+        const w = skipBumps ? pw[i] * (1 - bm[i]) : pw[i];
+        if (w === 0) continue;
+        const xi = px[i];
+        const j0 = Math.max(0, Math.floor((xi - 3 * sig) / dxs)), j1 = Math.min(N - 1, Math.ceil((xi + 3 * sig) / dxs));
+        for (let j = j0; j <= j1; j++) { const d = j * dxs - xi; h2[j] += w * norm * Math.exp(-d * d * inv); }
       }
-      hb[j] = s / ws;
+      // broad: Gaussian, σ = 40 px
+      const sj = 40 / dxs, R = Math.ceil(3 * sj);
+      for (let j = 0; j < N; j++) {
+        let s = 0, ws = 0;
+        for (let k = Math.max(0, j - R); k <= Math.min(N - 1, j + R); k++) {
+          const w = Math.exp(-0.5 * ((k - j) / sj) ** 2); s += w * h2[k]; ws += w;
+        }
+        hb[j] = s / ws;
+      }
+    };
+    // pass 1: base with everything. A particle belongs to a bump by how
+    // far it stands above the base — gradually, from 0.2 h to 0.6 h, so
+    // nothing switches between the two models in one frame.
+    bm.fill(0);
+    thickness(false);
+    let nBump = 0;
+    const bump = this._bump, h = sim.h;
+    for (let i = sim.nFixed; i < sim.n; i++) {
+      if (pw[i] === 0) continue;
+      const u = Math.min(N - 1, Math.max(0, px[i] / dxs)), j = Math.min(N - 2, u | 0), f = u - j;
+      const base = (floor[j] - hb[j]) * (1 - f) + (floor[j + 1] - hb[j + 1]) * f;
+      const e = Math.min(1, Math.max(0, (base - py[i] - 0.2 * h) / (0.4 * h)));
+      bm[i] = e * e * (3 - 2 * e);
+      if (bm[i] > 0) bump[nBump++] = i;
     }
-    // The broad level follows a running average (the wall baseline's time
+    this._nBump = nBump;
+    // pass 2: the base without them (by their bump share)
+    thickness(true);
+    // The base level follows a running average (the wall baseline's time
     // constant): the pool slowly filling or draining moves the whole light
-    // cone, which the wall would otherwise show as broad glows. Bumps and
-    // necks (the detail) stay instantaneous.
+    // cone, which the wall would otherwise show as broad glows.
     const hs = this._hbSlow;
     if (!this._hbInit || sim.resetCount !== this._hbReset) {
       hs.set(hb); this._hbInit = true; this._hbReset = sim.resetCount;
@@ -1446,14 +1512,14 @@ class MetaballRenderer {
       const k = Math.min(1, dt / (this._bdAge < 20 ? 2 : this.WALL_AVG_TAU));
       for (let j = 0; j < N; j++) hs[j] += (hb[j] - hs[j]) * k;
     }
-    // broad top, smoothed again (σ = 20 px) and evaluated directly at each
-    // x (interpolating between samples would leave kinks): the glass
-    // floor's own curvature would otherwise carry into the surface
+    // top, smoothed again (σ = 20 px) and evaluated directly at each x
+    // (interpolating between samples would leave kinks): the glass floor's
+    // own curvature would otherwise carry into the surface
     const topS = this._topS;
     for (let j = 0; j < N; j++) topS[j] = floor[j] - hs[j];
     const s2 = 20 / dxs, R2 = Math.ceil(4.5 * s2);   // (wide window: no step as it slides)
     const D = this._poolData;
-    const topAt = (x) => {
+    const topAt = this._poolTopAt = (x) => {
       const u = x / dxs, c = Math.round(u);
       let sum = 0, ws = 0;
       for (let k = Math.max(0, c - R2); k <= Math.min(N - 1, c + R2); k++) {
@@ -1461,16 +1527,16 @@ class MetaballRenderer {
       }
       return sum / ws;
     };
+    let yMin = 1e9;
     for (let j = 0; j < N; j++) {
       const rho = half * j / (N - 1);
       D[j] = 0.5 * (topAt(half + rho) + topAt(half - rho));
-      D[N + j] = h2[j] - hb[j];
+      D[N + j] = 0;
+      yMin = Math.min(yMin, D[j]);
     }
     // highest the surface gets (smallest y), so the tracer only looks the
     // pool up near it
-    let yMin = 1e9, hdMax = 0;
-    for (let j = 0; j < N; j++) { yMin = Math.min(yMin, D[j]); hdMax = Math.max(hdMax, D[N + j]); }
-    this.poolYMin = yMin - hdMax - 2;
+    this.poolYMin = yMin - 2;
     gl.activeTexture(gl.TEXTURE5);
     gl.bindTexture(gl.TEXTURE_2D, this.poolTex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -1479,13 +1545,60 @@ class MetaballRenderer {
     return N;
   }
 
+  // The pool's bumps and columns (buildPoolTex) as ellipsoids, appended to
+  // the blob list: bump particles grouped along x (a gap of more than h
+  // splits them), each group's weighted moments giving an ellipsoid that
+  // reaches down into the base. Particles count by their pool weight ×
+  // bump share. Lens strength = how much its particles belong to the pool,
+  // so as a blob pinches off, its share of the column's lens fades out
+  // while its own fades in. Returns the new blob count.
+  addPoolBumps(sim, px, py, nb, maxB) {
+    const n = this._nBump, idx = this._bump, pw = this._pw, bm = this._bm;
+    if (!n) return nb;
+    const order = Array.from(idx.subarray(0, n)).sort((a, b) => px[a] - px[b]);
+    const B = this._wBlobs, BS = this._wBlobS, cx = SIM_W * 0.5;
+    const pr2 = sim.mass / sim.restDensity / Math.PI, gap = sim.h;
+    let start = 0;
+    for (let e = 1; e <= n && nb < maxB; e++) {
+      if (e < n && px[order[e]] - px[order[e - 1]] <= gap) continue;
+      // cluster order[start .. e-1]
+      let sw = 0, sm = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
+      for (let k = start; k < e; k++) {
+        const i = order[k], w = pw[i] * bm[i];
+        sw += w; sm += bm[i]; sx += w * px[i]; sy += w * py[i]; sxx += w * px[i] * px[i]; syy += w * py[i] * py[i];
+      }
+      start = e;
+      if (sw < 0.5) continue;
+      const mx = sx / sw, my = sy / sw;
+      const vx = Math.max(0, sxx / sw - mx * mx), vy = Math.max(0, syy / sw - my * my);
+      const ax = Math.sqrt(4 * vx + pr2);
+      const top = my - Math.sqrt(4 * vy + pr2);
+      const bottom = this._poolTopAt(mx) + 0.25 * sim.h;          // into the base
+      if (bottom - top < 4) continue;
+      const cy = 0.5 * (top + bottom), ay = 0.5 * (bottom - top);
+      const Rl = bottleHalfFrac(Math.min(1, Math.max(0, cy / SIM_H))) * SIM_W;
+      const az = Math.min(ax, 0.9 * Rl);
+      const q = nb * 6;
+      B[q] = mx - cx; B[q + 1] = cy; B[q + 2] = 0; B[q + 3] = ax; B[q + 4] = ay; B[q + 5] = az;
+      // strength: how much its particles belong to the pool, faded in with
+      // its size (1 → 3 particles' worth) instead of appearing at a count
+      const g = Math.min(1, Math.max(0, (sw - 1) / 2));
+      BS[nb] = (sw / sm) * g * g * (3 - 2 * g);
+      if (BS[nb] < 0.01) continue;
+      nb++;
+    }
+    return nb;
+  }
+
   // One GPU light trace: the wall if wallOn, the liquid if causOn. Results:
   // bdTex[bdCurTex] and causTex[causCur] (each blended with the previous
   // one while drawing). dtWall / dtCaus: seconds between wall / liquid
   // traces; dtPool: between calls.
   gpuLight(sim, px, py, glow, lowQ, wallOn, causOn, dtWall, dtCaus, dtPool) {
     const gl = this.gl;
-    const nb = Math.min(40, this.buildWallBlobs(sim, px, py));
+    const poolN = this.buildPoolTex(sim, px, py, dtPool);   // leaves it on unit 5
+    let nb = Math.min(40, this.buildWallBlobs(sim, px, py));
+    nb = this.addPoolBumps(sim, px, py, nb, 40);
     const B = this._wBlobs, BS = this._wBlobS, w0 = this._wb0, w1 = this._wb1;
     for (let b = 0; b < nb; b++) {
       const q = b * 6, o = b * 4;
@@ -1495,20 +1608,22 @@ class MetaballRenderer {
     if (sim.resetCount !== this._bdResetSeen) {
       this.bdAvgInit = false; this.causInit = false; this._bdResetSeen = sim.resetCount;
     }
-    const poolN = this.buildPoolTex(sim, px, py, dtPool);   // leaves it on unit 5
     gl.useProgram(this.lightProg);
     const t = this.ltU;
     gl.uniform1i(t.uPool, 5);
     gl.uniform1i(t.uPoolN, poolN);
-    gl.uniform1f(t.uBumpZ, 22);
     gl.uniform2f(t.uSim, SIM_W, SIM_H);
     gl.uniform1f(t.uViewM, VIEW_M);
     gl.uniform1f(t.uViewT, VIEW_T);
     gl.uniform1f(t.uWallD, this.WALL_DIST);
     gl.uniform1f(t.uGlow, glow);
-    // the bulb, at the centre of the base, under the pool wax
-    gl.uniform1f(t.uYSrc, 0.96 * SIM_H);
-    gl.uniform1f(t.uSrcR, 0);
+    // The light source sits on the axis just under the pool's resting
+    // surface (where the lamp draws its solid pool). At the base, all its
+    // light crossed the pool's surface, which moves as wax leaves and
+    // returns — shifting the whole light field in jerks. Here mostly real
+    // bumps and columns above that level bend it.
+    gl.uniform1f(t.uYSrc, LIGHT_SRC_T * SIM_H);
+    gl.uniform1f(t.uSrcSigma, BULB_SIGMA * SIM_W);
     gl.uniform1f(t.uMuPool, 0.004);
     gl.uniform1f(t.uPoolYMin, this.poolYMin);
     gl.uniform1i(t.uNB, nb);
@@ -1524,9 +1639,105 @@ class MetaballRenderer {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
+  // TAA. Each target (wall, liquid) has a ring of its last N traces and a
+  // cycle of N jitter offsets for the ray grid (Halton 2,3); what is drawn
+  // is the ring's mean (RING_AVG_FS). A still scene then gives the same
+  // result every frame. N = 8 at full quality, 4 at the low tier.
+  taaRing(name, W, H, N) {
+    const gl = this.gl;
+    let r = this.rings[name];
+    if (!r || r.W !== W || r.H !== H || r.N !== N) {
+      if (r) { gl.deleteTexture(r.tex); r.acc.forEach(t => gl.deleteTexture(t)); r.tmp.forEach(t => gl.deleteTexture(t)); }
+      const tex = gl.createTexture();
+      gl.activeTexture(gl.TEXTURE7);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+      gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RG16F, W, H, N, 0, gl.RG, gl.FLOAT, null);
+      // the accumulators (RING_AVG_FS): running mean and count, full floats —
+      // half floats can't hold a long average (small steps round away)
+      const acc = [0, 1].map(() => {
+        const a = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, a);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, W, H, 0, gl.RGBA, gl.FLOAT, null);
+        return a;
+      });
+      // the denoiser's ping-pong pair (DENOISE_FS)
+      const tmp = [0, 1].map(() => {
+        const a = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, a);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG16F, W, H, 0, gl.RG, gl.FLOAT, null);
+        return a;
+      });
+      r = this.rings[name] = { tex, acc, tmp, accCur: 0, W, H, N, slot: 0, filled: 0 };
+    }
+    if (!this.taa) r.filled = 0;                // restart when TAA is turned back on
+    return r;
+  }
+  taaSeed(t, r) {
+    const gl = this.gl;
+    // Random ray origins and directions (the wide bulb, LIGHT_TRACE_FS) are
+    // their own jitter: a fresh seed every trace, so samples keep adding up
+    // (RING_AVG_FS) instead of cycling through the same few sets.
+    this._seedN = (this._seedN || 0) + 1;
+    gl.uniform1f(t.uSeed, this._seedN % 65536 + 1);
+  }
+  // after the update pass wrote this trace into layer r.slot: add it to the
+  // accumulator (restarting it where the light moved), denoise → outTex
+  taaResolve(r, outTex, hist) {
+    const gl = this.gl;
+    r.filled = Math.min(r.N, r.filled + 1);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchFbo);
+    const an = r.accCur ^ 1;
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, r.acc[an], 0);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, this.denoise ? r.tmp[0] : outTex, 0);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+    gl.viewport(0, 0, r.W, r.H);
+    gl.useProgram(this.ringAvgProg);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, r.tex);
+    gl.uniform1i(this.raU.uRing, 3);
+    // the ring fills slot by slot: average what is there so far
+    gl.uniform1i(this.raU.uCount, r.filled);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, r.acc[r.accCur]);
+    gl.uniform1i(this.raU.uAcc, 2);
+    gl.uniform1i(this.raU.uSlot, r.slot);
+    gl.uniform1f(this.raU.uHist, hist && r.filled >= r.N ? 1 : 0);
+    gl.bindVertexArray(this.vao);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    r.slot = (r.slot + 1) % r.N;
+    r.accCur = an;
+    if (!this.denoise) return;
+    // à-trous passes, steps 1, 2, 4 …: tmp0 → tmp1 → tmp0 … → outTex
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, null, 0);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+    gl.useProgram(this.denoiseProg);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, r.acc[an]);
+    gl.uniform1i(this.dnU.uAcc, 2);
+    gl.uniform1i(this.dnU.uSrc, 3);
+    gl.uniform1f(this.dnU.uK, this.denoiseK || 6);
+    const passes = this.denoisePasses || 4;
+    for (let k = 0; k < passes; k++) {
+      const src = r.tmp[k & 1], dst = k === passes - 1 ? outTex : r.tmp[(k + 1) & 1];
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, dst, 0);
+      gl.activeTexture(gl.TEXTURE3);
+      gl.bindTexture(gl.TEXTURE_2D, src);
+      gl.uniform1i(this.dnU.uStep, 1 << k);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+  }
+
   gpuWall(t, NSRC, dtTrace, lowQ) {
     const gl = this.gl;
-    const NPH = lowQ ? 40 : 128, NAZ = lowQ ? 80 : 256;
+    const rs = this.rayScale || 1;
+    const NPH = Math.max(8, Math.round((lowQ ? 128 : 384) * rs)), NAZ = Math.max(16, Math.round((lowQ ? 256 : 768) * rs));
+    this.wallRays = NAZ * NPH * NSRC;
     if (!this.ensureRays(NAZ, NPH, NSRC)) { this.wallGpu = false; this.WG_W = 0; this.ensureWallGrid(); return; }
     // 1. rays → wall landing points
     gl.useProgram(this.lightProg);
@@ -1542,29 +1753,32 @@ class MetaballRenderer {
     // normalisation, bdRef, divides the scale back out.)
     gl.uniform1f(t.uRayScale, 1e7 / (NPH * NAZ));
     gl.uniform3i(t.uRayDim, NAZ, NPH, NSRC);
+    const ring = this.taaRing("wall", this.WG_W, this.WG_H, lowQ ? 4 : 8);
+    gl.useProgram(this.lightProg);
+    this.taaSeed(t, ring);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-    // 2. ray tubes → wall (2× grid), additively
+    // 2. photons → wall (2× grid), additively
     const GWc = this.WG_W, GHc = this.WG_H;
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.irrFbo);
     gl.viewport(0, 0, 2 * GWc, 2 * GHc);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.useProgram(this.wallSplatProg);
+    gl.useProgram(this.wallPhotonProg);
     gl.activeTexture(gl.TEXTURE6);
     gl.bindTexture(gl.TEXTURE_2D, this.rayTex);
-    const sU = this.wsU;
-    gl.uniform1i(sU.uRays, 6);
-    gl.uniform3i(sU.uRayDim, NAZ, NPH, NSRC);
-    gl.uniform2f(sU.uView, VIEW_W, VIEW_H);
-    gl.uniform2f(sU.uCell, VIEW_W / (2 * GWc), VIEW_H / (2 * GHc));
-    gl.uniform1f(sU.uMaxSpan, 280);
+    const pU = this.wpU;
+    gl.uniform1i(pU.uRays, 6);
+    gl.uniform2i(pU.uRaySize, NAZ, NPH * NSRC);
+    gl.uniform2f(pU.uView, VIEW_W, VIEW_H);
+    // kernel: a fixed width on the wall (sim px), in 2× grid texels
+    gl.uniform1f(pU.uSigma, Math.min(20, WALL_PHOTON_SIGMA * (lowQ ? 1.5 : 1) * 2 * GWc / VIEW_W));
     gl.enable(gl.BLEND);
     gl.blendEquation(gl.FUNC_ADD);
     gl.blendFunc(gl.ONE, gl.ONE);
     gl.bindVertexArray(this.emptyVao);
-    gl.drawArrays(gl.TRIANGLES, 0, (NAZ - 1) * (NPH - 1) * NSRC * 6);
+    gl.drawArrays(gl.POINTS, 0, NAZ * NPH * NSRC);
     gl.disable(gl.BLEND);
 
     // Normalisation, once per grid: the mean wall light beside the lamp
@@ -1586,7 +1800,10 @@ class MetaballRenderer {
           }
         }
       }
-      this.bdRef = cnt && sum > 0 ? 4 * sum / cnt : 1;
+      // …measured on the actual wall, then scaled to the reference
+      // distance, so the 1/r² falloff to the real wall shows: the
+      // normalisation alone would otherwise cancel it
+      this.bdRef = (cnt && sum > 0 ? 4 * sum / cnt : 1) * (this.WALL_DIST / this.WALL_DIST_REF) ** 2;
     }
 
     // 3. filter down, baseline, drawn difference (see the CPU path)
@@ -1594,7 +1811,13 @@ class MetaballRenderer {
     this._bdAge += dtTrace;
     const tau = this._bdAge < 20 ? 2 : this.WALL_AVG_TAU;
     const cur = this.bdCurTex, nxt = cur ^ 1;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.updFbo[nxt]);
+    if (this.taa) {
+      // this trace's difference → the ring's current layer (resolved below)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchFbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.avgTex[nxt], 0);
+      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, ring.tex, 0, ring.slot);
+      gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+    } else gl.bindFramebuffer(gl.FRAMEBUFFER, this.updFbo[nxt]);
     gl.viewport(0, 0, GWc, GHc);
     gl.useProgram(this.wallUpdProg);
     const uU = this.wuU;
@@ -1604,28 +1827,31 @@ class MetaballRenderer {
     gl.uniform1i(uU.uIrr, 5); gl.uniform1i(uU.uAvg, 6); gl.uniform1i(uU.uPrev, 7);
     gl.uniform1f(uU.uInvRef, 1 / this.bdRef);
     gl.uniform1f(uU.uAlpha, Math.min(1, dtTrace / tau));
-    // light temporal smoothing: half-life of 2 frames
-    gl.uniform1f(uU.uSM, 1 - Math.pow(0.5, dtTrace / (2 / 60)));
+    // temporal smoothing: without TAA, a half-life of 2 frames; with TAA
+    // the raw trace goes to the ring, whose mean is drawn
+    gl.uniform1f(uU.uSM, this.taa ? 1 : 1 - Math.pow(0.707, dtTrace * 60));
     gl.uniform1f(uU.uInit, this.bdAvgInit ? 0 : 1);
+    gl.uniform1f(uU.uFull, this.wallFull ? 1 : 0);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
+    if (this.taa) this.taaResolve(ring, this.bdTex[nxt], this.bdAvgInit);
     this.bdAvgInit = true;
     this.bdCurTex = nxt;
     this.wallFramesSince = 0;
   }
 
-  // Caustics in the liquid: path vertices → plane crossings → ray tubes →
-  // filtered field over the lamp.
+  // Caustics in the liquid: path vertices → photon bands → filtered field
+  // over the lamp.
   gpuCaustics(t, NSRC, glow, dtTrace, lowQ) {
     const gl = this.gl;
-    const J = lowQ ? 20 : 40, NAZ = lowQ ? 64 : 128, NPH = lowQ ? 24 : 48;
+    const rs = this.rayScale || 1;
+    const NAZ = Math.max(16, Math.round((lowQ ? 128 : 256) * rs)), NPH = Math.max(6, Math.round((lowQ ? 48 : 96) * rs));
+    this.causRays = NAZ * NPH * NSRC;
     const cell = lowQ ? 4 : 2;
     const CW = Math.round(SIM_W / cell), CH = Math.round(SIM_H / cell);
     const rows = NPH * NSRC;
-    // planes from just above the pool to near the top
-    const yLo = 0.86 * SIM_H, yHi = 0.06 * SIM_H, dy = (yLo - yHi) / (J - 1);
     // targets
-    const pk = NAZ + "x" + rows + "x" + J;
+    const pk = NAZ + "x" + rows;
     if (pk !== this.pathKey) {
       // path vertices: four targets written at once, two columns per ray
       this.pathTex.forEach((tx, i) => { const fb = this.gpuTarget(tx, gl.RGBA32F, gl.RGBA, NAZ * 2, 2 * rows, gl.NEAREST, null); if (fb) gl.deleteFramebuffer(fb); });
@@ -1636,7 +1862,6 @@ class MetaballRenderer {
       gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2, gl.COLOR_ATTACHMENT3]);
       if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) { gl.deleteFramebuffer(this.pathFbo); this.pathFbo = null; }
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      this.crossFbo = this.gpuTarget(this.crossTex, gl.RGBA32F, gl.RGBA, NAZ * J, 2 * rows, gl.NEAREST, this.crossFbo);
       this.pathKey = pk; this.refReady = false;
     }
     const ck = CW + "x" + CH;
@@ -1648,7 +1873,7 @@ class MetaballRenderer {
       this.causEdgeFbo = this.gpuTarget(this.causEdgeTex, gl.RG16F, gl.RG, 2, CH, gl.LINEAR, this.causEdgeFbo);
       this.causKey = ck; this.causRef = null; this.causInit = false; this.refReady = false;
     }
-    if (!this.pathFbo || !this.crossFbo || !this.causAccFbo || !this.causFbo[0] || !this.causFbo[1]
+    if (!this.pathFbo || !this.causAccFbo || !this.causFbo[0] || !this.causFbo[1]
         || !this.refFbo[0] || !this.refFbo[1] || !this.causEdgeFbo) {
       console.warn("GPU caustic targets incomplete, using the CPU");
       this.wallGpu = false; this.WG_W = 0; this.ensureWallGrid(); return;
@@ -1659,6 +1884,9 @@ class MetaballRenderer {
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.pathFbo);
     gl.uniform1i(t.uMode, 1);
     gl.uniform1f(t.uAzSpan, 2 * Math.PI);
+    const ring = this.taaRing("caus", CW, CH, lowQ ? 4 : 8);
+    gl.useProgram(this.lightProg);
+    this.taaSeed(t, ring);
     gl.uniform1f(t.uRayScale, 1e3 / (NPH * NAZ));             // ~1 per texel: see gpuWall
     gl.uniform3i(t.uRayDim, NAZ, NPH, NSRC);
     gl.bindVertexArray(this.vao);
@@ -1668,51 +1896,34 @@ class MetaballRenderer {
       gl.uniform1f(t.uLensOn, pass === 0 ? 1 : 0);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
     }
-    // 1b. plane crossings
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.crossFbo);
-    gl.viewport(0, 0, NAZ * J, 2 * rows);
-    gl.useProgram(this.causCrossProg);
-    const xU = this.ccU;
+    // 2. photons → light, additively (path vertices on units 4-7)
+    gl.useProgram(this.causPhotonProg);
+    const pU = this.cpU;
     this.pathTex.forEach((tx, i) => { gl.activeTexture(gl.TEXTURE4 + i); gl.bindTexture(gl.TEXTURE_2D, tx); });
-    gl.uniform1i(xU.uV0, 4); gl.uniform1i(xU.uV1, 5); gl.uniform1i(xU.uV2, 6); gl.uniform1i(xU.uV3, 7);
-    gl.uniform1i(xU.uPlanes, J);
-    gl.uniform1f(xU.uPlaneY0, yLo);
-    gl.uniform1f(xU.uPlaneDY, dy);
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
-
-    // 2. tubes → light, additively (crossings on unit 6, blob flags on 7)
-    gl.useProgram(this.causTubeProg);
-    gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, this.crossTex);
-    gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, this.pathTex[3]);
-    const tU = this.ctU;
-    gl.uniform1i(tU.uPath, 6);
-    gl.uniform1i(tU.uFlag, 7);
-    gl.uniform1i(tU.uPathK, J);
-    gl.uniform3i(tU.uRayDim, NAZ, NPH, NSRC);
-    gl.uniform1i(tU.uRowsLens, rows);
-    gl.uniform2f(tU.uSim, SIM_W, SIM_H);
-    gl.uniform2f(tU.uTgt, CW, CH);
-    gl.uniform1f(tU.uMaxW, 90);
+    gl.uniform1i(pU.uV0, 4); gl.uniform1i(pU.uV1, 5); gl.uniform1i(pU.uV2, 6); gl.uniform1i(pU.uV3, 7);
+    gl.uniform1i(pU.uNAz, NAZ);
+    gl.uniform1i(pU.uRowsLens, rows);
+    gl.uniform2f(pU.uSim, SIM_W, SIM_H);
+    gl.uniform2f(pU.uTgt, CW, CH);
+    gl.uniform1f(pU.uSig, Math.max(0.7, CAUS_PHOTON_SIGMA / cell));
     gl.viewport(0, 0, CW, CH);
     gl.clearColor(0, 0, 0, 0);
     gl.enable(gl.BLEND);
     gl.blendEquation(gl.FUNC_ADD);
     gl.blendFunc(gl.ONE, gl.ONE);
     gl.bindVertexArray(this.emptyVao);
-    // 2a. the tubes blobs (or pool bumps) touched, traced and reference
+    // 2a. the rays blobs (or pool bumps) touched, traced and reference
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.causAccFbo);
     gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.uniform1i(tU.uRefSrc, -1);
-    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, (J - 1) * NAZ * (NPH - 1) * 2 * NSRC);
+    gl.uniform1i(pU.uRefSrc, -1);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, 6 * NAZ * 2 * rows);
     // 2b. the full reference (changes slowly: every 4th update)
     if (!this.refReady || (this._refTick = ((this._refTick || 0) + 1) % 4) === 0) {
       const build = this.refReady ? this.refCur ^ 1 : 0;
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.refFbo[build]);
       gl.clear(gl.COLOR_BUFFER_BIT);
-      for (let src = 0; src < NSRC; src++) {
-        gl.uniform1i(tU.uRefSrc, src);
-        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, (J - 1) * NAZ * (NPH - 1));
-      }
+      gl.uniform1i(pU.uRefSrc, 0);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, 6 * NAZ * rows);
       this.refCur = build; this.refReady = true;
     }
     gl.disable(gl.BLEND);
@@ -1748,7 +1959,12 @@ class MetaballRenderer {
 
     // 3. filter, normalise, smooth in time
     const cur = this.causCur, nxt = cur ^ 1;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.causFbo[nxt]);
+    if (this.taa) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchFbo);
+      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, ring.tex, 0, ring.slot);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, null, 0);
+      gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+    } else gl.bindFramebuffer(gl.FRAMEBUFFER, this.causFbo[nxt]);
     gl.viewport(0, 0, CW, CH);
     gl.useProgram(this.causUpdProg);
     gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, this.causAcc);
@@ -1757,10 +1973,11 @@ class MetaballRenderer {
     const cU = this.cuU;
     gl.uniform1i(cU.uAcc, 5); gl.uniform1i(cU.uRef, 6); gl.uniform1i(cU.uPrev, 7);
     gl.uniform1f(cU.uInvRef, 1 / this.causRef.f);
-    gl.uniform1f(cU.uSM, 1 - Math.pow(0.3, dtTrace / (2 / 60)));
+    gl.uniform1f(cU.uSM, this.taa ? 1 : 1 - Math.pow(0.548, dtTrace * 60));   // see gpuWall
     gl.uniform1f(cU.uInit, this.causInit ? 0 : 1);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
+    if (this.taa) this.taaResolve(ring, this.causTex[nxt], this.causInit);
     this.causInit = true;
     this.causCur = nxt;
     this.causFramesSince = 0;
@@ -2096,6 +2313,10 @@ class MetaballRenderer {
     // Step 2b: caustics from wax lensing + wall reflection (see traceCaustics).
     const causticsOn = params.caustics !== false;
     const lightGpu = causticsOn && this.wallGpu && params.lightCpu !== true;
+    this.rayScale = params.rayScale || 1;
+    this.taa = params.taa !== false;
+    this.denoise = params.denoise !== false;
+    this.wallFull = params.wallFull !== false;
     this._lightGpuOn = lightGpu;
     if (lightGpu) {
       // Everything on the GPU (gpuLight); the CPU only builds the blob list
@@ -2498,6 +2719,20 @@ $("caustics").onchange = (e) => params.caustics = e.target.checked;
 $("glassLens").onchange = (e) => params.lens = e.target.checked;
 $("bloom").onchange = (e) => params.bloom = e.target.checked;
 $("wallLight").onchange = (e) => params.wall = e.target.checked;
+
+// Light rays: scales the GPU light trace's ray grids (both axes), wall
+// and liquid; the label shows how many rays are traced
+params.rayScale = 1;
+$("rays").oninput = (e) => { params.rayScale = parseFloat(e.target.value); };
+$("taa").onchange = (e) => params.taa = e.target.checked;
+$("denoise").onchange = (e) => params.denoise = e.target.checked;
+$("wallFull").onchange = (e) => params.wallFull = e.target.checked;
+function updateRaysLabel() {
+  const r = renderer;
+  if (!r.wallGpu) { $("raysVal").textContent = "CPU"; return; }
+  const n = (params.wall !== false ? (r.wallRays || 0) : 0) + (r.causRays || 0);
+  $("raysVal").textContent = "×" + params.rayScale.toFixed(2) + " · " + (n >= 1000 ? Math.round(n / 1000) + "k" : n);
+}
 
 $("glow").oninput = (e) => {
   params.glow = parseFloat(e.target.value);
@@ -2931,6 +3166,7 @@ function frame(now) {
     const fps = Math.round((frames * 1000) / (now - fpsTime));
     $("fpsText").textContent = fps + " fps · " + Math.round(renderScale * 100) + "% res";
     $("partText").textContent = sim.n + " particles";
+    updateRaysLabel();
     frames = 0;
     fpsTime = now;
   }
