@@ -733,6 +733,9 @@ class MetaballRenderer {
       time:        this.uloc("uTime"),
       blobZ:       this.uloc("uBlobZ"),
       blobSize:    this.uloc("uBlobSize"),
+      sizeScale:   this.uloc("uSizeScale"),
+      v0:          this.uloc("uV0"),
+      muWax:       this.uloc("uMuWax"),
       colMass:       this.uloc("uColMass"),
       backdrop:      this.uloc("uBackdrop"),
       backdrop2:     this.uloc("uBackdrop2"),
@@ -2368,6 +2371,14 @@ class MetaballRenderer {
     if (this.u.blobZ) gl.uniform1fv(this.u.blobZ, this.blobZ36);
     // Per-blob smoothed visual size (normalized 0-1). Uses the
     // smoothed values so split-off blobs transition gradually.
+    // blob opacity (waxOpacity): absolute sizes from the relative ones
+    if (this.u.sizeScale) {
+      let maxN = 1;
+      for (let k = 0; k < sim.MAX_BLOBS; k++) if (sim.cmn[k] > maxN) maxN = sim.cmn[k];
+      gl.uniform1f(this.u.sizeScale, maxN);
+      gl.uniform1f(this.u.v0, sim.mass / sim.restDensity);
+      gl.uniform1f(this.u.muWax, 0.0125);      // ≈ 0.5 opaque at 10 particles, 0.7 at 30, 0.9 at 100
+    }
     if (this.u.blobSize) {
       gl.uniform1fv(this.u.blobSize, this.blobSize36);
     }

@@ -179,6 +179,9 @@ uniform float uGlow;
 uniform float uTime;
 uniform float uBlobZ[36];     // 0-31: sim blobs, 32-35: merge ghosts
 uniform float uBlobSize[36];
+uniform float uSizeScale;     // particles in the largest group (uBlobSize is relative to it)
+uniform float uV0;            // area of one particle (sim px²)
+uniform float uMuWax;         // wax absorption (per sim px)
 // Pool-merge fusion. A blob that just joined the pool keeps rendering as a
 // "ghost" group (id 32+k) whose fusion with the pool, uGhostMix[k], eases
 // 0 → 1. At 0 the pair renders as two touching blobs; at 1 exactly as one
@@ -241,6 +244,18 @@ float hash(vec2 p) {
   p = fract(p * vec2(123.34, 456.21));
   p += dot(p, p + 45.32);
   return fract(p.x * p.y);
+}
+
+// Opacity of a blob of relative size size01 where the metaball field is f:
+// Beer–Lambert, 1 − e^(−μL), with L the path through the blob — a sphere
+// of the blob's area-equivalent radius, thinning toward the rim (read from
+// the field, which also stays lower in small blobs). Small blobs are thin,
+// so they let more of the light behind them through.
+float waxOpacity(float size01, float f) {
+  float N = max(size01 * uSizeScale, 1.0);
+  float rb = sqrt(N * uV0 / 3.14159265);
+  float L = 2.0 * rb * sqrt(smoothstep(0.37, 1.2, f));
+  return 1.0 - exp(-uMuWax * L);
 }
 
 void main() {
@@ -566,11 +581,8 @@ void main() {
   vec3 specTint = mix(LIN(vec3(1.0, 0.95, 0.85)), waxColor * 2.0 + LIN(vec3(0.3)), compIntensity * 0.6);
   waxColor += specTint * highlight;
 
-  // ---- Uniform translucency + pressure opacity ----
-  // Base 10% transparency, plus a soft center fade so the core
-  // of each blob feels translucent rather than a solid disc.
-  alpha *= 0.90;
-  alpha *= 1.0 - centerness * 0.18;
+  // ---- Opacity: absorption through the wax, plus pressure ----
+  alpha *= waxOpacity(blobSz, field);
   alpha *= max(1.0 - compIntensity * 0.65, 0.40);  // clip at 60% transparency
 
   // Inner core detail
@@ -590,7 +602,7 @@ void main() {
     float otherTempN = clamp((otherTemp - 0.18) / 0.85, 0.0, 1.0);
     vec3 otherWax = mix(uCold, uHot, smoothstep(0.0, 1.0, otherTempN)) * lightFromBelow;
     float otherAlpha = smoothstep(threshold - 0.18, threshold + 0.04, otherFieldRaw);
-    otherAlpha *= 0.90;
+    otherAlpha *= waxOpacity(clamp(uBlobSize[int(ids[otherDom])], 0.0, 1.0), otherFieldRaw);
     fluidBg = mix(fluidBg, otherWax, otherAlpha);
   }
 
