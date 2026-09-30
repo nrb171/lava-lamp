@@ -248,13 +248,15 @@ float hash(vec2 p) {
 
 // Opacity of a blob of relative size size01 where the metaball field is f:
 // Beer–Lambert, 1 − e^(−μL), with L the path through the blob — a sphere
-// of the blob's area-equivalent radius, thinning toward the rim (read from
+// of the blob's area-equivalent radius, thinner toward the rim (read from
 // the field, which also stays lower in small blobs). Small blobs are thin,
 // so they let more of the light behind them through.
 float waxOpacity(float size01, float f) {
   float N = max(size01 * uSizeScale, 1.0);
   float rb = sqrt(N * uV0 / 3.14159265);
-  float L = 2.0 * rb * sqrt(smoothstep(0.37, 1.2, f));
+  // (a floor at the rim: a lens seen edge-on is still a visible surface,
+  // not a fade to nothing)
+  float L = 2.0 * rb * (0.3 + 0.7 * sqrt(smoothstep(0.45, 1.2, f)));
   return 1.0 - exp(-uMuWax * L);
 }
 
@@ -545,7 +547,12 @@ void main() {
   if (dom == poolSlot && sizeOverride >= 0.0) blobSz = clamp(sizeOverride, 0.0, 1.0);
 
   float threshold = 0.55;
-  float alpha = smoothstep(threshold - 0.18, threshold + 0.04, field);
+  // The blob's surface: a crisp edge, antialiased over one screen pixel
+  // (the field's own gradient sets the width), at the field level the
+  // old soft edge was centred on. Wax is a surface, not a haze.
+  const float EDGE = 0.45;
+  float fw = max(fwidth(field), 1e-4);
+  float alpha = clamp((field - EDGE) / fw + 0.5, 0.0, 1.0);
 
   // shell: 1 at the metaball boundary, 0 deep inside
   float centerness = smoothstep(threshold + 0.20, threshold + 0.55, field);
@@ -593,7 +600,7 @@ void main() {
   if (fuseBackW > 0.0) {
     float bT = clamp((fuseBackT - 0.18) / 0.85, 0.0, 1.0);
     vec3 bWax = mix(uCold, uHot, smoothstep(0.0, 1.0, bT)) * lightFromBelow;
-    float bA = smoothstep(threshold - 0.18, threshold + 0.04, fuseBackF) * 0.90;
+    float bA = clamp((fuseBackF - EDGE) / fw + 0.5, 0.0, 1.0) * 0.90;
     fluidBg = mix(fluidBg, bWax, bA * fuseBackW);
   }
   if (otherDom >= 0) {
@@ -601,7 +608,7 @@ void main() {
     float otherTemp = otherFieldRaw > 0.001 ? (WT[otherDom] / otherFieldRaw) : 0.18;
     float otherTempN = clamp((otherTemp - 0.18) / 0.85, 0.0, 1.0);
     vec3 otherWax = mix(uCold, uHot, smoothstep(0.0, 1.0, otherTempN)) * lightFromBelow;
-    float otherAlpha = smoothstep(threshold - 0.18, threshold + 0.04, otherFieldRaw);
+    float otherAlpha = clamp((otherFieldRaw - EDGE) / fw + 0.5, 0.0, 1.0);
     otherAlpha *= waxOpacity(clamp(uBlobSize[int(ids[otherDom])], 0.0, 1.0), otherFieldRaw);
     fluidBg = mix(fluidBg, otherWax, otherAlpha);
   }
@@ -735,9 +742,8 @@ uniform float uMuPool;      // attenuation in the pool wax (per sim px)
 uniform int   uNB;
 uniform vec4  uWB0[40];     // blob centre (x from the axis, y, z), lens strength
 uniform vec4  uWB1[40];     // blob semi-axes
-uniform highp sampler2D uPool;  // row 0: pool top y vs radius; row 1: bump height vs x
+uniform highp sampler2D uPool;  // row 0: pool base top y vs radius
 uniform int   uPoolN;
-uniform float uBumpZ;       // bump extent across the view direction (sim px)
 uniform float uLensOn;      // 0 = reference: no blobs, no bumps
 uniform int   uMode;        // 0 = wall landing, 1 = path vertices
 uniform float uPoolYMin;
@@ -773,15 +779,10 @@ float poolRow(int row, float u) {
   float w2 = (4.0 - 6.0 * g * g + 3.0 * g * g * g) / 6.0, w3 = f * f * f / 6.0;
   return w0 * poolAt(row, i - 1) + w1 * poolAt(row, i) + w2 * poolAt(row, i + 1) + w3 * poolAt(row, i + 2);
 }
-// y of the pool's top surface above (x, z) (x from the axis)
+// y of the pool's base surface above (x, z) (x from the axis); its bumps
+// and columns are ellipsoids in the blob list
 float poolTop(vec2 xz) {
-  float half_ = 0.5 * uSim.x;
-  float y = poolRow(0, length(xz) / half_ * float(uPoolN - 1));
-  if (uLensOn > 0.5) {
-    float hd = poolRow(1, (xz.x + half_) / uSim.x * float(uPoolN - 1));
-    y -= hd * exp(-0.5 * xz.y * xz.y / (uBumpZ * uBumpZ));
-  }
-  return y;
+  return poolRow(0, length(xz) / (0.5 * uSim.x) * float(uPoolN - 1));
 }
 bool hitE(int b, vec3 p, vec3 d, out float h0, out float h1) {
   vec3 a = uWB1[b].xyz;
@@ -917,8 +918,6 @@ void main() {
   }
   P *= exp(-uMuPool * poolLen);
   if (!out_) P = 0.0;
-  // a pool bump or neck here: the light differs from the reference's
-  if (uLensOn > 0.5 && abs(poolRow(1, (p.x + 0.5 * uSim.x) / uSim.x * float(uPoolN - 1))) > 1.5) hitBlob = true;
   rec(p, P);
   if (P <= 0.0) {
     if (uMode == 1) {
@@ -1357,29 +1356,44 @@ uniform vec2  uView;
 uniform vec2  uCell;
 uniform float uMaxSpan;
 out vec2 vE;
+int S, S1, a, t;
 float cross2(vec2 u, vec2 v) { return u.x * v.y - u.y * v.x; }
-void main() {
-  int q = gl_VertexID / 6, k = gl_VertexID - q * 6;
-  int S = uSub, S1 = S + 1;
-  int i = q % S; q /= S;
-  int j = q % S; q /= S;
-  int a = q % (uRayDim.x - 1), t = q / (uRayDim.x - 1);     // t = source · (polar − 1) + tube row
-  ivec2 b = ivec2(a * S1 + i, t * S1 + j);
-  vec4 r00 = texelFetch(uSubRays, b, 0), r01 = texelFetch(uSubRays, b + ivec2(1, 0), 0);
-  vec4 r10 = texelFetch(uSubRays, b + ivec2(0, 1), 0), r11 = texelFetch(uSubRays, b + ivec2(1, 1), 0);
+vec4 sr(int i, int j) { return texelFetch(uSubRays, ivec2(a * S1 + i, t * S1 + j), 0); }
+// small tube (i, j) of this block: irradiance (liquid, wax), or x < 0
+vec2 sub(int i, int j) {
+  if (i < 0 || j < 0 || i >= S || j >= S) return vec2(-1.0);
+  vec4 r00 = sr(i, j), r01 = sr(i + 1, j), r10 = sr(i, j + 1), r11 = sr(i + 1, j + 1);
   float s0 = floor(r00.w);
   bool ok = min(min(r00.z, r01.z), min(r10.z, r11.z)) > 0.0
          && max(distance(r00.xy, r11.xy), distance(r01.xy, r10.xy)) <= uMaxSpan
          && floor(r01.w) == s0 && floor(r10.w) == s0 && floor(r11.w) == s0;
-  if (!ok) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vE = vec2(0.0); return; }
-  vec4 A = k < 3 ? r00 : r01, B = k < 3 ? r01 : r11, C = r10;
-  int kk = k < 3 ? k : k - 3;
-  vec4 me = kk == 0 ? A : kk == 1 ? B : C;
+  if (!ok) return vec2(-1.0);
   vec2 a0 = r00.xy / uCell, a1 = r01.xy / uCell, b0 = r10.xy / uCell, b1 = r11.xy / uCell;
   float area = 0.5 * abs(cross2(a1 - a0, b0 - a0)) + 0.5 * abs(cross2(b1 - a1, b0 - a1));
   float E = 0.25 * (r00.z + r01.z + r10.z + r11.z);
   float wf = 0.25 * (fract(r00.w) + fract(r01.w) + fract(r10.w) + fract(r11.w));
-  vE = E / max(area, 0.35) * vec2(1.0 - wf, wf);
-  vec2 ndc = vec2(me.x / uView.x * 2.0 - 1.0, 1.0 - me.y / uView.y * 2.0);
-  gl_Position = vec4(ndc, 0.0, 1.0);
+  return E / max(area, 0.7) * vec2(1.0 - wf, wf);
+}
+void main() {
+  int q = gl_VertexID / 6, k = gl_VertexID - q * 6;
+  S = uSub; S1 = S + 1;
+  int i = q % S; q /= S;
+  int j = q % S; q /= S;
+  a = q % (uRayDim.x - 1); t = q / (uRayDim.x - 1);     // t = source · (polar − 1) + tube row
+  if (sub(i, j).x < 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vE = vec2(0.0); return; }
+  // triangles (00, 01, 10) and (01, 11, 10); this corner's ray
+  int kk = k < 3 ? k : k - 3;
+  ivec2 c = k < 3 ? (kk == 0 ? ivec2(0, 0) : kk == 1 ? ivec2(1, 0) : ivec2(0, 1))
+                  : (kk == 0 ? ivec2(1, 0) : kk == 1 ? ivec2(1, 1) : ivec2(0, 1));
+  int vi = i + c.x, vj = j + c.y;
+  // smooth shading, as WALL_SPLAT_VS (within this block)
+  vec2 sum = vec2(0.0); float n = 0.0;
+  for (int dy = -1; dy <= 0; dy++) for (int dx = -1; dx <= 0; dx++) {
+    vec2 e = sub(vi + dx, vj + dy);
+    if (e.x >= 0.0) { sum += e; n += 1.0; }
+  }
+  vE = sum / max(n, 1.0);
+  vec4 me = sr(vi, vj);
+  gl_Position = vec4(me.x / uView.x * 2.0 - 1.0, 1.0 - me.y / uView.y * 2.0, 0.0, 1.0);
 }`;
+
