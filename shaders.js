@@ -1414,3 +1414,23 @@ void main() {
   gl_Position = vec4(me.x / uView.x * 2.0 - 1.0, 1.0 - me.y / uView.y * 2.0, 0.0, 1.0);
 }`;
 
+
+// TAA output: the mean of the last uCount traces (a ring of layers). The
+// traces cycle through uCount jitter offsets of the ray grid, so in a
+// still scene the window always holds the same set of samplings and the
+// result doesn't change at all — no flicker; moving light is averaged
+// over the window.
+const RING_AVG_FS = `#version 300 es
+precision highp float;
+uniform highp sampler2DArray uRing;
+uniform int uCount;
+out vec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec2 s = vec2(0.0);
+  for (int i = 0; i < 16; i++) {
+    if (i >= uCount) break;
+    s += texelFetch(uRing, ivec3(p, i), 0).rg;
+  }
+  o = vec4(s / float(uCount), 0.0, 1.0);
+}`;

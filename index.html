@@ -689,6 +689,9 @@ class MetaballRenderer {
         this.causTubeProg = link(CAUS_TUBE_VS, CAUS_TUBE_FS);
         this.causCrossProg = link(VS, CAUS_CROSS_FS);
         this.causEdgeProg = link(VS, CAUS_EDGE_FS);
+        this.ringAvgProg = link(VS, RING_AVG_FS);
+        this.scratchFbo = gl.createFramebuffer();
+        this.rings = {};
         this.causUpdProg = link(VS, CAUS_UPDATE_FS);
         const L = (p, names) => Object.fromEntries(names.map(n => [n, gl.getUniformLocation(p, n)]));
         this.ltU = L(this.lightProg, ["uSim", "uViewM", "uViewT", "uWallD", "uGlow", "uRayScale",
@@ -703,6 +706,7 @@ class MetaballRenderer {
                                          "uFlag", "uRefSrc"]);
         this.cuU = L(this.causUpdProg, ["uAcc", "uRef", "uPrev", "uInvRef", "uSM", "uInit"]);
         this.ceU = L(this.causEdgeProg, ["uCaus", "uSim", "uEdgeScale"]);
+        this.raU = L(this.ringAvgProg, ["uRing", "uCount"]);
         this.causEdgeTex = gl.createTexture();
         this.ccU = L(this.causCrossProg, ["uV0", "uV1", "uV2", "uV3", "uPlanes", "uPlaneY0", "uPlaneDY"]);
         this.emptyVao = gl.createVertexArray();     // the splat / line passes have no attributes
@@ -1602,13 +1606,6 @@ class MetaballRenderer {
     gl.uniform1f(t.uSrcR, 0);
     gl.uniform1f(t.uMuPool, 0.004);
     gl.uniform1f(t.uPoolYMin, this.poolYMin);
-    // TAA: offset the whole ray grid by a sub-ray step each trace (Halton
-    // 2,3 over 16 traces); the update passes average the samplings
-    if (this.taa) {
-      const k = (this._jitK = ((this._jitK || 0) + 1) % 16) + 1;
-      const halton = (i, b) => { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; };
-      gl.uniform2f(t.uJitter, halton(k, 2) - 0.5, halton(k, 3) - 0.5);
-    } else gl.uniform2f(t.uJitter, 0, 0);
     gl.uniform1i(t.uNB, nb);
     gl.uniform4fv(t.uWB0, w0);
     gl.uniform4fv(t.uWB1, w1);
@@ -1620,6 +1617,53 @@ class MetaballRenderer {
     }
     if (causOn) this.gpuCaustics(t, 1, glow, dtCaus, lowQ);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  // TAA. Each target (wall, liquid) has a ring of its last N traces and a
+  // cycle of N jitter offsets for the ray grid (Halton 2,3); what is drawn
+  // is the ring's mean (RING_AVG_FS). A still scene then gives the same
+  // result every frame. N = 8 at full quality, 4 at the low tier.
+  taaRing(name, W, H, N) {
+    const gl = this.gl;
+    let r = this.rings[name];
+    if (!r || r.W !== W || r.H !== H || r.N !== N) {
+      if (r) gl.deleteTexture(r.tex);
+      const tex = gl.createTexture();
+      gl.activeTexture(gl.TEXTURE7);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+      gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RG16F, W, H, N, 0, gl.RG, gl.FLOAT, null);
+      r = this.rings[name] = { tex, W, H, N, slot: 0, filled: 0 };
+    }
+    if (!this.taa) r.filled = 0;                // restart when TAA is turned back on
+    return r;
+  }
+  taaJitter(t, r) {
+    const gl = this.gl;
+    if (!this.taa) { gl.uniform2f(t.uJitter, 0, 0); return; }
+    const k = r.slot + 1;
+    const halton = (i, b) => { let f = 1, q = 0; while (i > 0) { f /= b; q += f * (i % b); i = Math.floor(i / b); } return q; };
+    gl.uniform2f(t.uJitter, halton(k, 2) - 0.5, halton(k, 3) - 0.5);
+  }
+  // after the update pass wrote this trace into layer r.slot: mean → out
+  taaResolve(r, outTex) {
+    const gl = this.gl;
+    r.filled = Math.min(r.N, r.filled + 1);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, outTex, 0);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, null, 0);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+    gl.viewport(0, 0, r.W, r.H);
+    gl.useProgram(this.ringAvgProg);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, r.tex);
+    gl.uniform1i(this.raU.uRing, 3);
+    // the ring fills slot by slot: average what is there so far
+    gl.uniform1i(this.raU.uCount, r.filled);
+    gl.bindVertexArray(this.vao);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    r.slot = (r.slot + 1) % r.N;
   }
 
   gpuWall(t, NSRC, dtTrace, lowQ) {
@@ -1644,6 +1688,9 @@ class MetaballRenderer {
     gl.uniform3i(t.uRayDim, NAZ, NPH, NSRC);
     gl.uniform1i(t.uSub, 0);
     gl.uniform1f(t.uMaxSpan, 280);
+    const ring = this.taaRing("wall", this.WG_W, this.WG_H, lowQ ? 4 : 8);
+    gl.useProgram(this.lightProg);
+    this.taaJitter(t, ring);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
 
@@ -1732,7 +1779,13 @@ class MetaballRenderer {
     this._bdAge += dtTrace;
     const tau = this._bdAge < 20 ? 2 : this.WALL_AVG_TAU;
     const cur = this.bdCurTex, nxt = cur ^ 1;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.updFbo[nxt]);
+    if (this.taa) {
+      // this trace's difference → the ring's current layer (resolved below)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchFbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.avgTex[nxt], 0);
+      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, ring.tex, 0, ring.slot);
+      gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+    } else gl.bindFramebuffer(gl.FRAMEBUFFER, this.updFbo[nxt]);
     gl.viewport(0, 0, GWc, GHc);
     gl.useProgram(this.wallUpdProg);
     const uU = this.wuU;
@@ -1742,15 +1795,13 @@ class MetaballRenderer {
     gl.uniform1i(uU.uIrr, 5); gl.uniform1i(uU.uAvg, 6); gl.uniform1i(uU.uPrev, 7);
     gl.uniform1f(uU.uInvRef, 1 / this.bdRef);
     gl.uniform1f(uU.uAlpha, Math.min(1, dtTrace / tau));
-    // light temporal smoothing: half-life of 2 frames
-    // temporal smoothing, per frame of time: half-life 2 frames; with TAA
-    // (a jittered ray grid) ~3, to average its samplings. (No neighbourhood clamp:
-    // with light fields it snapped flat regions back to the noisy sample,
-    // and lava moves slowly enough that trails are negligible.)
-    gl.uniform1f(uU.uSM, 1 - Math.pow(this.taa ? 0.8 : 0.707, dtTrace * 60));
+    // temporal smoothing: without TAA, a half-life of 2 frames; with TAA
+    // the raw trace goes to the ring, whose mean is drawn
+    gl.uniform1f(uU.uSM, this.taa ? 1 : 1 - Math.pow(0.707, dtTrace * 60));
     gl.uniform1f(uU.uInit, this.bdAvgInit ? 0 : 1);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
+    if (this.taa) this.taaResolve(ring, this.bdTex[nxt]);
     this.bdAvgInit = true;
     this.bdCurTex = nxt;
     this.wallFramesSince = 0;
@@ -1804,6 +1855,9 @@ class MetaballRenderer {
     gl.uniform1i(t.uMode, 1);
     gl.uniform1i(t.uSub, 0);
     gl.uniform1f(t.uAzSpan, 2 * Math.PI);
+    const ring = this.taaRing("caus", CW, CH, lowQ ? 4 : 8);
+    gl.useProgram(this.lightProg);
+    this.taaJitter(t, ring);
     gl.uniform1f(t.uRayScale, 1e3 / (NPH * NAZ));             // ~1 per texel: see gpuWall
     gl.uniform3i(t.uRayDim, NAZ, NPH, NSRC);
     gl.bindVertexArray(this.vao);
@@ -1893,7 +1947,12 @@ class MetaballRenderer {
 
     // 3. filter, normalise, smooth in time
     const cur = this.causCur, nxt = cur ^ 1;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.causFbo[nxt]);
+    if (this.taa) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchFbo);
+      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, ring.tex, 0, ring.slot);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, null, 0);
+      gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+    } else gl.bindFramebuffer(gl.FRAMEBUFFER, this.causFbo[nxt]);
     gl.viewport(0, 0, CW, CH);
     gl.useProgram(this.causUpdProg);
     gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, this.causAcc);
@@ -1902,10 +1961,11 @@ class MetaballRenderer {
     const cU = this.cuU;
     gl.uniform1i(cU.uAcc, 5); gl.uniform1i(cU.uRef, 6); gl.uniform1i(cU.uPrev, 7);
     gl.uniform1f(cU.uInvRef, 1 / this.causRef.f);
-    gl.uniform1f(cU.uSM, 1 - Math.pow(this.taa ? 0.8 : 0.548, dtTrace * 60));   // see gpuWall
+    gl.uniform1f(cU.uSM, this.taa ? 1 : 1 - Math.pow(0.548, dtTrace * 60));   // see gpuWall
     gl.uniform1f(cU.uInit, this.causInit ? 0 : 1);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
+    if (this.taa) this.taaResolve(ring, this.causTex[nxt]);
     this.causInit = true;
     this.causCur = nxt;
     this.causFramesSince = 0;
