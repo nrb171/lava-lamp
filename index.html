@@ -656,7 +656,10 @@ class MetaballRenderer {
     // Wall behind the lamp (see traceWall3D): light from the bulb that
     // reaches the wall through the globe, split into liquid-path and
     // wax-path light, on a square-celled grid spanning the view.
-    this.WALL_DIST = 200;                  // wall plane behind the axis (sim px)
+    // wall plane behind the axis (sim px): about 0.6 lamp heights — close
+    // enough to catch the light, far enough for it to spread and fall off
+    this.WALL_DIST = 400;
+    this.WALL_DIST_REF = 200;              // brightness is normalised as if the wall were here
     // Two wall textures (previous and newest trace); the shader blends
     // between them every frame, so the CPU only touches the wall grid on
     // the frames it traces.
@@ -1707,7 +1710,10 @@ class MetaballRenderer {
           }
         }
       }
-      this.bdRef = cnt && sum > 0 ? 4 * sum / cnt : 1;
+      // …measured on the actual wall, then scaled to the reference
+      // distance, so the 1/r² falloff to the real wall shows: the
+      // normalisation alone would otherwise cancel it
+      this.bdRef = (cnt && sum > 0 ? 4 * sum / cnt : 1) * (this.WALL_DIST / this.WALL_DIST_REF) ** 2;
     }
 
     // 3. filter down, baseline, drawn difference (see the CPU path)
