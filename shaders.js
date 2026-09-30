@@ -815,6 +815,17 @@ bool hitE(int b, vec3 p, vec3 d, out float h0, out float h1) {
   h0 = (-B - s) / A; h1 = (-B + s) / A;
   return true;
 }
+// the lens ellipsoid (other than skip) that p is inside of and d goes on
+// through, or -1
+int insideWax(vec3 p, vec3 d, int skip) {
+  if (uLensOn < 0.5) return -1;
+  float h0, h1;
+  for (int b = 0; b < 40; b++) {
+    if (b >= uNB) break;
+    if (b != skip && hitE(b, p, d, h0, h1) && h0 < 0.0 && h1 > 1e-2) return b;
+  }
+  return -1;
+}
 vec3 eNormal(int b, vec3 p) {
   vec3 a = uWB1[b].xyz;
   return normalize((p - uWB0[b].xyz) / (a * a));
@@ -883,13 +894,16 @@ void main() {
     fip = float(p) + float(j) / float(uSub);
     subW = 1.0 / float(uSub * uSub);
   }
-  fia += uJitter.x; fip += uJitter.y;
+  // The first polar row sits on the pole, straight up, and stays there under
+  // the jitter: rows starting half a step off it left a cone with no tubes
+  // above the bulb — a dark V in the liquid.
+  fia += uJitter.x; if (fip > 0.0) fip += uJitter.y;
   // The bulb: one diffuse (Lambertian) source at the centre of the base.
   // (uRayDim.z > 1 would add points on a ring of radius uSrcR — but each
   // point casts its own image of every blob, so one blob would show as
   // several refractions on the wall.)
   float cMin = cos(1.35);
-  float c = 1.0 - (1.0 - cMin) * (fip + 0.5) / float(uRayDim.y);
+  float c = 1.0 - (1.0 - cMin) * fip / float(uRayDim.y - 1);
   float sph = sqrt(1.0 - c * c);
   float al = PI + uAzSpan * (fia + 0.5) / float(uRayDim.x);        // from −x round through the back
   vec3 d = vec3(sph * cos(al), -c, sph * sin(al));
@@ -928,6 +942,9 @@ void main() {
     float gz = (poolTop(p.xz + vec2(0.0, e)) - poolTop(p.xz - vec2(0.0, e))) / (2.0 * e);
     vec3 nUp = normalize(vec3(gx, -1.0, gz));          // up, into the liquid
     float ci = dot(d, nUp);
+    // under a bump or column (wax ellipsoids standing on the base): wax on
+    // both sides, no surface here
+    if (ci > 0.0 && insideWax(p, d, -1) >= 0) { p += d * 0.05; out_ = true; break; }
     vec3 r = refract(d, -nUp, 1.43 / 1.34);
     if (ci > 0.0 && dot(r, r) > 0.0) {
       P *= 1.0 - fresnelR(ci, 1.43, 1.34);
@@ -1031,6 +1048,12 @@ void main() {
       float st = uWB0[inB].w;
       waxLen += t1 * st;
       P *= exp(-0.004 * t1 * st);
+      // Still inside another ellipsoid here (blobs merging, a column on its
+      // bump): wax on both sides, no surface. Refracting there bent rays
+      // near grazing by ~20° — a dark V above the bulb, thrown out of the
+      // middle by the columns of a rising pool.
+      int nx = insideWax(p, d, inB);
+      if (nx >= 0) { inB = nx; continue; }
       vec3 n = eNormal(inB, p);
       float nwO = 1.0 + st * (NW - 1.0);
       vec3 r = refract(d, -n, nwO);
@@ -1265,17 +1288,20 @@ void main() {
   // Tubes whose rays met no blob or pool bump are the same with and
   // without the lenses and cancel in the difference: skip them (in both
   // passes).
-  if (uRefSrc < 0) {
-    int rt = row < uRowsLens ? row : row - uRowsLens;
-    if (texelFetch(uFlag, ivec2(2 * ia + 1, rt), 0).x + texelFetch(uFlag, ivec2(2 * ib + 1, rt), 0).x
-      + texelFetch(uFlag, ivec2(2 * ia + 1, rt + 1), 0).x + texelFetch(uFlag, ivec2(2 * ib + 1, rt + 1), 0).x <= 0.0) {
-      gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vW = vec2(0.0); return;
-    }
+  // All four rays must have taken the same path (LIGHT_TRACE_FS: sig).
+  // For the difference, the traced rays decide for both passes: dropping a
+  // torn traced tube but still subtracting its reference twin left a dark
+  // hole along its whole length — a dark V from the pool up to a blob that
+  // the rays near the vertical partly hit.
+  int rt = uRefSrc < 0 && row >= uRowsLens ? row - uRowsLens : row;
+  if (uRefSrc < 0
+      && texelFetch(uFlag, ivec2(2 * ia + 1, rt), 0).x + texelFetch(uFlag, ivec2(2 * ib + 1, rt), 0).x
+       + texelFetch(uFlag, ivec2(2 * ia + 1, rt + 1), 0).x + texelFetch(uFlag, ivec2(2 * ib + 1, rt + 1), 0).x <= 0.0) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vW = vec2(0.0); return;
   }
-  // all four rays must have taken the same path (LIGHT_TRACE_FS: sig)
-  float s0 = texelFetch(uFlag, ivec2(2 * ia + 1, row), 0).y;
-  if (texelFetch(uFlag, ivec2(2 * ib + 1, row), 0).y != s0 || texelFetch(uFlag, ivec2(2 * ia + 1, row + 1), 0).y != s0
-      || texelFetch(uFlag, ivec2(2 * ib + 1, row + 1), 0).y != s0) {
+  float s0 = texelFetch(uFlag, ivec2(2 * ia + 1, rt), 0).y;
+  if (texelFetch(uFlag, ivec2(2 * ib + 1, rt), 0).y != s0 || texelFetch(uFlag, ivec2(2 * ia + 1, rt + 1), 0).y != s0
+      || texelFetch(uFlag, ivec2(2 * ib + 1, rt + 1), 0).y != s0) {
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vW = vec2(0.0); return;
   }
   load(j);
