@@ -673,6 +673,7 @@ class MetaballRenderer {
       try {
         this.lightProg = link(VS, LIGHT_TRACE_FS);
         this.wallSplatProg = link(WALL_SPLAT_VS, WALL_SPLAT_FS);
+        this.wallSubProg = link(WALL_SUB_VS, WALL_SPLAT_FS);
         this.wallUpdProg = link(VS, WALL_UPDATE_FS);
         this.causTubeProg = link(CAUS_TUBE_VS, CAUS_TUBE_FS);
         this.causCrossProg = link(VS, CAUS_CROSS_FS);
@@ -682,8 +683,10 @@ class MetaballRenderer {
         this.ltU = L(this.lightProg, ["uSim", "uViewM", "uViewT", "uWallD", "uGlow", "uRayScale",
                                       "uRayDim", "uAzSpan", "uYSrc", "uSrcR", "uMuPool", "uNB", "uWB0", "uWB1",
                                       "uPool", "uPoolN", "uBumpZ", "uLensOn", "uMode", "uRowOff",
-                                      "uPoolYMin"]);
+                                      "uPoolYMin", "uSub", "uRays", "uMaxSpan"]);
         this.wsU = L(this.wallSplatProg, ["uRays", "uRayDim", "uView", "uCell", "uMaxSpan"]);
+        this.wbU = L(this.wallSubProg, ["uSubRays", "uSub", "uRayDim", "uView", "uCell", "uMaxSpan"]);
+        this.subTex = gl.createTexture(); this.subKey = "";
         this.wuU = L(this.wallUpdProg, ["uIrr", "uAvg", "uPrev", "uInvRef", "uAlpha", "uSM", "uInit"]);
         this.ctU = L(this.causTubeProg, ["uPath", "uPathK", "uRayDim", "uRowsLens", "uSim", "uTgt", "uMaxW",
                                          "uFlag", "uRefSrc"]);
@@ -1542,8 +1545,31 @@ class MetaballRenderer {
     // normalisation, bdRef, divides the scale back out.)
     gl.uniform1f(t.uRayScale, 1e7 / (NPH * NAZ));
     gl.uniform3i(t.uRayDim, NAZ, NPH, NSRC);
+    gl.uniform1i(t.uSub, 0);
+    gl.uniform1f(t.uMaxSpan, 280);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // 1b. refinement: a finer grid of rays across each tube that touches a
+    //     blob or is broken (edges, folds) — blobs subtend only a few
+    //     degrees, and drawn from the main grid alone their images were a
+    //     few big triangles (spiky) with stair-stepped edges
+    const S = lowQ ? 3 : 4;
+    const SW = (NAZ - 1) * (S + 1), SH = (NPH - 1) * (S + 1) * NSRC;
+    const sk = SW + "x" + SH;
+    if (sk !== this.subKey) {
+      this.subFbo = this.gpuTarget(this.subTex, gl.RGBA32F, gl.RGBA, SW, SH, gl.NEAREST, this.subFbo);
+      this.subKey = sk;
+    }
+    gl.useProgram(this.lightProg);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.subFbo);
+    gl.viewport(0, 0, SW, SH);
+    gl.activeTexture(gl.TEXTURE6);
+    gl.bindTexture(gl.TEXTURE_2D, this.rayTex);
+    gl.uniform1i(t.uRays, 6);
+    gl.uniform1i(t.uSub, S);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.uniform1i(t.uSub, 0);
 
     // 2. ray tubes → wall (2× grid), additively
     const GWc = this.WG_W, GHc = this.WG_H;
@@ -1565,6 +1591,18 @@ class MetaballRenderer {
     gl.blendFunc(gl.ONE, gl.ONE);
     gl.bindVertexArray(this.emptyVao);
     gl.drawArrays(gl.TRIANGLES, 0, (NAZ - 1) * (NPH - 1) * NSRC * 6);
+    // … and the refined tubes
+    gl.useProgram(this.wallSubProg);
+    gl.activeTexture(gl.TEXTURE6);
+    gl.bindTexture(gl.TEXTURE_2D, this.subTex);
+    const bU = this.wbU;
+    gl.uniform1i(bU.uSubRays, 6);
+    gl.uniform1i(bU.uSub, S);
+    gl.uniform3i(bU.uRayDim, NAZ, NPH, NSRC);
+    gl.uniform2f(bU.uView, VIEW_W, VIEW_H);
+    gl.uniform2f(bU.uCell, VIEW_W / (2 * GWc), VIEW_H / (2 * GHc));
+    gl.uniform1f(bU.uMaxSpan, 280);
+    gl.drawArrays(gl.TRIANGLES, 0, (NAZ - 1) * (NPH - 1) * NSRC * S * S * 6);
     gl.disable(gl.BLEND);
 
     // Normalisation, once per grid: the mean wall light beside the lamp
@@ -1658,6 +1696,7 @@ class MetaballRenderer {
     gl.useProgram(this.lightProg);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.pathFbo);
     gl.uniform1i(t.uMode, 1);
+    gl.uniform1i(t.uSub, 0);
     gl.uniform1f(t.uAzSpan, 2 * Math.PI);
     gl.uniform1f(t.uRayScale, 1e3 / (NPH * NAZ));             // ~1 per texel: see gpuWall
     gl.uniform3i(t.uRayDim, NAZ, NPH, NSRC);

@@ -740,7 +740,13 @@ uniform int   uPoolN;
 uniform float uBumpZ;       // bump extent across the view direction (sim px)
 uniform float uLensOn;      // 0 = reference: no blobs, no bumps
 uniform int   uMode;        // 0 = wall landing, 1 = path vertices
-uniform float uPoolYMin;    // highest point of the pool surface (smallest y)
+uniform float uPoolYMin;
+// Refinement (mode 0, uSub > 0): for each tube of the main wall trace that
+// touches a blob or is broken (see tubeRefined), a (uSub+1)² grid of rays
+// across it; other tubes output nothing.
+uniform int   uSub;
+uniform highp sampler2D uRays;  // the main wall trace
+uniform float uMaxSpan;    // highest point of the pool surface (smallest y)
 uniform int   uRowOff;
 // mode 0: wall x, wall y (view px), power, signature + wax share (o only)
 // mode 1: path vertices 4·chunk … 4·chunk+3 (o, o1, o2, o3); vertex 7's
@@ -822,6 +828,17 @@ void rec(vec3 p, float P) {
 }
 // this chunk's vertices are all in, and the blob flag can't change: stop
 bool enough() { return uMode == 1 && vc >= kBase + 4 && (kBase == 0 || hitBlob); }
+// A main-trace tube is drawn as is (WALL_SPLAT_VS) only if its four rays
+// all reached the wall, landed close together, took the same path and met
+// no blob. The rest — blob images, their edges, folds — are refined.
+bool tubeRefined(vec4 r00, vec4 r01, vec4 r10, vec4 r11) {
+  if (min(min(r00.z, r01.z), min(r10.z, r11.z)) <= 0.0) return true;
+  if (max(distance(r00.xy, r11.xy), distance(r01.xy, r10.xy)) > uMaxSpan) return true;
+  float s0 = floor(r00.w);
+  if (floor(r01.w) != s0 || floor(r10.w) != s0 || floor(r11.w) != s0) return true;
+  return mod(s0, 68921.0) > 0.0;                        // entered a blob
+}
+
 void main() {
   ivec2 id = ivec2(gl_FragCoord.xy);
   id.y -= uRowOff;
@@ -829,19 +846,35 @@ void main() {
   if (uMode == 1) { ia = id.x / 2; kBase = 4 * (id.x - ia * 2); }
   for (int i = 0; i < 4; i++) pv[i] = vec4(0.0);
   int ip = id.y % uRayDim.y, src = id.y / uRayDim.y;
+  float fia = float(ia), fip = float(ip);                 // ray (fractional when refining)
+  float subW = 1.0;                                       // share of a main ray's power
+  if (uSub > 0) {
+    int S1 = uSub + 1;
+    int a = id.x / S1, i = id.x - a * S1, t = id.y / S1, j = id.y - t * S1;
+    int p = t % (uRayDim.y - 1);
+    src = t / (uRayDim.y - 1);
+    int row = src * uRayDim.y + p;
+    if (!tubeRefined(texelFetch(uRays, ivec2(a, row), 0), texelFetch(uRays, ivec2(a + 1, row), 0),
+                     texelFetch(uRays, ivec2(a, row + 1), 0), texelFetch(uRays, ivec2(a + 1, row + 1), 0))) {
+      o = vec4(0.0); return;
+    }
+    fia = float(a) + float(i) / float(uSub);
+    fip = float(p) + float(j) / float(uSub);
+    subW = 1.0 / float(uSub * uSub);
+  }
   // The bulb: one diffuse (Lambertian) source at the centre of the base.
   // (uRayDim.z > 1 would add points on a ring of radius uSrcR — but each
   // point casts its own image of every blob, so one blob would show as
   // several refractions on the wall.)
   float cMin = cos(1.35);
-  float c = 1.0 - (1.0 - cMin) * (float(ip) + 0.5) / float(uRayDim.y);
+  float c = 1.0 - (1.0 - cMin) * (fip + 0.5) / float(uRayDim.y);
   float sph = sqrt(1.0 - c * c);
-  float al = PI + uAzSpan * (float(ia) + 0.5) / float(uRayDim.x);   // from −x round through the back
+  float al = PI + uAzSpan * (fia + 0.5) / float(uRayDim.x);        // from −x round through the back
   vec3 d = vec3(sph * cos(al), -c, sph * sin(al));
   vec2 s0 = vec2(0.0);
   if (src > 0) { float an = float(src - 1) * 2.0 * PI / float(uRayDim.z - 1) + 0.3; s0 = uSrcR * vec2(cos(an), sin(an)); }
   vec3 p = vec3(s0.x, uYSrc, s0.y);
-  float P = c * uGlow * uRayScale / float(uRayDim.z);                // Lambertian
+  float P = c * uGlow * uRayScale * subW / float(uRayDim.z);         // Lambertian
   float P0 = P;                         // cut-offs are relative to this
   float h0, h1;
 
@@ -1025,9 +1058,11 @@ vec2 tube(int a, int p) {
   vec4 r00 = ray(a, p), r01 = ray(a + 1, p), r10 = ray(a, p + 1), r11 = ray(a + 1, p + 1);
   float span = max(distance(r00.xy, r11.xy), distance(r01.xy, r10.xy));
   if (min(min(r00.z, r01.z), min(r10.z, r11.z)) <= 0.0 || span > uMaxSpan) return vec2(-1.0);
-  // all four rays must have taken the same path (LIGHT_TRACE_FS: sig)
+  // all four rays must have taken the same path (LIGHT_TRACE_FS: sig), and
+  // not through a blob: those tubes are drawn refined (WALL_SUB_VS)
   float s0 = floor(r00.w);
   if (floor(r01.w) != s0 || floor(r10.w) != s0 || floor(r11.w) != s0) return vec2(-1.0);
+  if (mod(s0, 68921.0) > 0.0) return vec2(-1.0);
   vec2 a0 = r00.xy / uCell, a1 = r01.xy / uCell, b0 = r10.xy / uCell, b1 = r11.xy / uCell;
   float area = 0.5 * abs(cross2(a1 - a0, b0 - a0)) + 0.5 * abs(cross2(b1 - a1, b0 - a1));
   float E = 0.25 * (r00.z + r01.z + r10.z + r11.z);
@@ -1307,4 +1342,44 @@ void main() {
     }
   }
   o = vec4(max(sum / wsum, 0.0) * uEdgeScale, 0.0, 0.0, 1.0);
+}`;
+
+// Refined ray tubes → wall: each refined main tube's (uSub+1)² rays as
+// uSub² small tubes, drawn with the same rules (all four rays alive, close
+// together, same path). Tubes that weren't refined have no rays here and
+// draw nothing.
+const WALL_SUB_VS = `#version 300 es
+precision highp float;
+uniform highp sampler2D uSubRays;
+uniform int   uSub;
+uniform ivec3 uRayDim;      // of the main trace
+uniform vec2  uView;
+uniform vec2  uCell;
+uniform float uMaxSpan;
+out vec2 vE;
+float cross2(vec2 u, vec2 v) { return u.x * v.y - u.y * v.x; }
+void main() {
+  int q = gl_VertexID / 6, k = gl_VertexID - q * 6;
+  int S = uSub, S1 = S + 1;
+  int i = q % S; q /= S;
+  int j = q % S; q /= S;
+  int a = q % (uRayDim.x - 1), t = q / (uRayDim.x - 1);     // t = source · (polar − 1) + tube row
+  ivec2 b = ivec2(a * S1 + i, t * S1 + j);
+  vec4 r00 = texelFetch(uSubRays, b, 0), r01 = texelFetch(uSubRays, b + ivec2(1, 0), 0);
+  vec4 r10 = texelFetch(uSubRays, b + ivec2(0, 1), 0), r11 = texelFetch(uSubRays, b + ivec2(1, 1), 0);
+  float s0 = floor(r00.w);
+  bool ok = min(min(r00.z, r01.z), min(r10.z, r11.z)) > 0.0
+         && max(distance(r00.xy, r11.xy), distance(r01.xy, r10.xy)) <= uMaxSpan
+         && floor(r01.w) == s0 && floor(r10.w) == s0 && floor(r11.w) == s0;
+  if (!ok) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vE = vec2(0.0); return; }
+  vec4 A = k < 3 ? r00 : r01, B = k < 3 ? r01 : r11, C = r10;
+  int kk = k < 3 ? k : k - 3;
+  vec4 me = kk == 0 ? A : kk == 1 ? B : C;
+  vec2 a0 = r00.xy / uCell, a1 = r01.xy / uCell, b0 = r10.xy / uCell, b1 = r11.xy / uCell;
+  float area = 0.5 * abs(cross2(a1 - a0, b0 - a0)) + 0.5 * abs(cross2(b1 - a1, b0 - a1));
+  float E = 0.25 * (r00.z + r01.z + r10.z + r11.z);
+  float wf = 0.25 * (fract(r00.w) + fract(r01.w) + fract(r10.w) + fract(r11.w));
+  vE = E / max(area, 0.35) * vec2(1.0 - wf, wf);
+  vec2 ndc = vec2(me.x / uView.x * 2.0 - 1.0, 1.0 - me.y / uView.y * 2.0);
+  gl_Position = vec4(ndc, 0.0, 1.0);
 }`;
