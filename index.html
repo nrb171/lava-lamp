@@ -1388,12 +1388,20 @@ class MetaballRenderer {
     if (!this._poolFloor) {
       // glass bottom (2-D) under each x
       this._poolFloor = new Float32Array(N);
+      // (solved exactly: a floor found in fixed steps is a staircase, and
+      // revolved, each step is a ring of sharp curvature that a point
+      // bulb draws on the wall as a line)
       for (let j = 0; j < N; j++) {
         const ax = Math.abs(j * dxs - half);
-        let y = 0.99 * SIM_H;
-        while (y > 0.8 * SIM_H && bottleHalfFrac(y / SIM_H) * SIM_W < ax) y -= 0.5;
-        this._poolFloor[j] = y;
+        let lo = 0.8 * SIM_H, hi = 0.99 * SIM_H;      // radius ≥ ax at lo
+        if (bottleHalfFrac(hi / SIM_H) * SIM_W >= ax) { this._poolFloor[j] = hi; continue; }
+        for (let k = 0; k < 30; k++) {
+          const m = 0.5 * (lo + hi);
+          if (bottleHalfFrac(m / SIM_H) * SIM_W >= ax) lo = m; else hi = m;
+        }
+        this._poolFloor[j] = lo;
       }
+      this._topS = new Float64Array(N);
       this._h2 = new Float64Array(N); this._hb = new Float64Array(N);
       this._hbSlow = new Float64Array(N); this._hbInit = false;
       this._poolData = new Float32Array(2 * N);
@@ -1435,10 +1443,20 @@ class MetaballRenderer {
       const k = Math.min(1, dt / (this._bdAge < 20 ? 2 : this.WALL_AVG_TAU));
       for (let j = 0; j < N; j++) hs[j] += (hb[j] - hs[j]) * k;
     }
+    // broad top, smoothed again (σ = 20 px) and evaluated directly at each
+    // x (interpolating between samples would leave kinks): the glass
+    // floor's own curvature would otherwise carry into the surface
+    const topS = this._topS;
+    for (let j = 0; j < N; j++) topS[j] = floor[j] - hs[j];
+    const s2 = 20 / dxs, R2 = Math.ceil(4.5 * s2);   // (wide window: no step as it slides)
     const D = this._poolData;
-    const topAt = (x) => {              // broad-part top y at sim x
-      const u = Math.min(N - 1, Math.max(0, x / dxs)), i0 = Math.min(N - 2, u | 0), f = u - i0;
-      return (floor[i0] - hs[i0]) * (1 - f) + (floor[i0 + 1] - hs[i0 + 1]) * f;
+    const topAt = (x) => {
+      const u = x / dxs, c = Math.round(u);
+      let sum = 0, ws = 0;
+      for (let k = Math.max(0, c - R2); k <= Math.min(N - 1, c + R2); k++) {
+        const w = Math.exp(-0.5 * ((k - u) / s2) ** 2); sum += w * topS[k]; ws += w;
+      }
+      return sum / ws;
     };
     for (let j = 0; j < N; j++) {
       const rho = half * j / (N - 1);
@@ -1487,7 +1505,7 @@ class MetaballRenderer {
     gl.uniform1f(t.uGlow, glow);
     // the bulb, at the centre of the base, under the pool wax
     gl.uniform1f(t.uYSrc, 0.96 * SIM_H);
-    gl.uniform1f(t.uSrcR, 28);
+    gl.uniform1f(t.uSrcR, 0);
     gl.uniform1f(t.uMuPool, 0.004);
     gl.uniform1f(t.uPoolYMin, this.poolYMin);
     gl.uniform1i(t.uNB, nb);
@@ -1495,17 +1513,17 @@ class MetaballRenderer {
     gl.uniform4fv(t.uWB1, w1);
     gl.bindVertexArray(this.vao);
     if (wallOn) {
-      this.gpuWall(t, lowQ ? 4 : 7, dtWall, lowQ);
+      this.gpuWall(t, 1, dtWall, lowQ);
       gl.activeTexture(gl.TEXTURE5);                     // the wall's filter pass used unit 5
       gl.bindTexture(gl.TEXTURE_2D, this.poolTex);
     }
-    if (causOn) this.gpuCaustics(t, lowQ ? 4 : 7, glow, dtCaus, lowQ);
+    if (causOn) this.gpuCaustics(t, 1, glow, dtCaus, lowQ);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
   gpuWall(t, NSRC, dtTrace, lowQ) {
     const gl = this.gl;
-    const NPH = lowQ ? 32 : 64, NAZ = lowQ ? 64 : 128;
+    const NPH = lowQ ? 40 : 128, NAZ = lowQ ? 80 : 256;
     if (!this.ensureRays(NAZ, NPH, NSRC)) { this.wallGpu = false; this.WG_W = 0; this.ensureWallGrid(); return; }
     // 1. rays → wall landing points
     gl.useProgram(this.lightProg);
@@ -1515,7 +1533,11 @@ class MetaballRenderer {
     gl.uniform1i(t.uRowOff, 0);
     gl.uniform1f(t.uLensOn, 1);
     gl.uniform1f(t.uAzSpan, Math.PI);                  // back half: toward the wall
-    gl.uniform1f(t.uRayScale, (18 * 30) / (NPH * NAZ));      // CPU-trace totals
+    // Power per ray. The splat target is half-float: at ~3e-5 per texel
+    // (the natural scale here) values are subnormal and round coarsely,
+    // which summed into contour rings — so work around 1 instead. (The
+    // normalisation, bdRef, divides the scale back out.)
+    gl.uniform1f(t.uRayScale, 1e7 / (NPH * NAZ));
     gl.uniform3i(t.uRayDim, NAZ, NPH, NSRC);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
@@ -1593,7 +1615,7 @@ class MetaballRenderer {
   // filtered field over the lamp.
   gpuCaustics(t, NSRC, glow, dtTrace, lowQ) {
     const gl = this.gl;
-    const J = lowQ ? 20 : 40, NAZ = lowQ ? 32 : 64, NPH = lowQ ? 12 : 24;
+    const J = lowQ ? 20 : 40, NAZ = lowQ ? 64 : 128, NPH = lowQ ? 24 : 48;
     const cell = lowQ ? 4 : 2;
     const CW = Math.round(SIM_W / cell), CH = Math.round(SIM_H / cell);
     const rows = NPH * NSRC;
@@ -1634,7 +1656,7 @@ class MetaballRenderer {
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.pathFbo);
     gl.uniform1i(t.uMode, 1);
     gl.uniform1f(t.uAzSpan, 2 * Math.PI);
-    gl.uniform1f(t.uRayScale, 1 / (NPH * NAZ));
+    gl.uniform1f(t.uRayScale, 1e3 / (NPH * NAZ));             // ~1 per texel: see gpuWall
     gl.uniform3i(t.uRayDim, NAZ, NPH, NSRC);
     gl.bindVertexArray(this.vao);
     for (let pass = 0; pass < 2; pass++) {
@@ -1714,7 +1736,9 @@ class MetaballRenderer {
         }
       }
       vals.sort((a, b) => a - b);
-      const f = vals.length ? vals[Math.floor(vals.length * 0.99)] : 1;
+      // (95th percentile: a point bulb under the round pool focuses a thin
+      // bright line up the axis, which shouldn't set the scale)
+      const f = vals.length ? vals[Math.floor(vals.length * 0.95)] : 1;
       const e = eN ? eSum / eN : 1;
       this.causRef = { f: (f || 1) / glow, e: (e || 1) / glow };
     }

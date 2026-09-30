@@ -683,7 +683,7 @@ if (typeof module !== 'undefined' && module.exports) {
 //
 //  One ray tracer (LIGHT_TRACE_FS) follows the lamp's light:
 //   • it starts at the bulb — one diffuse (Lambertian) source at the
-//     centre of the base, a small disc — and passes up through the pool wax, dimmed
+//     centre of the base — and passes up through the pool wax, dimmed
 //     along the way, to the pool's top surface: a height field built each
 //     trace from the pool particles, bumps and necks included, which
 //     refracts it (wax → liquid, Fresnel, total internal reflection);
@@ -811,9 +811,9 @@ void main() {
   for (int i = 0; i < 4; i++) pv[i] = vec4(0.0);
   int ip = id.y % uRayDim.y, src = id.y / uRayDim.y;
   // The bulb: one diffuse (Lambertian) source at the centre of the base.
-  // It has a size, which softens its caustics (a point source through the
-  // round pool would focus a hard line up the lamp's axis): sampled at its
-  // centre and a ring, each point with its own coherent fan of rays.
+  // (uRayDim.z > 1 would add points on a ring of radius uSrcR — but each
+  // point casts its own image of every blob, so one blob would show as
+  // several refractions on the wall.)
   float cMin = cos(1.35);
   float c = 1.0 - (1.0 - cMin) * (float(ip) + 0.5) / float(uRayDim.y);
   float sph = sqrt(1.0 - c * c);
@@ -975,10 +975,8 @@ void main() {
 }`;
 
 // Ray tubes → wall. No vertex attributes: gl_VertexID picks the quad (and
-// which of its 6 triangle corners), and every corner reads all four rays of
-// its quad, so all three corners of a triangle agree on its brightness and
-// on whether the tube is torn (a ray lost, or neighbours landing far apart
-// across a TIR fold). Torn tubes collapse to nothing.
+// which of its 6 triangle corners). A tube that is torn (a ray lost, or
+// neighbours landing far apart across a TIR fold) collapses to nothing.
 const WALL_SPLAT_VS = `#version 300 es
 precision highp float;
 uniform highp sampler2D uRays;
@@ -986,37 +984,53 @@ uniform ivec3 uRayDim;
 uniform vec2  uView;        // view size (sim px)
 uniform vec2  uCell;        // target texel size (sim px)
 uniform float uMaxSpan;
-flat out vec2 vE;           // irradiance per texel: liquid-path, wax-path
+out vec2 vE;                // irradiance per texel: liquid-path, wax-path
+int src;
+vec4 ray(int a, int p) { return texelFetch(uRays, ivec2(a, src * uRayDim.y + p), 0); }
+float cross2(vec2 u, vec2 v) { return u.x * v.y - u.y * v.x; }
+// the tube with corner rays (a, p) … (a+1, p+1): its irradiance (power
+// over its area on the wall, in texels) split liquid / wax, or x < 0 if
+// there is none (off the grid, a ray lost, or torn across a fold)
+vec2 tube(int a, int p) {
+  if (a < 0 || p < 0 || a >= uRayDim.x - 1 || p >= uRayDim.y - 1) return vec2(-1.0);
+  vec4 r00 = ray(a, p), r01 = ray(a + 1, p), r10 = ray(a, p + 1), r11 = ray(a + 1, p + 1);
+  float span = max(distance(r00.xy, r11.xy), distance(r01.xy, r10.xy));
+  if (min(min(r00.z, r01.z), min(r10.z, r11.z)) <= 0.0 || span > uMaxSpan) return vec2(-1.0);
+  vec2 a0 = r00.xy / uCell, a1 = r01.xy / uCell, b0 = r10.xy / uCell, b1 = r11.xy / uCell;
+  float area = 0.5 * abs(cross2(a1 - a0, b0 - a0)) + 0.5 * abs(cross2(b1 - a1, b0 - a1));
+  float E = 0.25 * (r00.z + r01.z + r10.z + r11.z);
+  float wf = 0.25 * (r00.w + r01.w + r10.w + r11.w);
+  float irr = E / max(area, 0.7);
+  return irr * vec2(1.0 - wf, wf);
+}
 void main() {
   int q = gl_VertexID / 6, k = gl_VertexID - q * 6;
   int qa = uRayDim.x - 1, qp = uRayDim.y - 1;
-  int ia = q % qa, t = q / qa, ip = t % qp, src = t / qp;
-  int row = src * uRayDim.y + ip;
-  vec4 r00 = texelFetch(uRays, ivec2(ia, row), 0);
-  vec4 r01 = texelFetch(uRays, ivec2(ia + 1, row), 0);
-  vec4 r10 = texelFetch(uRays, ivec2(ia, row + 1), 0);
-  vec4 r11 = texelFetch(uRays, ivec2(ia + 1, row + 1), 0);
-  float span = max(distance(r00.xy, r11.xy), distance(r01.xy, r10.xy));
-  bool ok = min(min(r00.z, r01.z), min(r10.z, r11.z)) > 0.0 && span <= uMaxSpan;
-  // triangles (00, 01, 10) and (01, 11, 10)
-  vec4 A = k < 3 ? r00 : r01, B = k < 3 ? r01 : r11, C = r10;
+  int ia = q % qa, t = q / qa, ip = t % qp;
+  src = t / qp;
+  if (tube(ia, ip).x < 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vE = vec2(0.0); return; }
+  // triangles (00, 01, 10) and (01, 11, 10); this corner's ray
   int kk = k < 3 ? k : k - 3;
-  vec4 me = kk == 0 ? A : kk == 1 ? B : C;
-  vec2 e1 = (B.xy - A.xy) / uCell, e2 = (C.xy - A.xy) / uCell;
-  float area = 0.5 * abs(e1.x * e2.y - e1.y * e2.x);             // in texels
-  float E = 0.5 * 0.25 * (r00.z + r01.z + r10.z + r11.z);         // half the tube's power
-  float wf = 0.25 * (r00.w + r01.w + r10.w + r11.w);
-  // a floor on the area: a triangle much smaller than a texel lands on at
-  // most one texel anyway, and this keeps cusps from making single hot ones
-  float irr = E / max(area, 0.35);
-  vE = irr * vec2(1.0 - wf, wf);
+  ivec2 c = k < 3 ? (kk == 0 ? ivec2(0, 0) : kk == 1 ? ivec2(1, 0) : ivec2(0, 1))
+                  : (kk == 0 ? ivec2(1, 0) : kk == 1 ? ivec2(1, 1) : ivec2(0, 1));
+  int va = ia + c.x, vp = ip + c.y;
+  // Smooth shading: the ray carries the mean irradiance of the tubes
+  // around it, interpolated across the triangle. Each tube drawn flat made
+  // visible terraces where tubes are large on the wall.
+  vec2 sum = vec2(0.0); float n = 0.0;
+  for (int dy = -1; dy <= 0; dy++) for (int dx = -1; dx <= 0; dx++) {
+    vec2 e = tube(va + dx, vp + dy);
+    if (e.x >= 0.0) { sum += e; n += 1.0; }
+  }
+  vE = sum / max(n, 1.0);
+  vec4 me = ray(va, vp);
   vec2 ndc = vec2(me.x / uView.x * 2.0 - 1.0, 1.0 - me.y / uView.y * 2.0);
-  gl_Position = ok ? vec4(ndc, 0.0, 1.0) : vec4(2.0, 2.0, 2.0, 1.0);
+  gl_Position = vec4(ndc, 0.0, 1.0);
 }`;
 
 const WALL_SPLAT_FS = `#version 300 es
 precision highp float;
-flat in vec2 vE;
+in vec2 vE;
 out vec4 o;
 void main() { o = vec4(vE, 0.0, 0.0); }`;
 
