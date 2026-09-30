@@ -718,7 +718,7 @@ class MetaballRenderer {
         this.cpU = L(this.causPhotonProg, ["uV0", "uV1", "uV2", "uV3", "uNAz", "uRowsLens", "uRefSrc", "uSim", "uTgt", "uSig"]);
         this.cuU = L(this.causUpdProg, ["uAcc", "uRef", "uPrev", "uInvRef", "uSM", "uInit"]);
         this.ceU = L(this.causEdgeProg, ["uCaus", "uSim", "uEdgeScale"]);
-        this.raU = L(this.ringAvgProg, ["uRing", "uCount"]);
+        this.raU = L(this.ringAvgProg, ["uRing", "uAcc", "uCount", "uSlot", "uHist"]);
         this.causEdgeTex = gl.createTexture();
         this.emptyVao = gl.createVertexArray();     // the splat / line passes have no attributes
         this.avgTex = [gl.createTexture(), gl.createTexture()];
@@ -1641,14 +1641,24 @@ class MetaballRenderer {
     const gl = this.gl;
     let r = this.rings[name];
     if (!r || r.W !== W || r.H !== H || r.N !== N) {
-      if (r) gl.deleteTexture(r.tex);
+      if (r) { gl.deleteTexture(r.tex); r.acc.forEach(t => gl.deleteTexture(t)); }
       const tex = gl.createTexture();
       gl.activeTexture(gl.TEXTURE7);
       gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
       gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RG16F, W, H, N, 0, gl.RG, gl.FLOAT, null);
-      r = this.rings[name] = { tex, W, H, N, slot: 0, filled: 0 };
+      // the accumulators (RING_AVG_FS): running mean and count, full floats —
+      // half floats can't hold a long average (small steps round away)
+      const acc = [0, 1].map(() => {
+        const a = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, a);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, W, H, 0, gl.RGBA, gl.FLOAT, null);
+        return a;
+      });
+      r = this.rings[name] = { tex, acc, accCur: 0, W, H, N, slot: 0, filled: 0 };
     }
     if (!this.taa) r.filled = 0;                // restart when TAA is turned back on
     return r;
@@ -1656,20 +1666,21 @@ class MetaballRenderer {
   taaSeed(t, r) {
     const gl = this.gl;
     // Random ray origins and directions (the wide bulb, LIGHT_TRACE_FS) are
-    // their own jitter: one seed per ring slot, so a still scene cycles
-    // through the same samples and its mean doesn't flicker. Without TAA,
-    // a new seed every trace.
+    // their own jitter: a fresh seed every trace, so samples keep adding up
+    // (RING_AVG_FS) instead of cycling through the same few sets.
     this._seedN = (this._seedN || 0) + 1;
-    gl.uniform1f(t.uSeed, this.taa ? r.slot + 1 : this._seedN % 4096 + 1);
+    gl.uniform1f(t.uSeed, this._seedN % 65536 + 1);
   }
-  // after the update pass wrote this trace into layer r.slot: mean → out
-  taaResolve(r, outTex) {
+  // after the update pass wrote this trace into layer r.slot: add it to the
+  // accumulator (restarting it where the light moved) → outTex
+  taaResolve(r, outTex, hist) {
     const gl = this.gl;
     r.filled = Math.min(r.N, r.filled + 1);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchFbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, outTex, 0);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, null, 0);
-    gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+    const an = r.accCur ^ 1;
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, r.acc[an], 0);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, outTex, 0);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
     gl.viewport(0, 0, r.W, r.H);
     gl.useProgram(this.ringAvgProg);
     gl.activeTexture(gl.TEXTURE3);
@@ -1677,9 +1688,15 @@ class MetaballRenderer {
     gl.uniform1i(this.raU.uRing, 3);
     // the ring fills slot by slot: average what is there so far
     gl.uniform1i(this.raU.uCount, r.filled);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, r.acc[r.accCur]);
+    gl.uniform1i(this.raU.uAcc, 2);
+    gl.uniform1i(this.raU.uSlot, r.slot);
+    gl.uniform1f(this.raU.uHist, hist && r.filled >= r.N ? 1 : 0);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
     r.slot = (r.slot + 1) % r.N;
+    r.accCur = an;
   }
 
   gpuWall(t, NSRC, dtTrace, lowQ) {
@@ -1783,7 +1800,7 @@ class MetaballRenderer {
     gl.uniform1f(uU.uFull, this.wallFull ? 1 : 0);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
-    if (this.taa) this.taaResolve(ring, this.bdTex[nxt]);
+    if (this.taa) this.taaResolve(ring, this.bdTex[nxt], this.bdAvgInit);
     this.bdAvgInit = true;
     this.bdCurTex = nxt;
     this.wallFramesSince = 0;
@@ -1926,7 +1943,7 @@ class MetaballRenderer {
     gl.uniform1f(cU.uInit, this.causInit ? 0 : 1);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
-    if (this.taa) this.taaResolve(ring, this.causTex[nxt]);
+    if (this.taa) this.taaResolve(ring, this.causTex[nxt], this.causInit);
     this.causInit = true;
     this.causCur = nxt;
     this.causFramesSince = 0;
