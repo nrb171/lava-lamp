@@ -742,9 +742,9 @@ uniform float uLensOn;      // 0 = reference: no blobs, no bumps
 uniform int   uMode;        // 0 = wall landing, 1 = path vertices
 uniform float uPoolYMin;    // highest point of the pool surface (smallest y)
 uniform int   uRowOff;
-// mode 0: wall x, wall y (view px), power, wax share (o only)
+// mode 0: wall x, wall y (view px), power, signature + wax share (o only)
 // mode 1: path vertices 4·chunk … 4·chunk+3 (o, o1, o2, o3); vertex 7's
-//         slot holds (1 if the path met a blob, …) instead
+//         slot holds (1 if the path met a blob, its signature, …) instead
 layout(location = 0) out vec4 o;
 layout(location = 1) out vec4 o1;
 layout(location = 2) out vec4 o2;
@@ -807,6 +807,13 @@ int vc = 0, kBase = -100;
 vec4 pv[4];
 vec4 lastV = vec4(0.0);
 bool hitBlob = false;
+// The path's signature: which blobs it entered (first three), plus its
+// internal reflections. Neighbouring rays with different signatures are
+// not one bundle of light — e.g. one grazes a blob's rim and is thrown
+// wide while its neighbour misses the blob — and the tube between them
+// must not be drawn: stretched across, it becomes a long bright spike.
+float sig = 0.0;
+int nEnt = 0;
 void rec(vec3 p, float P) {
   vec4 v = vec4(p.x + 0.5 * uSim.x, p.y, p.z, P);
   int i = vc - kBase;
@@ -872,6 +879,7 @@ void main() {
       d = r; p += d * 0.05; out_ = true;
     } else {
       d -= 2.0 * ci * nUp; p -= nUp * 0.1; P *= 0.9;   // reflected back into the pool
+      sig += 275684.0;
     }
   }
   P *= exp(-uMuPool * poolLen);
@@ -883,7 +891,7 @@ void main() {
     if (uMode == 1) {
       vec4 w[4];
       for (int i = 0; i < 4; i++) w[i] = kBase + i < vc ? pv[i] : vec4(lastV.xyz, 0.0);
-      if (kBase == 4) w[3] = vec4(hitBlob ? 1.0 : 0.0, 0.0, 0.0, 0.0);
+      if (kBase == 4) w[3] = vec4(hitBlob ? 1.0 : 0.0, sig, 0.0, 0.0);
       o = w[0]; o1 = w[1]; o2 = w[2]; o3 = w[3];
     } else o = vec4(0.0);
     return;
@@ -942,6 +950,7 @@ void main() {
         P *= 0.96;
         rec(p, P);
         refl++;
+        sig += 68921.0;
         if (refl > 2) { P = 0.0; break; }
         d -= 2.0 * ci * n;
         p -= n * 0.5;
@@ -951,9 +960,15 @@ void main() {
       p += d * tB; liqLen += tB;
       vec3 n = eNormal(bB, p);
       float nwB = 1.0 + uWB0[bB].w * (NW - 1.0);   // faded refractive contrast
+      // Fresnel: near the blob's rim (grazing) most light is reflected, not
+      // transmitted — otherwise rim rays, bent hardest and spread thinnest,
+      // fan out into faceted wedges on the wall
+      P *= 1.0 - fresnelR(max(-dot(d, n), 0.0), 1.0, nwB);
       vec3 r = refract(d, n, 1.0 / nwB);
       if (dot(r, r) > 0.0) d = r;
       hitBlob = true;
+      if (nEnt < 3) sig += float(bB + 1) * (nEnt == 0 ? 1.0 : nEnt == 1 ? 41.0 : 1681.0);
+      nEnt++;
       rec(p, P);
       inB = bB;
     } else {
@@ -966,7 +981,8 @@ void main() {
       vec3 n = eNormal(inB, p);
       float nwO = 1.0 + st * (NW - 1.0);
       vec3 r = refract(d, -n, nwO);
-      if (dot(r, r) > 0.0) d = r; else d -= 2.0 * dot(d, n) * n;
+      if (dot(r, r) > 0.0) { P *= 1.0 - fresnelR(max(dot(d, n), 0.0), nwO, 1.0); d = r; }
+      else d -= 2.0 * dot(d, n) * n;                          // total internal reflection
       rec(p, P);
       p += d * 1e-2;
       inB = -1;
@@ -976,14 +992,15 @@ void main() {
     // past the path's end: its last point, carrying nothing
     vec4 w[4];
     for (int i = 0; i < 4; i++) w[i] = kBase + i < vc ? pv[i] : vec4(lastV.xyz, 0.0);
-    if (kBase == 4) w[3] = vec4(hitBlob ? 1.0 : 0.0, 0.0, 0.0, 0.0);
+    if (kBase == 4) w[3] = vec4(hitBlob ? 1.0 : 0.0, sig, 0.0, 0.0);
     o = w[0]; o1 = w[1]; o2 = w[2]; o3 = w[3];
     return;
   }
   if (!exited || P <= 1e-4 * P0 || d.z > -1e-4) { o = vec4(0.0); return; }
   P *= exp(-2.2 / uSim.y * liqLen);
   float sW = (-uWallD - p.z) / d.z;
-  o = vec4(p.x + d.x * sW + 0.5 * uSim.x + uViewM, p.y + d.y * sW + uViewT, P, min(1.0, waxLen / 20.0));
+  // w: signature, plus the wax share (< 1) in the fraction
+  o = vec4(p.x + d.x * sW + 0.5 * uSim.x + uViewM, p.y + d.y * sW + uViewT, P, sig + min(0.999, waxLen / 20.0));
 }`;
 
 // Ray tubes → wall. No vertex attributes: gl_VertexID picks the quad (and
@@ -1008,10 +1025,13 @@ vec2 tube(int a, int p) {
   vec4 r00 = ray(a, p), r01 = ray(a + 1, p), r10 = ray(a, p + 1), r11 = ray(a + 1, p + 1);
   float span = max(distance(r00.xy, r11.xy), distance(r01.xy, r10.xy));
   if (min(min(r00.z, r01.z), min(r10.z, r11.z)) <= 0.0 || span > uMaxSpan) return vec2(-1.0);
+  // all four rays must have taken the same path (LIGHT_TRACE_FS: sig)
+  float s0 = floor(r00.w);
+  if (floor(r01.w) != s0 || floor(r10.w) != s0 || floor(r11.w) != s0) return vec2(-1.0);
   vec2 a0 = r00.xy / uCell, a1 = r01.xy / uCell, b0 = r10.xy / uCell, b1 = r11.xy / uCell;
   float area = 0.5 * abs(cross2(a1 - a0, b0 - a0)) + 0.5 * abs(cross2(b1 - a1, b0 - a1));
   float E = 0.25 * (r00.z + r01.z + r10.z + r11.z);
-  float wf = 0.25 * (r00.w + r01.w + r10.w + r11.w);
+  float wf = 0.25 * (fract(r00.w) + fract(r01.w) + fract(r10.w) + fract(r11.w));
   float irr = E / max(area, 0.7);
   return irr * vec2(1.0 - wf, wf);
 }
@@ -1129,7 +1149,7 @@ uniform int   uRowsLens;
 uniform vec2  uSim;
 uniform vec2  uTgt;         // target size (texels)
 uniform float uMaxW;        // widest believable tube (sim px); wider = torn
-uniform highp sampler2D uFlag;  // path texture 3: column 2·ray+1 holds the blob-hit flag
+uniform highp sampler2D uFlag;  // path texture 3: column 2·ray+1 holds (blob-hit flag, signature)
 uniform int   uRefSrc;      // ≥ 0: draw only this source's reference tubes, all of them
 out vec2 vW;
 int ia, ib, row;
@@ -1188,6 +1208,12 @@ void main() {
       + texelFetch(uFlag, ivec2(2 * ia + 1, rt + 1), 0).x + texelFetch(uFlag, ivec2(2 * ib + 1, rt + 1), 0).x <= 0.0) {
       gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vW = vec2(0.0); return;
     }
+  }
+  // all four rays must have taken the same path (LIGHT_TRACE_FS: sig)
+  float s0 = texelFetch(uFlag, ivec2(2 * ia + 1, row), 0).y;
+  if (texelFetch(uFlag, ivec2(2 * ib + 1, row), 0).y != s0 || texelFetch(uFlag, ivec2(2 * ia + 1, row + 1), 0).y != s0
+      || texelFetch(uFlag, ivec2(2 * ib + 1, row + 1), 0).y != s0) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vW = vec2(0.0); return;
   }
   load(j);
   float dj = density(1, j);
