@@ -626,11 +626,22 @@ void main() {
   inside = inside * lensT + lensF * (LIN(vec3(0.035, 0.028, 0.05)) + uHot * 0.04 * uGlow);
 
   // -------- Bottle frame ---------
-  vec3 topCapCol = LIN(vec3(0.06, 0.05, 0.10));
-  float neckBand = smoothstep(0.030, 0.035, t) * (1.0 - smoothstep(0.045, 0.050, t));
-  topCapCol += LIN(vec3(0.10, 0.08, 0.14)) * neckBand;
-  float capLight = smoothstep(0.4, 0.0, distFromCenter / (uSim.x * 0.3));
-  topCapCol *= mix(1.0, 1.5, capLight * (1.0 - smoothstep(0.0, 0.05, t)));
+  // Top cap: a tapered metal cone sitting on the glass (half-width
+  // 0.15 → 0.265 of the lamp's width from its top to the glass), shaded
+  // like a metal cylinder — darker toward its sides, a soft highlight
+  // band — with a darker lip where it meets the glass. Crisp,
+  // antialiased edges; the wall shows around it.
+  const float CAP_T = 0.055;
+  float capU = clamp(t / CAP_T, 0.0, 1.0);
+  float capHW = uSim.x * mix(0.15, 0.265, capU);
+  float capX = (simPos.x - cx) / capHW;                     // −1 … 1 across the cone
+  float capCov = clamp((capHW - distFromCenter) / max(fwidth(distFromCenter), 1e-3) + 0.5, 0.0, 1.0)
+               * clamp(t / max(fwidth(t), 1e-5) + 0.5, 0.0, 1.0)
+               * clamp((CAP_T - t) / max(fwidth(t), 1e-5) + 0.5, 0.0, 1.0);
+  float capShade = 0.35 + 0.65 * sqrt(max(1.0 - capX * capX, 0.0));
+  float capSpec = pow(max(1.0 - abs(capX + 0.35) * 2.5, 0.0), 2.0);
+  vec3 topCapCol = LIN(vec3(0.13, 0.11, 0.16)) * capShade + LIN(vec3(0.30, 0.27, 0.34)) * capSpec;
+  topCapCol *= mix(1.0, 0.55, smoothstep(0.85, 1.0, capU));   // lip
 
   vec3 botCapCol = mix(LIN(vec3(0.07, 0.04, 0.09)), LIN(vec3(0.16, 0.10, 0.13)), smoothstep(0.95, 1.00, t));
   float baseGlow = smoothstep(0.99, 0.95, t) * uGlow;
@@ -660,10 +671,8 @@ void main() {
   }
 
   vec3 col;
-  bool inCapX = distFromCenter < uSim.x * 0.5;   // cap / base are the lamp's width
-  if (t >= 0.0 && t < 0.05 && inCapX) {
-    col = topCapCol;
-  } else if (t > 0.95 && t <= 1.0 && inCapX) {
+  bool inCapX = distFromCenter < uSim.x * 0.5;   // the base is the lamp's width
+  if (t > 0.95 && t <= 1.0 && inCapX) {
     col = botCapCol;
   } else {
     col = mix(frameOut, inside, insideGlass);
@@ -683,6 +692,8 @@ void main() {
       col += edgeCol * (1.0 - exp(-0.7 * wallIrr)) * L * 0.32 * step(b, R);
     }
   }
+
+  col = mix(col, topCapCol, capCov);
 
   // Soft outer glow
   float outerGlow = smoothstep(0.96, 0.55, t) * uGlow * 0.18;
