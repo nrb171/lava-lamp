@@ -1908,7 +1908,11 @@ class MetaballRenderer {
     gl.uniform1i(tU.uRowsLens, rows);
     gl.uniform2f(tU.uSim, SIM_W, SIM_H);
     gl.uniform2f(tU.uTgt, CW, CH);
-    gl.uniform1f(tU.uMaxW, 90);
+    // widest believable tube: generous — light spreading out above a
+    // blob's focus is genuinely wide, and cutting it (this was 90 px) ended
+    // shafts on a flat line; tubes torn across different paths are
+    // already dropped by the path signature
+    gl.uniform1f(tU.uMaxW, 400);
     gl.viewport(0, 0, CW, CH);
     gl.clearColor(0, 0, 0, 0);
     gl.enable(gl.BLEND);
