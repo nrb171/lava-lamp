@@ -45,11 +45,11 @@ class SPH {
     // Kernel and core fluid params
     this.h = 26;                  // smoothing radius (px)
     this.mass = 0.9;
-    this.gasK = 2400 * 3.00;      // pressure stiffness
+    this.gasK = 2400 * 5.00;      // pressure stiffness
     this.viscosity = 0.2 / 26;    // base kinematic viscosity
     this.viscScale = 0.50;        // user multiplier (lower = bouncier: Ohnesorge ∝ ν/√(σR))
     this.cohesion = 0.55;
-    this.surfaceTensionScale = 2.20;   // UI "Surface tension": scales cohesion AND capSigma
+    this.surfaceTensionScale = 5.00;   // UI "Surface tension": scales cohesion AND capSigma
 
     // Capillary (surface-tension) restoring force on each free blob's
     // lowest shape mode — see _applyCapillaryMode() for the derivation.
@@ -84,7 +84,7 @@ class SPH {
     this.springMaxStretch = this.h * 0.4;
     this.springMin = this.h * 0.4;
     this.springReach = this.h * 1.3;
-    this.springScale = 6.00 / 2000;
+    this.springScale = 12.00 / 2000;
 
     // Pool-zone spring attenuation band (y-space)
     this.poolSpringLo = 480;   // spring starts fading here
@@ -93,7 +93,7 @@ class SPH {
 
     // Sticky bottom layer
     this.stickyHeight = 90;
-    this.stickyStrength = 0.15;
+    this.stickyStrength = 0.80;
     this.stickyPull = 2.00;
 
     // Pool-zone barrier attenuation
@@ -139,6 +139,9 @@ class SPH {
       particles: [],         // [{idx, offX, offY, w}]
     };
 
+    // Drag of the surrounding liquid on the wax: velocity kept per substep
+    this.velDamp = 0.9998;
+
     // Time scale
     this.timeScale = 1.0;
 
@@ -149,23 +152,32 @@ class SPH {
     this.gravity = 240;
     this.coolDensityExcess = 0.030;
     this.hotDensityDeficit = 0.045;
-    this.gravityScale = 1.00;
-    this.buoyancyExp = 4.0;
+    this.gravityScale = 1.50;
+    this.buoyancyExp = 3.0;
+    // Buoyancy of a free blob comes from its density as a whole — its mean
+    // temperature — not each particle's own: per-particle buoyancy makes a
+    // blob with a hot side and a cool side pull itself apart, and turning
+    // buoyancy up then tears blobs instead of lifting them. This is the
+    // share taken from the blob's mean (the rest per particle). The pool —
+    // any group centred in the pool zone, joined to the base or not — stays
+    // per particle, so hot plumes rise out of it rather than the whole pool
+    // lifting off as one blob.
+    this.blobBuoyancy = 1.0;
     this.coolMassRef = 8;
 
     // Heat
     this.tAmbient = 0.18;
-    this.heatScale = 3.00;
+    this.heatScale = 4.50;
     this.heatRate = 0.05;
     this.heatDiff = 0.05;
     this.heatDiffScale = 5.00;
     this.interDiffRatio = 0.03;
     this.ambientCool = 0.01;
-    this.ambientCoolScale = 1.10;
+    this.ambientCoolScale = 3.50;
     this.heatNoise = 0.50;
     this.simTime = 0;
     this.bulbHeight = 58;
-    this.edgeFactor = 0.80;
+    this.edgeFactor = 0.30;
 
     this.restDensity = 1;
 
@@ -807,6 +819,18 @@ class SPH {
     const interRatio = this.interDiffRatio;
     const sumFrx = this.sumFrx, sumFry = this.sumFry;
     const zoneDwell = this.zoneDwell;
+    // per-group mean temperature (for blobBuoyancy)
+    const K = this.MAX_BLOBS;
+    const gT = this._groupT || (this._groupT = new Float64Array(K));
+    const gTn = this._groupTn || (this._groupTn = new Float64Array(K));
+    const blobBuo = this.blobBuoyancy;
+    if (blobBuo > 0) {
+      gT.fill(0); gTn.fill(0);
+      for (let i = nFixed; i < n; i++) { gT[gid[i]] += ptemp[i]; gTn[gid[i]]++; }
+      for (let k = 0; k < K; k++) gT[k] = gTn[k] > 0 ? gT[k] / gTn[k] : 0;
+    }
+    const poolG = this._poolBlobId, wallG = nFixed > 0 ? gid[0] : -1;
+    const cmyG = this.cmy, poolTopY = this.poolZoneTop;
 
     // Pool-spring cosine ramp: spring stiffness blends from 1.0×
     // above poolSpringLo to (1-atten)× below poolSpringHi.
@@ -943,7 +967,8 @@ class SPH {
       }
 
       // Buoyancy
-      const tNorm = Math.max(0, Math.min(1, (Ti - this.tAmbient) / (1.0 - this.tAmbient)));
+      const Tb = (blobBuo > 0 && gi !== poolG && gi !== wallG && cmyG[gi] < poolTopY) ? Ti + blobBuo * (gT[gi] - Ti) : Ti;
+      const tNorm = Math.max(0, Math.min(1, (Tb - this.tAmbient) / (1.0 - this.tAmbient)));
       const riseFactor = (Math.exp(buoK * tNorm) - 1) / buoDenom;
       const densRatio = this.coolDensityExcess - buoTotal * riseFactor;
       const effG = this.gravity * densRatio * this.gravityScale;
@@ -1023,11 +1048,12 @@ class SPH {
     const ceilDragDt = ceilDrag * dt;
     const ceilPushDt = ceilPush * dt;
     const invMass = 1.0 / this.mass;
+    const velDamp = this.velDamp;
     for (let i = nFixed; i < n; i++) {
       pvx[i] += this.fx[i] * dt * invMass;
       pvy[i] += this.fy[i] * dt * invMass;
-      pvx[i] *= 0.9995;
-      pvy[i] *= 0.9995;
+      pvx[i] *= velDamp;
+      pvy[i] *= velDamp;
       if (py[i] > stickyTop) {
         const t = Math.min(1, (py[i] - stickyTop) / this.stickyHeight);
         const drag = Math.max(0, 1 - stickyDt * t);
