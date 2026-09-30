@@ -706,8 +706,8 @@ if (typeof module !== 'undefined' && module.exports) {
 //  Lamp light on the GPU: caustics in the liquid and on the wall behind
 //
 //  One ray tracer (LIGHT_TRACE_FS) follows the lamp's light:
-//   • it starts at one diffuse (Lambertian) source on the axis at the
-//     pool's resting surface; where the pool is thicker than that, it
+//   • it starts at one diffuse (Lambertian) source on the axis just
+//     under the pool's resting surface; where there is wax above it, it
 //     passes up through the wax, dimmed, to the pool's base surface (a
 //     smooth height field built each trace from the pool particles),
 //     which refracts it (wax → liquid, Fresnel, total internal
@@ -743,7 +743,7 @@ uniform float uGlow;
 uniform float uRayScale;    // power per ray (keeps totals independent of ray count)
 uniform ivec3 uRayDim;      // rays: azimuth × polar × sources
 uniform float uAzSpan;      // azimuths covered: π (toward the wall) or 2π
-uniform float uYSrc;        // the light source: on the axis at the pool's resting surface (sim px)
+uniform float uYSrc;        // the light source: on the axis just under the pool's resting surface (sim px)
 uniform float uSrcR;        // … and its radius
 uniform float uMuPool;      // attenuation in the pool wax (per sim px)
 uniform int   uNB;
