@@ -197,7 +197,8 @@ uniform sampler2D uBackdrop2; // … newest trace
 uniform float uWallMix;       // 0 → previous, 1 → newest
 uniform float uWall;          // 1 = draw the lit wall
 // GPU caustics (see LIGHT_TRACE_FS): light scattered in the liquid over the
-// lamp, R = traced, G = without wax lenses; previous and newest trace
+// lamp, R = excess over the lamp without wax lenses, G = that lamp's light;
+// previous and newest trace
 uniform sampler2D uCaus;
 uniform sampler2D uCaus2;
 uniform float uCausMix;
@@ -494,7 +495,7 @@ void main() {
       wallIrr = vol.b;
       if (uCausGpu > 0.5) {
         vec2 cz = mix(texture(uCaus, vec2(colU, colV)).rg, texture(uCaus2, vec2(colU, colV)).rg, uCausMix);
-        excess = cz.r - cz.g;
+        excess = cz.r;
         // Glass-edge light: light arriving near the glass on this side
         // (a band 8-20 px in from the glass, ±8 px in height), relative to
         // its mean along a clear lamp's glass: ≈1 on average, a few × where
@@ -507,8 +508,9 @@ void main() {
           float dyi = (float(k / 2) - 1.0) * 8.0;
           float v = colV - dyi / uSim.y;
           vec2 uL = vec2((cx - dxi) / uSim.x, v), uR = vec2((cx + dxi) / uSim.x, v);
-          er += vec2(mix(texture(uCaus, uL).r, texture(uCaus2, uL).r, uCausMix),
-                     mix(texture(uCaus, uR).r, texture(uCaus2, uR).r, uCausMix));
+          vec2 cl = mix(texture(uCaus, uL).rg, texture(uCaus2, uL).rg, uCausMix);
+          vec2 cr = mix(texture(uCaus, uR).rg, texture(uCaus2, uR).rg, uCausMix);
+          er += vec2(cl.r + cl.g, cr.r + cr.g);          // traced = reference + excess
         }
         float sideT = smoothstep(-0.5 * halfW, 0.5 * halfW, simPos.x - cx);
         wallIrr = max(mix(er.x, er.y, sideT) / 6.0, 0.0) * uEdgeScale;
@@ -718,9 +720,11 @@ if (typeof module !== 'undefined' && module.exports) {
 //          baseline and the difference that is drawn.
 //  Liquid: CAUS_TUBE_* does the same between successive planes: a tube's
 //          light scattered out in that slab (power × path length) is spread
-//          over the band it spans in the view — once as traced and once
-//          without the wax lenses (the reference); CAUS_UPDATE_FS filters
-//          and normalises both.
+//          over the band it spans in the view — as traced and without the
+//          wax lenses (the reference), for the tubes a blob touched (the
+//          rest cancel). The full reference changes slowly and is rebuilt
+//          one emitting point per update. CAUS_UPDATE_FS filters and
+//          normalises.
 // ============================================================
 
 const LIGHT_TRACE_FS = `#version 300 es
@@ -741,10 +745,15 @@ uniform int   uPoolN;
 uniform float uBumpZ;       // bump extent across the view direction (sim px)
 uniform float uLensOn;      // 0 = reference: no blobs, no bumps
 uniform int   uMode;        // 0 = wall landing, 1 = path vertices
-uniform int   uPathK;       // vertices per path
 uniform float uPoolYMin;    // highest point of the pool surface (smallest y)
 uniform int   uRowOff;
-out vec4 o;
+// mode 0: wall x, wall y (view px), power, wax share (o only)
+// mode 1: path vertices 4·chunk … 4·chunk+3 (o, o1, o2, o3); vertex 7's
+//         slot holds (1 if the path met a blob, …) instead
+layout(location = 0) out vec4 o;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2;
+layout(location = 3) out vec4 o3;
 ${BOTTLE_GLSL}
 const float PI = 3.14159265;
 const float ETA_G = 1.34;             // liquid → air
@@ -790,20 +799,26 @@ float fresnelR(float ci, float n1, float n2) {
   float rp = (n1 * ct - n2 * ci) / (n1 * ct + n2 * ci);
   return 0.5 * (rs * rs + rp * rp);
 }
-// path recording (mode 1): vertex kWant of the path, with the power that
-// leaves it
-int vc = 0, kWant = -1;
-vec4 pathV = vec4(0.0), lastV = vec4(0.0);
+// path recording (mode 1): vertices kBase … kBase+3 of the path, each with
+// the power that leaves it
+int vc = 0, kBase = -100;
+vec4 pv[4];
+vec4 lastV = vec4(0.0);
+bool hitBlob = false;
 void rec(vec3 p, float P) {
   vec4 v = vec4(p.x + 0.5 * uSim.x, p.y, p.z, P);
-  if (vc == kWant) pathV = v;
+  int i = vc - kBase;
+  if (i >= 0 && i < 4) pv[i] = v;
   lastV = v; vc++;
 }
+// this chunk's vertices are all in, and the blob flag can't change: stop
+bool enough() { return uMode == 1 && vc >= kBase + 4 && (kBase == 0 || hitBlob); }
 void main() {
   ivec2 id = ivec2(gl_FragCoord.xy);
   id.y -= uRowOff;
   int ia = id.x;
-  if (uMode == 1) { ia = id.x / uPathK; kWant = id.x - ia * uPathK; }
+  if (uMode == 1) { ia = id.x / 2; kBase = 4 * (id.x - ia * 2); }
+  for (int i = 0; i < 4; i++) pv[i] = vec4(0.0);
   int ip = id.y % uRayDim.y, src = id.y / uRayDim.y;
   // emitting point: sunflower pattern over a disc (equal area each), on the
   // pool's surface
@@ -838,7 +853,7 @@ void main() {
     if (hitE(b, p, d, h0, h1) && h0 < 0.0 && h1 > 0.0) { inB = b; break; }
   }
   for (int ev = 0; ev < 10; ev++) {
-    if (P <= 1e-3 * P0) break;
+    if (P <= 1e-3 * P0 || enough()) break;
     if (inB < 0) {
       float tB = 1e9; int bB = -1;
       for (int b = 0; b < 40; b++) {
@@ -892,6 +907,7 @@ void main() {
       float nwB = 1.0 + uWB0[bB].w * (NW - 1.0);   // faded refractive contrast
       vec3 r = refract(d, n, 1.0 / nwB);
       if (dot(r, r) > 0.0) d = r;
+      hitBlob = true;
       rec(p, P);
       inB = bB;
     } else {
@@ -912,7 +928,10 @@ void main() {
   }
   if (uMode == 1) {
     // past the path's end: its last point, carrying nothing
-    o = kWant < vc ? pathV : vec4(lastV.xyz, 0.0);
+    vec4 w[4];
+    for (int i = 0; i < 4; i++) w[i] = kBase + i < vc ? pv[i] : vec4(lastV.xyz, 0.0);
+    if (kBase == 4) w[3] = vec4(hitBlob ? 1.0 : 0.0, 0.0, 0.0, 0.0);
+    o = w[0]; o1 = w[1]; o2 = w[2]; o3 = w[3];
     return;
   }
   if (!exited || P <= 1e-4 * P0 || d.z > -1e-4) { o = vec4(0.0); return; }
@@ -998,7 +1017,7 @@ void main() {
   oWall = vec4(s, 0.0, 1.0);
 }`;
 
-// Path vertices → where each path crosses each plane (planes go up from
+// Path vertices (up to 7) → where each path crosses each plane (planes go up from
 // uPlaneY0 in steps of uPlaneDY), with the power it carries there. The pool
 // glows continuously but our emitters are points, whose light is
 // concentrated right next to them, so a path's light fades in over its
@@ -1006,22 +1025,26 @@ void main() {
 // below the path's start (inside the pool) gets the start, carrying ~0.
 const CAUS_CROSS_FS = `#version 300 es
 precision highp float;
-uniform highp sampler2D uPathV;
-uniform int   uPathK;       // vertices per path
+uniform highp sampler2D uV0, uV1, uV2, uV3;   // vertex k: texture k % 4, column 2·ray + k / 4
 uniform int   uPlanes;
 uniform float uPlaneY0, uPlaneDY;
 out vec4 o;
+vec4 vert(int ray, int k, int row) {
+  ivec2 c = ivec2(2 * ray + k / 4, row);
+  int t = k - (k / 4) * 4;
+  return t == 0 ? texelFetch(uV0, c, 0) : t == 1 ? texelFetch(uV1, c, 0)
+       : t == 2 ? texelFetch(uV2, c, 0) : texelFetch(uV3, c, 0);
+}
 void main() {
   ivec2 id = ivec2(gl_FragCoord.xy);
   int ray = id.x / uPlanes, j = id.x - ray * uPlanes;
   float py = uPlaneY0 - float(j) * uPlaneDY;
-  vec4 v0 = texelFetch(uPathV, ivec2(ray * uPathK, id.y), 0);
+  vec4 v0 = vert(ray, 0, id.y);
   if (v0.w <= 0.0) { o = vec4(v0.xyz, 0.0); return; }
   if (v0.y <= py) { o = vec4(v0.xyz, v0.w * 1e-4); return; }
   vec4 a = v0;
-  for (int k = 1; k < 16; k++) {
-    if (k >= uPathK) break;
-    vec4 b = texelFetch(uPathV, ivec2(ray * uPathK + k, id.y), 0);
+  for (int k = 1; k < 7; k++) {
+    vec4 b = vert(ray, k, id.y);
     if ((a.y - py) * (b.y - py) <= 0.0 && a.y != b.y) {
       vec3 q = mix(a.xyz, b.xyz, (py - a.y) / (b.y - a.y));
       o = vec4(q, a.w * max(smoothstep(8.0, 40.0, distance(q, v0.xyz)), 1e-4));
@@ -1048,58 +1071,82 @@ uniform int   uRowsLens;
 uniform vec2  uSim;
 uniform vec2  uTgt;         // target size (texels)
 uniform float uMaxW;        // widest believable tube (sim px); wider = torn
+uniform highp sampler2D uFlag;  // path texture 3: column 2·ray+1 holds the blob-hit flag
+uniform int   uRefSrc;      // ≥ 0: draw only this source's reference tubes, all of them
 out vec2 vW;
 int ia, ib, row;
-vec4 at(int i, int r, int j) { return texelFetch(uPath, ivec2(i * uPathK + j, r), 0); }
-// the tube's four rays at plane j: x range, mean y, weakest power, mean power
-void plane(int j, out float xm, out float xM, out float y, out float pmin, out float pm) {
-  vec4 a = at(ia, row, j), b = at(ib, row, j), c = at(ia, row + 1, j), d = at(ib, row + 1, j);
+// the tube's four rays at planes j-1 … j+2 (index 0 … 3), fetched once
+vec4 R[16];
+void load(int j) {
+  for (int m = 0; m < 4; m++) {
+    int jj = clamp(j - 1 + m, 0, uPathK - 1);
+    R[m * 4 + 0] = texelFetch(uPath, ivec2(ia * uPathK + jj, row), 0);
+    R[m * 4 + 1] = texelFetch(uPath, ivec2(ib * uPathK + jj, row), 0);
+    R[m * 4 + 2] = texelFetch(uPath, ivec2(ia * uPathK + jj, row + 1), 0);
+    R[m * 4 + 3] = texelFetch(uPath, ivec2(ib * uPathK + jj, row + 1), 0);
+  }
+}
+// x range, mean y, weakest and mean power at loaded plane m
+void plane(int m, out float xm, out float xM, out float y, out float pmin, out float pm) {
+  vec4 a = R[m * 4], b = R[m * 4 + 1], c = R[m * 4 + 2], d = R[m * 4 + 3];
   xm = min(min(a.x, b.x), min(c.x, d.x)); xM = max(max(a.x, b.x), max(c.x, d.x));
   y = 0.25 * (a.y + b.y + c.y + d.y);
   pmin = min(min(a.w, b.w), min(c.w, d.w));
   pm = 0.25 * (a.w + b.w + c.w + d.w);
 }
-float pathLen(int j) {
-  return 0.25 * (distance(at(ia, row, j).xyz, at(ia, row, j + 1).xyz) + distance(at(ib, row, j).xyz, at(ib, row, j + 1).xyz)
-               + distance(at(ia, row + 1, j).xyz, at(ia, row + 1, j + 1).xyz) + distance(at(ib, row + 1, j).xyz, at(ib, row + 1, j + 1).xyz));
-}
-// light per texel the tube puts in slab j (between planes j and j+1), or −1
-float density(int j) {
+// light per texel the tube puts in the slab between loaded planes m and
+// m+1 (plane j-1+m), or −1
+float density(int m, int j) {
   if (j < 0 || j >= uPathK - 1) return -1.0;
   float x0, X0, y0, q0, p0, x1, X1, y1, q1, p1;
-  plane(j, x0, X0, y0, q0, p0);
-  plane(j + 1, x1, X1, y1, q1, p1);
+  plane(m, x0, X0, y0, q0, p0);
+  plane(m + 1, x1, X1, y1, q1, p1);
   if (min(q0, q1) <= 0.0 || X0 - x0 > uMaxW || X1 - x1 > uMaxW || abs(y1 - y0) < 0.05) return -1.0;
   vec2 s = uTgt / uSim;
-  float E = p0 * pathLen(j) * s.x;                                  // power × length (texels)
+  float L = 0.0;
+  for (int r = 0; r < 4; r++) L += distance(R[m * 4 + r].xyz, R[m * 4 + 4 + r].xyz);
+  float E = p0 * 0.25 * L * s.x;                                    // power × length (texels)
   float w0 = max((X0 - x0) * s.x, 1.0), w1 = max((X1 - x1) * s.x, 1.0);
   return E / max(0.5 * (w0 + w1) * abs(y1 - y0) * s.y, 0.5);
 }
 void main() {
-  int q = gl_VertexID / 6, k = gl_VertexID - q * 6;
+  // one instance per tube slab, drawn as a 4-vertex strip:
+  // 0 lower-left, 1 lower-right, 2 upper-left, 3 upper-right
+  int q = gl_InstanceID, k = gl_VertexID;
   int nsl = uPathK - 1;
   int j = q % nsl; q /= nsl;
   ia = q % uRayDim.x; q /= uRayDim.x;
   int ip = q % (uRayDim.y - 1); q /= (uRayDim.y - 1);
-  row = q * uRayDim.y + ip;            // q = source + pass · sources
+  // q = source + pass · sources, or (reference mode) that reference source
+  if (uRefSrc >= 0) q = uRefSrc + uRayDim.z;
+  row = q * uRayDim.y + ip;
   ib = (ia + 1) % uRayDim.x;
-  float dj = density(j);
+  // Tubes whose rays met no blob are the same with and without the wax
+  // lenses and cancel in the difference: skip them (in both passes).
+  if (uRefSrc < 0) {
+    int rt = row < uRowsLens ? row : row - uRowsLens;
+    if (texelFetch(uFlag, ivec2(2 * ia + 1, rt), 0).x + texelFetch(uFlag, ivec2(2 * ib + 1, rt), 0).x
+      + texelFetch(uFlag, ivec2(2 * ia + 1, rt + 1), 0).x + texelFetch(uFlag, ivec2(2 * ib + 1, rt + 1), 0).x <= 0.0) {
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vW = vec2(0.0); return;
+    }
+  }
+  load(j);
+  float dj = density(1, j);
+  if (dj < 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vW = vec2(0.0); return; }
   // The tube's light varies linearly through the slab, matching its
   // neighbouring slabs at the shared planes — a constant per slab would
   // make the field a staircase in height.
-  float dm = density(j - 1), dp = density(j + 1);
-  float lo = dm >= 0.0 ? 0.5 * (dm + dj) : dj, hi = dp >= 0.0 ? 0.5 * (dj + dp) : dj;
+  bool top = k >= 2;
+  float dn = top ? density(2, j + 1) : density(0, j - 1);
+  float w = dn >= 0.0 ? 0.5 * (dn + dj) : dj;
   float x0, X0, y0, q0, p0, x1, X1, y1, q1, p1;
-  plane(j, x0, X0, y0, q0, p0);
-  plane(j + 1, x1, X1, y1, q1, p1);
+  plane(1, x0, X0, y0, q0, p0);
+  plane(2, x1, X1, y1, q1, p1);
   vec2 s = uTgt / uSim;
   float hw0 = 0.5 * max((X0 - x0) * s.x, 1.0) / s.x, hw1 = 0.5 * max((X1 - x1) * s.x, 1.0) / s.x;
   float cx0 = 0.5 * (x0 + X0), cx1 = 0.5 * (x1 + X1);
-  // corners: (lo edge) 0 1, (hi edge) 2 4 5; 3 = 0
-  bool top = k == 2 || k == 4 || k == 5;
-  vec2 P = k == 0 || k == 3 ? vec2(cx0 - hw0, y0) : k == 1 ? vec2(cx0 + hw0, y0)
-         : k == 2 || k == 4 ? vec2(cx1 + hw1, y1) : vec2(cx1 - hw1, y1);
-  float w = top ? hi : lo;
+  vec2 P = k == 0 ? vec2(cx0 - hw0, y0) : k == 1 ? vec2(cx0 + hw0, y0)
+         : k == 2 ? vec2(cx1 - hw1, y1) : vec2(cx1 + hw1, y1);
   vW = row < uRowsLens ? vec2(w, 0.0) : vec2(0.0, w);
   vec2 t = P * s;
   gl_Position = dj >= 0.0 ? vec4(t.x / uTgt.x * 2.0 - 1.0, 1.0 - t.y / uTgt.y * 2.0, 0.0, 1.0)
@@ -1113,9 +1160,12 @@ out vec4 o;
 void main() { o = vec4(vW, 0.0, 0.0); }`;
 
 // 3×3 tent against residual sampling noise, normalise, smooth in time.
+// Out: R = caustic excess (traced − reference, over blob-touched tubes),
+//      G = the full reference field (the light without wax lenses).
 const CAUS_UPDATE_FS = `#version 300 es
 precision highp float;
-uniform highp sampler2D uAcc;
+uniform highp sampler2D uAcc;   // R: traced, G: reference (blob tubes)
+uniform highp sampler2D uRef;   // G: full reference
 uniform highp sampler2D uPrev;
 uniform float uInvRef, uSM, uInit;
 out vec4 o;
@@ -1129,7 +1179,17 @@ void main() {
       v += w * texelFetch(uAcc, clamp(p + ivec2(i, j), ivec2(0), hi), 0).rg;
     }
   }
-  v *= uInvRef / 16.0;
-  vec2 s = uInit > 0.5 ? v : mix(texelFetch(uPrev, p, 0).rg, v, uSM);
+  // The reference is smooth; a taller tent (≈ a slab between planes)
+  // removes the faint per-slab steps.
+  float g = 0.0, gw = 0.0;
+  for (int j = -4; j <= 4; j++) {
+    for (int i = -1; i <= 1; i++) {
+      float w = float((2 - abs(i)) * (5 - abs(j)));
+      g += w * texelFetch(uRef, clamp(p + ivec2(i, 2 * j), ivec2(0), hi), 0).g;
+      gw += w;
+    }
+  }
+  vec2 cur = vec2((v.r - v.g) / 16.0, g / gw) * uInvRef;
+  vec2 s = uInit > 0.5 ? cur : mix(texelFetch(uPrev, p, 0).rg, cur, uSM);
   o = vec4(s, 0.0, 1.0);
 }`;

@@ -680,20 +680,23 @@ class MetaballRenderer {
         const L = (p, names) => Object.fromEntries(names.map(n => [n, gl.getUniformLocation(p, n)]));
         this.ltU = L(this.lightProg, ["uSim", "uViewM", "uViewT", "uWallD", "uGlow", "uRayScale",
                                       "uRayDim", "uAzSpan", "uSrcR", "uNB", "uWB0", "uWB1",
-                                      "uPool", "uPoolN", "uBumpZ", "uLensOn", "uMode", "uPathK", "uRowOff",
+                                      "uPool", "uPoolN", "uBumpZ", "uLensOn", "uMode", "uRowOff",
                                       "uPoolYMin"]);
         this.wsU = L(this.wallSplatProg, ["uRays", "uRayDim", "uView", "uCell", "uMaxSpan"]);
         this.wuU = L(this.wallUpdProg, ["uIrr", "uAvg", "uPrev", "uInvRef", "uAlpha", "uSM", "uInit"]);
-        this.ctU = L(this.causTubeProg, ["uPath", "uPathK", "uRayDim", "uRowsLens", "uSim", "uTgt", "uMaxW"]);
-        this.cuU = L(this.causUpdProg, ["uAcc", "uPrev", "uInvRef", "uSM", "uInit"]);
-        this.ccU = L(this.causCrossProg, ["uPathV", "uPathK", "uPlanes", "uPlaneY0", "uPlaneDY"]);
+        this.ctU = L(this.causTubeProg, ["uPath", "uPathK", "uRayDim", "uRowsLens", "uSim", "uTgt", "uMaxW",
+                                         "uFlag", "uRefSrc"]);
+        this.cuU = L(this.causUpdProg, ["uAcc", "uRef", "uPrev", "uInvRef", "uSM", "uInit"]);
+        this.ccU = L(this.causCrossProg, ["uV0", "uV1", "uV2", "uV3", "uPlanes", "uPlaneY0", "uPlaneDY"]);
         this.emptyVao = gl.createVertexArray();     // the splat / line passes have no attributes
         this.avgTex = [gl.createTexture(), gl.createTexture()];
         this.irrTex = gl.createTexture();
         this.poolTex = gl.createTexture();
         this.rayTex = null; this.rayKey = "";
-        this.pathTex = null; this.pathKey = "";
+        this.pathTex = [0, 1, 2, 3].map(() => gl.createTexture()); this.pathKey = "";
         this.crossTex = gl.createTexture();
+        this.refTex = [gl.createTexture(), gl.createTexture()];
+        this.refFbo = [null, null];
         this.causTex = [gl.createTexture(), gl.createTexture()];
         this.causAcc = gl.createTexture();
         this.causCur = 0; this.causFramesSince = 0; this.causKey = "";
@@ -1260,8 +1263,8 @@ class MetaballRenderer {
   // very large windows, capped at ~60k cells). Rebuilt when the view
   // changes size; the running-average baseline restarts then.
   ensureWallGrid() {
-    // GPU: ~3 sim-px cells, up to ~150k of them. CPU: ~4 px, up to ~60k.
-    const cell = this.wallGpu ? Math.max(3, Math.sqrt(VIEW_W * VIEW_H / 150000))
+    // GPU: ~2 sim-px cells, up to ~300k of them. CPU: ~4 px, up to ~60k.
+    const cell = this.wallGpu ? Math.max(2, Math.sqrt(VIEW_W * VIEW_H / 300000))
                               : Math.max(4, Math.sqrt(VIEW_W * VIEW_H / 60000));
     const W = Math.max(8, Math.round(VIEW_W / cell)), H = Math.max(8, Math.round(VIEW_H / cell));
     if (W === this.WG_W && H === this.WG_H && this._wgVW === VIEW_W && this._wgVH === VIEW_H) return;
@@ -1452,10 +1455,11 @@ class MetaballRenderer {
     return N;
   }
 
-  // One GPU light trace (caustics in the liquid, and the wall if wallOn).
-  // dtTrace: seconds between traces. Results: causTex[causCur] and
-  // bdTex[bdCurTex] (each blended with the previous one while drawing).
-  gpuLight(sim, px, py, glow, dtTrace, lowQ, wallOn, causOn) {
+  // One GPU light trace: the wall if wallOn, the liquid if causOn. Results:
+  // bdTex[bdCurTex] and causTex[causCur] (each blended with the previous
+  // one while drawing). dtWall / dtCaus: seconds between wall / liquid
+  // traces; dtPool: between calls.
+  gpuLight(sim, px, py, glow, lowQ, wallOn, causOn, dtWall, dtCaus, dtPool) {
     const gl = this.gl;
     const nb = Math.min(40, this.buildWallBlobs(sim, px, py));
     const B = this._wBlobs, BS = this._wBlobS, w0 = this._wb0, w1 = this._wb1;
@@ -1467,7 +1471,7 @@ class MetaballRenderer {
     if (sim.resetCount !== this._bdResetSeen) {
       this.bdAvgInit = false; this.causInit = false; this._bdResetSeen = sim.resetCount;
     }
-    const poolN = this.buildPoolTex(sim, px, py, dtTrace / 2);   // leaves it on unit 5
+    const poolN = this.buildPoolTex(sim, px, py, dtPool);   // leaves it on unit 5
     gl.useProgram(this.lightProg);
     const t = this.ltU;
     gl.uniform1i(t.uPool, 5);
@@ -1489,11 +1493,11 @@ class MetaballRenderer {
     // emitting points on the pool surface: more for the wall, whose light
     // shows each point's shadows and lens images directly
     if (wallOn) {
-      this.gpuWall(t, lowQ ? 7 : 12, dtTrace, lowQ);
+      this.gpuWall(t, lowQ ? 7 : 12, dtWall, lowQ);
       gl.activeTexture(gl.TEXTURE5);                     // the wall's filter pass used unit 5
       gl.bindTexture(gl.TEXTURE_2D, this.poolTex);
     }
-    if (causOn) this.gpuCaustics(t, lowQ ? 5 : 7, glow, dtTrace, lowQ);
+    if (causOn) this.gpuCaustics(t, lowQ ? 5 : 7, glow, dtCaus, lowQ);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
@@ -1573,8 +1577,8 @@ class MetaballRenderer {
     gl.uniform1i(uU.uIrr, 5); gl.uniform1i(uU.uAvg, 6); gl.uniform1i(uU.uPrev, 7);
     gl.uniform1f(uU.uInvRef, 1 / this.bdRef);
     gl.uniform1f(uU.uAlpha, Math.min(1, dtTrace / tau));
-    // per-trace temporal smoothing: the CPU path's 0.5 per 4 frames
-    gl.uniform1f(uU.uSM, 1 - Math.pow(0.5, dtTrace / (4 / 60)));
+    // light temporal smoothing: half-life of 2 frames
+    gl.uniform1f(uU.uSM, 1 - Math.pow(0.5, dtTrace / (2 / 60)));
     gl.uniform1f(uU.uInit, this.bdAvgInit ? 0 : 1);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
@@ -1587,8 +1591,8 @@ class MetaballRenderer {
   // filtered field over the lamp.
   gpuCaustics(t, NSRC, glow, dtTrace, lowQ) {
     const gl = this.gl;
-    const K = 10, J = lowQ ? 20 : 36, NAZ = lowQ ? 32 : 48, NPH = lowQ ? 12 : 16;
-    const cell = lowQ ? 4 : 2.5;
+    const J = lowQ ? 20 : 40, NAZ = lowQ ? 32 : 48, NPH = lowQ ? 12 : 20;
+    const cell = lowQ ? 4 : 2;
     const CW = Math.round(SIM_W / cell), CH = Math.round(SIM_H / cell);
     const rows = NPH * NSRC;
     // planes from just above the pool to near the top
@@ -1596,19 +1600,28 @@ class MetaballRenderer {
     // targets
     const pk = NAZ + "x" + rows + "x" + J;
     if (pk !== this.pathKey) {
-      if (!this.pathTex) this.pathTex = gl.createTexture();
-      this.pathFbo = this.gpuTarget(this.pathTex, gl.RGBA32F, gl.RGBA, NAZ * K, 2 * rows, gl.NEAREST, this.pathFbo);
+      // path vertices: four targets written at once, two columns per ray
+      this.pathTex.forEach((tx, i) => { const fb = this.gpuTarget(tx, gl.RGBA32F, gl.RGBA, NAZ * 2, 2 * rows, gl.NEAREST, null); if (fb) gl.deleteFramebuffer(fb); });
+      if (this.pathFbo) gl.deleteFramebuffer(this.pathFbo);
+      this.pathFbo = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.pathFbo);
+      this.pathTex.forEach((tx, i) => gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, tx, 0));
+      gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2, gl.COLOR_ATTACHMENT3]);
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) { gl.deleteFramebuffer(this.pathFbo); this.pathFbo = null; }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       this.crossFbo = this.gpuTarget(this.crossTex, gl.RGBA32F, gl.RGBA, NAZ * J, 2 * rows, gl.NEAREST, this.crossFbo);
-      this.pathKey = pk;
+      this.pathKey = pk; this.refStep = 0; this.refReady = false;
     }
     const ck = CW + "x" + CH;
     if (ck !== this.causKey) {
       this.causAccFbo = this.gpuTarget(this.causAcc, gl.RGBA16F, gl.RGBA, CW, CH, gl.NEAREST, this.causAccFbo);
       this.causFbo = (this.causFbo || [null, null]).map((fb, i) =>
         this.gpuTarget(this.causTex[i], gl.RG16F, gl.RG, CW, CH, gl.LINEAR, fb));
-      this.causKey = ck; this.causRef = null; this.causInit = false;
+      this.refFbo = this.refFbo.map((fb, i) => this.gpuTarget(this.refTex[i], gl.RGBA16F, gl.RGBA, CW, CH, gl.NEAREST, fb));
+      this.causKey = ck; this.causRef = null; this.causInit = false; this.refStep = 0; this.refReady = false;
     }
-    if (!this.pathFbo || !this.crossFbo || !this.causAccFbo || !this.causFbo[0] || !this.causFbo[1]) {
+    if (!this.pathFbo || !this.crossFbo || !this.causAccFbo || !this.causFbo[0] || !this.causFbo[1]
+        || !this.refFbo[0] || !this.refFbo[1]) {
       console.warn("GPU caustic targets incomplete, using the CPU");
       this.wallGpu = false; this.WG_W = 0; this.ensureWallGrid(); return;
     }
@@ -1617,13 +1630,12 @@ class MetaballRenderer {
     gl.useProgram(this.lightProg);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.pathFbo);
     gl.uniform1i(t.uMode, 1);
-    gl.uniform1i(t.uPathK, K);
     gl.uniform1f(t.uAzSpan, 2 * Math.PI);
     gl.uniform1f(t.uRayScale, 1 / (NPH * NAZ));
     gl.uniform3i(t.uRayDim, NAZ, NPH, NSRC);
     gl.bindVertexArray(this.vao);
     for (let pass = 0; pass < 2; pass++) {
-      gl.viewport(0, pass * rows, NAZ * K, rows);
+      gl.viewport(0, pass * rows, NAZ * 2, rows);
       gl.uniform1i(t.uRowOff, pass * rows);
       gl.uniform1f(t.uLensOn, pass === 0 ? 1 : 0);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
@@ -1632,44 +1644,60 @@ class MetaballRenderer {
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.crossFbo);
     gl.viewport(0, 0, NAZ * J, 2 * rows);
     gl.useProgram(this.causCrossProg);
-    gl.activeTexture(gl.TEXTURE6);
-    gl.bindTexture(gl.TEXTURE_2D, this.pathTex);
     const xU = this.ccU;
-    gl.uniform1i(xU.uPathV, 6);
-    gl.uniform1i(xU.uPathK, K);
+    this.pathTex.forEach((tx, i) => { gl.activeTexture(gl.TEXTURE4 + i); gl.bindTexture(gl.TEXTURE_2D, tx); });
+    gl.uniform1i(xU.uV0, 4); gl.uniform1i(xU.uV1, 5); gl.uniform1i(xU.uV2, 6); gl.uniform1i(xU.uV3, 7);
     gl.uniform1i(xU.uPlanes, J);
     gl.uniform1f(xU.uPlaneY0, yLo);
     gl.uniform1f(xU.uPlaneDY, dy);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
-    // 2. tubes → light, additively
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.causAccFbo);
-    gl.viewport(0, 0, CW, CH);
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    // 2. tubes → light, additively (crossings on unit 6, blob flags on 7)
     gl.useProgram(this.causTubeProg);
-    gl.activeTexture(gl.TEXTURE6);
-    gl.bindTexture(gl.TEXTURE_2D, this.crossTex);
+    gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, this.crossTex);
+    gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, this.pathTex[3]);
     const tU = this.ctU;
     gl.uniform1i(tU.uPath, 6);
+    gl.uniform1i(tU.uFlag, 7);
     gl.uniform1i(tU.uPathK, J);
     gl.uniform3i(tU.uRayDim, NAZ, NPH, NSRC);
     gl.uniform1i(tU.uRowsLens, rows);
     gl.uniform2f(tU.uSim, SIM_W, SIM_H);
     gl.uniform2f(tU.uTgt, CW, CH);
     gl.uniform1f(tU.uMaxW, 90);
+    gl.viewport(0, 0, CW, CH);
+    gl.clearColor(0, 0, 0, 0);
     gl.enable(gl.BLEND);
     gl.blendEquation(gl.FUNC_ADD);
     gl.blendFunc(gl.ONE, gl.ONE);
     gl.bindVertexArray(this.emptyVao);
-    gl.drawArrays(gl.TRIANGLES, 0, (J - 1) * NAZ * (NPH - 1) * 2 * NSRC * 6);
+    // 2a. the tubes blobs touched, traced and reference
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.causAccFbo);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.uniform1i(tU.uRefSrc, -1);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, (J - 1) * NAZ * (NPH - 1) * 2 * NSRC);
+    // 2b. the full reference, one emitting point per update into the
+    //     texture being built (all at once the first time)
+    const perSrc = (J - 1) * NAZ * (NPH - 1);
+    const build = this.refReady ? this.refBuild : 0;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.refFbo[build]);
+    const first = this.refReady ? this.refStep : 0, last = this.refReady ? this.refStep : NSRC - 1;
+    if (first === 0) gl.clear(gl.COLOR_BUFFER_BIT);
+    for (let src = first; src <= last; src++) {
+      gl.uniform1i(tU.uRefSrc, src);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, perSrc);
+    }
     gl.disable(gl.BLEND);
+    if (!this.refReady) { this.refCur = 0; this.refBuild = 1; this.refReady = true; this.refStep = 0; }
+    else if (++this.refStep === NSRC) { this.refCur = build; this.refBuild = build ^ 1; this.refStep = 0; }
 
-    // Normalisation, once per grid, from the reference (G), as on the CPU:
-    // caustic excess is a fraction of the brightest clear-lamp light (at
-    // glow 1) — taken over the liquid above the pool, as a high percentile
+    // Normalisation, once per grid, from the full reference, as on the
+    // CPU: caustic excess is a fraction of the brightest clear-lamp light
+    // (at glow 1) — over the liquid above the pool, as a high percentile
     // (robust to a hot texel); glass-edge light is relative to its mean
     // along the lit glass.
     if (!this.causRef) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.refFbo[this.refCur]);
       const buf = new Float32Array(CW * CH * 4);
       gl.readPixels(0, 0, CW, CH, gl.RGBA, gl.FLOAT, buf);
       const vals = [];
@@ -1693,11 +1721,13 @@ class MetaballRenderer {
     // 3. filter, normalise, smooth in time
     const cur = this.causCur, nxt = cur ^ 1;
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.causFbo[nxt]);
+    gl.viewport(0, 0, CW, CH);
     gl.useProgram(this.causUpdProg);
     gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, this.causAcc);
+    gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, this.refTex[this.refCur]);
     gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, this.causTex[cur]);
     const cU = this.cuU;
-    gl.uniform1i(cU.uAcc, 5); gl.uniform1i(cU.uPrev, 7);
+    gl.uniform1i(cU.uAcc, 5); gl.uniform1i(cU.uRef, 6); gl.uniform1i(cU.uPrev, 7);
     gl.uniform1f(cU.uInvRef, 1 / this.causRef.f);
     gl.uniform1f(cU.uSM, 1 - Math.pow(0.3, dtTrace / (2 / 60)));
     gl.uniform1f(cU.uInit, this.causInit ? 0 : 1);
@@ -2032,18 +2062,24 @@ class MetaballRenderer {
     this._lightGpuOn = lightGpu;
     if (lightGpu) {
       // Everything on the GPU (gpuLight); the CPU only builds the blob list
-      // and the pool surface. Traced every `every` frames; the shader eases
-      // from the previous trace to the newest in between.
-      const every = (params.quality !== undefined && params.quality < 0.8) ? 4 : 2;
+      // and the pool surface. Full quality: the liquid every frame, the
+      // wall every 2nd. Low quality: a trace every 2 frames, wall and
+      // liquid taking turns (each every 4th). The shader eases from each
+      // one's previous trace to its newest in between.
+      // (the first step down of the adaptive quality already switches the
+      // light to its low tier: cheaper to give up than pixel sharpness)
+      const lowQ = params.quality !== undefined && params.quality < 0.9;
+      const wallOn = params.wall !== false;
+      const every = lowQ ? 2 : 1;
       this._causticTick = (this._causticTick || 0) + 1;
       if (this._causticTick % every === 0) {
-        // wall and liquid take turns (each updated every 2·every frames)
-        const wallOn = params.wall !== false;
         const turn = (this._lightTurn = (this._lightTurn || 0) + 1) & 1;
-        const doWall = wallOn && turn === 0, doCaus = !wallOn || turn === 1 || !this.causInit;
-        const dtT = (wallOn ? 2 : 1) * every / 60;
-        this.gpuLight(sim, sx, sy, params.glow / 0.38, dtT, every > 2, doWall, doCaus);
-        this.lightInterval = (wallOn ? 2 : 1) * every;
+        const doWall = wallOn && turn === 0;
+        const doCaus = !lowQ || !wallOn || turn === 1 || !this.causInit;
+        this.causInterval = (lowQ && wallOn ? 2 : 1) * every;
+        this.wallInterval = (wallOn ? 2 : 1) * every;
+        this.gpuLight(sim, sx, sy, params.glow / 0.38, lowQ, doWall, doCaus,
+                      this.wallInterval / 60, this.causInterval / 60, every / 60);
       }
     } else if (causticsOn) {
       if (!this.causticRef) {
@@ -2303,14 +2339,14 @@ class MetaballRenderer {
     if (this.u.backdrop) gl.uniform1i(this.u.backdrop, 3);
     if (this.u.backdrop2) gl.uniform1i(this.u.backdrop2, 4);
     if (this.u.wallMix) gl.uniform1f(this.u.wallMix,
-      Math.min(1, this.wallFramesSince / ((this._lightGpuOn ? this.lightInterval : this.wallInterval) || 4)));
+      Math.min(1, this.wallFramesSince / (this.wallInterval || 4)));
     const causGpu = this._lightGpuOn && params.volAbsorb !== false && this.causInit;
     if (this.u.causGpu) gl.uniform1f(this.u.causGpu, causGpu ? 1 : 0);
     if (this.u.caus) gl.uniform1i(this.u.caus, 5);
     if (this.u.caus2) gl.uniform1i(this.u.caus2, 6);
     if (this.u.edgeScale) gl.uniform1f(this.u.edgeScale, this.causRef ? this.causRef.f / this.causRef.e : 1);
     if (this.u.causMix) gl.uniform1f(this.u.causMix,
-      Math.min(1, this.causFramesSince / (this.lightInterval || 2)));
+      Math.min(1, this.causFramesSince / (this.causInterval || 2)));
     if (this.u.wallOn) gl.uniform1f(this.u.wallOn,
       params.wall !== false && params.caustics !== false && params.volAbsorb !== false ? 1 : 0);
     if (this.u.poolId) gl.uniform1f(this.u.poolId, poolGid);
