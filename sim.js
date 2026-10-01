@@ -46,6 +46,14 @@ class SPH {
     this.h = 26;                  // smoothing radius (px)
     this.mass = 0.9;
     this.gasK = 2400 * 5.00;      // pressure stiffness
+    // Near pressure (Clavet, Beaudoin & Poulin 2005): a short-range
+    // repulsion between particles of the same body, from a "near density"
+    // Σ(1 − r/h)³ that grows without bound as particles crowd. Ordinary
+    // pressure per unit mass, P/ρ, levels off at gasK however hard a body is
+    // squeezed, while the pull of its springs and cohesion grows with its
+    // number of neighbours — so a big, cohesive blob could crush itself to
+    // a point. This keeps particles apart whatever the cohesion.
+    this.nearK = 40;
     this.viscosity = 0.2 / 26;    // base kinematic viscosity
     this.viscScale = 0.50;        // user multiplier (lower = bouncier: Ohnesorge ∝ ν/√(σR))
     this.cohesion = 0.55;
@@ -207,6 +215,7 @@ class SPH {
     this.fy = new Float32Array(n);
     this.density  = new Float32Array(n);
     this.compression = new Float32Array(n);  // per-particle compression ratio
+    this.nearDensity = new Float32Array(n);  // Σ (1 − r/h)³ over the same body (near pressure)
     this.pressure = new Float32Array(n);
     this.temp = new Float32Array(n);
     this.dT   = new Float32Array(n);
@@ -745,10 +754,12 @@ class SPH {
     const pden = this.density;
     const ppres = this.pressure;
     const sqrtSize = this._sqrtSize;
+    const nearK = this.nearK;
 
     // 1) Density & pressure (inlined neighbor walk)
+    const pnear = this.nearDensity;
     for (let i = 0; i < n; i++) {
-      let rho = 0;
+      let rho = 0, rhoNear = 0;
       const xi = px[i], yi = py[i];
       const gi = gid[i];
       const isFluidI = i >= nFixed;
@@ -772,6 +783,8 @@ class SPH {
               const gj = gid[j];
               if (gj === gi) {
                 rho += term;
+                const qn = 1 - Math.sqrt(r2) / h;
+                rhoNear += qn * qn * qn;
               } else if (isFluidI && j >= nFixed) {
                 const absZ = Math.abs(bz[gi] - bz[gj]);
                 const zReach = Math.min(0.55, (sqrtSize[gi] + sqrtSize[gj]) * 0.07);
@@ -785,6 +798,7 @@ class SPH {
         }
       }
       if (rho < this.restDensity) rho = this.restDensity;
+      pnear[i] = rhoNear;
       pden[i] = rho;
       ppres[i] = this.gasK * (rho - this.restDensity);
       // Compression ratio: 0 at rest density, rises as particle is squeezed.
@@ -851,6 +865,8 @@ class SPH {
       let fvx = 0, fvy = 0;
       let fcx = 0, fcy = 0;
       let frx = 0, fry = 0;
+      let fnx = 0, fny = 0;
+      const nearI = pnear[i];
       let dTsum = 0, neighCount = 0;
       const xi = px[i], yi = py[i];
       const poolI = poolRamp[i];
@@ -919,6 +935,12 @@ class SPH {
                     const pTerm = -m * (Pi + ppres[j]) / (2 * rhoj) * SPIKY_GRAD * (h - r) * (h - r) / r;
                     fpx += pTerm * dx;
                     fpy += pTerm * dy;
+                    if (nearK > 0) {
+                      const qn = 1 - r / h;
+                      const nTerm = nearK * (nearI + pnear[j]) * qn * qn / r;
+                      fnx += nTerm * dx;
+                      fny += nTerm * dy;
+                    }
                     const vTerm = visc * m / rhoj * VISC_LAP * (h - r);
                     fvx += vTerm * (pvx[j] - vxi);
                     fvy += vTerm * (pvy[j] - vyi);
@@ -973,8 +995,8 @@ class SPH {
       const densRatio = this.coolDensityExcess - buoTotal * riseFactor;
       const effG = this.gravity * densRatio * this.gravityScale;
 
-      this.fx[i] = (fpx + fvx) / rhoi + fcx + frx;
-      this.fy[i] = (fpy + fvy) / rhoi + fcy + effG + fry;
+      this.fx[i] = (fpx + fvx) / rhoi + fcx + frx + fnx;
+      this.fy[i] = (fpy + fvy) / rhoi + fcy + effG + fry + fny;
       this.dT[i] = (neighCount > 0 ? dTsum / neighCount : 0) * (this.heatDiff * this.heatDiffScale);
     }
 
