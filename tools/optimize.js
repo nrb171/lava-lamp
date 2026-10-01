@@ -15,7 +15,8 @@
 //  KERNELS object below.
 // ============================================================
 
-const { SPH, SIM_H, SIM_W } = require('./sim.js');
+import { pathToFileURL } from 'node:url';
+import { SPH, SIM_H, SIM_W } from '../src/sim/sim.js';
 
 // ============================================================
 //  Kernel registry
@@ -725,8 +726,8 @@ function main() {
   optimize(kernelNames, { samples: numSamples, time: measureTime });
 }
 
-if (require.main === module) {
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   main();
 }
 
-module.exports = { KERNELS, optimize, ParamKalman, latinHypercube };
+export { KERNELS, optimize, ParamKalman, latinHypercube };

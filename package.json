@@ -1,0 +1,11 @@
+{
+  "name": "lava-lamp",
+  "private": true,
+  "description": "WebGL2 SPH lava lamp. No build step: index.html loads src/main.js as an ES module.",
+  "type": "module",
+  "scripts": {
+    "serve": "python3 -m http.server 8765",
+    "stats": "node tools/blobstats.js",
+    "sheet": "node tools/simsheet.js"
+  }
+}

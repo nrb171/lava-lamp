@@ -7,10 +7,14 @@
 //   node batch_blobpop.js kalman                      — Kalman refinement using LHS results
 //   node batch_blobpop.js validate                    — validation + baseline + final report
 
-const fs = require('fs');
-const path = require('path');
-const { KERNELS, latinHypercube, ParamKalman } = require('./optimize.js');
-const { SPH, SIM_H, SIM_W } = require('./sim.js');
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { KERNELS, latinHypercube, ParamKalman } from './optimize.js';
+import { SPH, SIM_H, SIM_W } from '../src/sim/sim.js';
+
+// (outputs/ sits beside the repo, as before the move to tools/)
+const __dirname = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const RESULTS_FILE = path.join(__dirname, '..', 'outputs', 'blobpop_lhs_results.json');
 const FINAL_FILE = path.join(__dirname, '..', 'outputs', 'blobpop_final.json');

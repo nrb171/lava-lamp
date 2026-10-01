@@ -4,7 +4,8 @@
 // toward a circle (Laplace pressure), stays in one piece, and — when
 // viscosity is low relative to σ — overshoots and oscillates.
 // Usage: node droptest.js [key=value ...]
-const { SPH } = require('./sim.js');
+import { pathToFileURL } from 'node:url';
+import { SPH } from '../src/sim/sim.js';
 function aspectOf(s) {
   let cx = 0, cy = 0, N = 0;
   for (let i = s.nFixed; i < s.n; i++) { cx += s.x[i]; cy += s.y[i]; N++; }
@@ -49,10 +50,10 @@ function run(over, N = 40, ax = 2.2) {
   }
   return { n: s.n - s.nFixed, maxGroups, trace: trace.join(' ') };
 }
-if (require.main === module) {
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const over = {};
   for (const kv of process.argv.slice(2).join(' ').split(/\s+/).filter(Boolean)) { const [k, v] = kv.split('='); over[k] = parseFloat(v); }
   const r = run(over);
   console.log(`particles=${r.n} maxPieces=${r.maxGroups}\naspect every 0.25s: ${r.trace}`);
 }
-module.exports = { run };
+export { run };

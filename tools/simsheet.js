@@ -1,19 +1,19 @@
 #!/usr/bin/env node
 // ============================================================
-//  Headless contact sheet: runs the sim as index.html does (60 fps,
+//  Headless contact sheet: runs the sim as the page does (src/main.js: 60 fps,
 //  5 substeps, seeded) and writes a PNG of snapshots side by side —
 //  particles coloured by blob (pool grey, walls dark), each with a
 //  trail of where it was over the last `trail` seconds, so speed and
 //  collisions can be judged without the browser.
 //
-//  Usage: node simsheet.js out.png [start=90] [every=2] [count=8]
+//  Usage: node tools/simsheet.js out.png [start=90] [every=2] [count=8]
 //                          [seed=1] [trail=1] [key=value ...]
 //  key=value pairs are assigned onto the SPH instance (as blobstats.js).
 // ============================================================
 
-const fs = require('fs');
-const zlib = require('zlib');
-const { SPH, SIM_W, SIM_H, bottleHalfWidth } = require('./sim.js');
+import fs from 'node:fs';
+import zlib from 'node:zlib';
+import { SPH, SIM_W, SIM_H, bottleHalfWidth } from '../src/sim/sim.js';
 
 function mulberry32(a) {
   return function () {
