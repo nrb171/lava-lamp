@@ -1160,11 +1160,18 @@ void main() {
   bool skip = a.w <= 0.0 || distance(a.xyz, b.xyz) < 1e-3
            || (uRefSrc < 0 && vert(ia, 7, rt).x <= 0.0);
   if (skip) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vW = vec2(0.0); vU = 0.0; return; }
+  // A segment pointing nearly along the view is short on screen but carries
+  // the light of its whole 3D length: drawn at its own length that all
+  // landed in a texel or two — a bright point. Bands are at least 2σ long
+  // (stretched about their middle), so it spreads like a photon's splat.
+  float Lb = max(L2, 2.0 * uSig);
+  vec2 dir = L2 > 1e-4 ? (B - A) / L2 : vec2(0.0, 1.0);
+  vec2 mid = 0.5 * (A + B);
+  A = mid - dir * 0.5 * Lb; B = mid + dir * 0.5 * Lb;
   // power × 3D length (texels), over the band's area: per unit of its
   // length, the Gaussian across it integrates to 1
-  float w = a.w * distance(a.xyz, b.xyz) * s.x / max(L2, 1.0) / (2.5066283 * uSig);
+  float w = a.w * distance(a.xyz, b.xyz) * s.x / Lb / (2.5066283 * uSig);
   vW = row < uRowsLens ? vec2(w, 0.0) : vec2(0.0, w);
-  vec2 dir = L2 > 1e-4 ? (B - A) / L2 : vec2(0.0, 1.0);
   vec2 nrm = vec2(-dir.y, dir.x);
   int side = gl_VertexID & 1, end = gl_VertexID >> 1;
   vU = side == 0 ? -3.0 : 3.0;
