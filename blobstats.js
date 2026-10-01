@@ -11,6 +11,10 @@
 //    frags       — mean # of free fragments with 1-4 particles
 //    aspect      — mean major/minor axis ratio of free blobs (1 = round)
 //    jiggle      — mean internal (non-rigid) speed² of free blobs
+//    reach       — roundness of free blobs (>= 8 particles), every mode: the
+//                  90th-percentile particle distance from the centroid over
+//                  √2 × the RMS distance (the radius, for a uniform disc).
+//                  A round blob ≈ 0.95; lumps and stretching raise it
 //    aloft       — mean fraction of fluid particles in the upper 60%
 //    size        — mean particle count of free blobs (>= 5 particles)
 //    sizeP90     — 90th percentile free-blob size
@@ -58,6 +62,7 @@ function runOnce(seed, seconds, overrides) {
   let merges = 0, upSum = 0, upN = 0, downSum = 0, downN = 0, contactSum = 0;
   const prevCy = new Float64Array(K), prevN = new Int32Array(K);
   let tears = 0, detaches = 0, fragSum = 0, aspSum = 0, aspN = 0;
+  let reachSum = 0, reachN = 0;
   let jigSum = 0, jigN = 0, aloftSum = 0, samples = 0, simMs = 0;
   const sizes = []; let bigSum = 0;
 
@@ -162,6 +167,13 @@ function runOnce(seed, seconds, overrides) {
       const disc = Math.sqrt(Math.max(0, tr * tr / 4 - det));
       const l1 = tr / 2 + disc, l2 = Math.max(1e-6, tr / 2 - disc);
       aspSum += Math.sqrt(l1 / l2); aspN++;
+      {
+        const ds = [];
+        for (let i = nFixed; i < n; i++) if (gid[i] === k) ds.push(Math.hypot(sim.x[i] - cmx[k], sim.y[i] - cmy[k]));
+        ds.sort((p, q) => p - q);
+        const Rd = Math.sqrt(2 * ds.reduce((a, d) => a + d * d, 0) / ds.length);
+        reachSum += ds[Math.floor(ds.length * 0.9)] / Rd; reachN++;
+      }
       jigSum += jig[k] / size[k]; jigN++;
     }
   }
@@ -171,6 +183,7 @@ function runOnce(seed, seconds, overrides) {
     detach: detaches / minutes,
     frags: fragSum / samples,
     aspect: aspN ? aspSum / aspN : NaN,
+    reach: reachN ? reachSum / reachN : NaN,
     jiggle: jigN ? jigSum / jigN : NaN,
     aloft: aloftSum / samples,
     size: sizes.length ? sizes.reduce((a, b) => a + b, 0) / sizes.length : NaN,

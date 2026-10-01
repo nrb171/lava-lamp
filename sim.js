@@ -46,6 +46,14 @@ class SPH {
     this.h = 26;                  // smoothing radius (px)
     this.mass = 0.9;
     this.gasK = 2400 * 5.00;      // pressure stiffness
+    // Near pressure (Clavet, Beaudoin & Poulin 2005): a short-range
+    // repulsion between particles of the same body, from a "near density"
+    // Σ(1 − r/h)³ that grows without bound as particles crowd. Ordinary
+    // pressure per unit mass, P/ρ, levels off at gasK however hard a body is
+    // squeezed, while the pull of its springs and cohesion grows with its
+    // number of neighbours — so a big, cohesive blob could crush itself to
+    // a point. This keeps particles apart whatever the cohesion.
+    this.nearK = 40;
     this.viscosity = 0.2 / 26;    // base kinematic viscosity
     this.viscScale = 0.50;        // user multiplier (lower = bouncier: Ohnesorge ∝ ν/√(σR))
     this.cohesion = 0.55;
@@ -58,8 +66,15 @@ class SPH {
     // Bo = g'R²/(σ/ρ) ≈ 0.3 for a typical 12-particle blob (R ≈ 30 px,
     // g' = gravity·hotDensityDeficit ≈ 11 px/s²): surface tension beats
     // buoyancy, so rising blobs stay round. (Real lamps sit near Bo ≈ 1-2.)
-    this.capSigma = 15000;
+    this.capSigma = 30000;
     this.capMinN = 5;        // fewer particles than this: no resolvable shape
+    // Viscous damping of each free blob's shape change (1/s): the
+    // traceless part of its best-fit linear velocity field — the rate it
+    // stretches or shears — is damped, leaving its motion, spin and the
+    // pool alone. Without it the capillary mode rings: blobs wobble between
+    // ellipses rather than settling round (stiffer surface tension only
+    // made them ring faster).
+    this.shapeDamp = 3;
 
     // Distinct masses ("blobs")
     this.MAX_BLOBS = 32;
@@ -207,6 +222,7 @@ class SPH {
     this.fy = new Float32Array(n);
     this.density  = new Float32Array(n);
     this.compression = new Float32Array(n);  // per-particle compression ratio
+    this.nearDensity = new Float32Array(n);  // Σ (1 − r/h)³ over the same body (near pressure)
     this.pressure = new Float32Array(n);
     this.temp = new Float32Array(n);
     this.dT   = new Float32Array(n);
@@ -745,10 +761,12 @@ class SPH {
     const pden = this.density;
     const ppres = this.pressure;
     const sqrtSize = this._sqrtSize;
+    const nearK = this.nearK;
 
     // 1) Density & pressure (inlined neighbor walk)
+    const pnear = this.nearDensity;
     for (let i = 0; i < n; i++) {
-      let rho = 0;
+      let rho = 0, rhoNear = 0;
       const xi = px[i], yi = py[i];
       const gi = gid[i];
       const isFluidI = i >= nFixed;
@@ -772,6 +790,8 @@ class SPH {
               const gj = gid[j];
               if (gj === gi) {
                 rho += term;
+                const qn = 1 - Math.sqrt(r2) / h;
+                rhoNear += qn * qn * qn;
               } else if (isFluidI && j >= nFixed) {
                 const absZ = Math.abs(bz[gi] - bz[gj]);
                 const zReach = Math.min(0.55, (sqrtSize[gi] + sqrtSize[gj]) * 0.07);
@@ -785,6 +805,7 @@ class SPH {
         }
       }
       if (rho < this.restDensity) rho = this.restDensity;
+      pnear[i] = rhoNear;
       pden[i] = rho;
       ppres[i] = this.gasK * (rho - this.restDensity);
       // Compression ratio: 0 at rest density, rises as particle is squeezed.
@@ -851,6 +872,8 @@ class SPH {
       let fvx = 0, fvy = 0;
       let fcx = 0, fcy = 0;
       let frx = 0, fry = 0;
+      let fnx = 0, fny = 0;
+      const nearI = pnear[i];
       let dTsum = 0, neighCount = 0;
       const xi = px[i], yi = py[i];
       const poolI = poolRamp[i];
@@ -919,6 +942,12 @@ class SPH {
                     const pTerm = -m * (Pi + ppres[j]) / (2 * rhoj) * SPIKY_GRAD * (h - r) * (h - r) / r;
                     fpx += pTerm * dx;
                     fpy += pTerm * dy;
+                    if (nearK > 0) {
+                      const qn = 1 - r / h;
+                      const nTerm = nearK * (nearI + pnear[j]) * qn * qn / r;
+                      fnx += nTerm * dx;
+                      fny += nTerm * dy;
+                    }
                     const vTerm = visc * m / rhoj * VISC_LAP * (h - r);
                     fvx += vTerm * (pvx[j] - vxi);
                     fvy += vTerm * (pvy[j] - vyi);
@@ -973,8 +1002,8 @@ class SPH {
       const densRatio = this.coolDensityExcess - buoTotal * riseFactor;
       const effG = this.gravity * densRatio * this.gravityScale;
 
-      this.fx[i] = (fpx + fvx) / rhoi + fcx + frx;
-      this.fy[i] = (fpy + fvy) / rhoi + fcy + effG + fry;
+      this.fx[i] = (fpx + fvx) / rhoi + fcx + frx + fnx;
+      this.fy[i] = (fpy + fvy) / rhoi + fcy + effG + fry + fny;
       this.dT[i] = (neighCount > 0 ? dTsum / neighCount : 0) * (this.heatDiff * this.heatDiffScale);
     }
 
@@ -1180,17 +1209,56 @@ class SPH {
     const px = this.x, py = this.y, gid = this.groupId;
     const acc = this._capAcc;     // per group: N, Σx, Σy, Σxx, Σyy, Σxy, -, -
     acc.fill(0);
+    const pvx = this.vx, pvy = this.vy;
+    // velocity moments for shapeDamp: Σvx, Σvy, Σ vx·x, Σ vx·y, Σ vy·x, Σ vy·y
+    const vm = this._capVel || (this._capVel = new Float64Array(K * 8));
+    const shapeDamp = this.shapeDamp;
+    if (shapeDamp > 0) vm.fill(0);
     for (let i = nFixed; i < n; i++) {
       const o = gid[i] << 3;
       const x = px[i], y = py[i];
       acc[o] += 1; acc[o + 1] += x; acc[o + 2] += y;
       acc[o + 3] += x * x; acc[o + 4] += y * y; acc[o + 5] += x * y;
+      if (shapeDamp > 0) {
+        const vx = pvx[i], vy = pvy[i];
+        vm[o] += vx; vm[o + 1] += vy;
+        vm[o + 2] += vx * x; vm[o + 3] += vx * y; vm[o + 4] += vy * x; vm[o + 5] += vy * y;
+      }
     }
     // Walls belong to the pool body, which is not a free drop.
     const skipA = nFixed > 0 ? gid[0] : -1;
     const skipB = this._poolBlobId;
     const V0 = this.mass / this.restDensity;       // area per particle
     const sig = this.capSigma * this.surfaceTensionScale;
+    // shapeDamp: fit v ≈ v̄ + G·d per free blob (G = C_vd · C_dd⁻¹ from the
+    // moments), keep the traceless symmetric part S (stretch and shear
+    // rates) and push back against it: a_i = −shapeDamp · S · d_i. No net
+    // force (Σd = 0), no torque (S symmetric), no change of area (trace 0).
+    const sd = this._capS || (this._capS = new Float64Array(K * 6));   // cx, cy, Sxx, Sxy, -, on
+    if (shapeDamp > 0) {
+      for (let g = 0; g < K; g++) {
+        const o = g << 3, N = acc[o], q = g * 6;
+        sd[q + 5] = 0;
+        if (N < this.capMinN || g === skipA || g === skipB) continue;
+        const cx = acc[o + 1] / N, cy = acc[o + 2] / N;
+        if (cy > this.poolZoneTop) continue;        // plumes rising out of the pool: leave be
+        const dxx = acc[o + 3] / N - cx * cx, dyy = acc[o + 4] / N - cy * cy, dxy = acc[o + 5] / N - cx * cy;
+        const det = dxx * dyy - dxy * dxy;
+        if (det < 1e-6) continue;
+        const mvx = vm[o] / N, mvy = vm[o + 1] / N;
+        // covariances of velocity with position
+        const cvxx = vm[o + 2] / N - mvx * cx, cvxy = vm[o + 3] / N - mvx * cy;
+        const cvyx = vm[o + 4] / N - mvy * cx, cvyy = vm[o + 5] / N - mvy * cy;
+        // G = Cvd · Cdd⁻¹
+        const ixx = dyy / det, iyy = dxx / det, ixy = -dxy / det;
+        const gxx = cvxx * ixx + cvxy * ixy, gxy = cvxx * ixy + cvxy * iyy;
+        const gyx = cvyx * ixx + cvyy * ixy, gyy = cvyx * ixy + cvyy * iyy;
+        const tr = 0.5 * (gxx + gyy);
+        sd[q] = cx; sd[q + 1] = cy;
+        sd[q + 2] = gxx - tr; sd[q + 3] = 0.5 * (gxy + gyx);
+        sd[q + 5] = 1;
+      }
+    }
     for (let g = 0; g < K; g++) {
       const o = g << 3;
       const N = acc[o];
@@ -1220,6 +1288,17 @@ class SPH {
       acc[o + 6] = sdd * this.mass;               // force = m·a
     }
     const fx = this.fx, fy = this.fy;
+    if (shapeDamp > 0) {
+      const mD = shapeDamp * this.mass;
+      for (let i = nFixed; i < n; i++) {
+        const q = gid[i] * 6;
+        if (sd[q + 5] === 0) continue;
+        const dx = px[i] - sd[q], dy = py[i] - sd[q + 1];
+        const sxx = sd[q + 2], sxy = sd[q + 3];
+        fx[i] -= mD * (sxx * dx + sxy * dy);
+        fy[i] -= mD * (sxy * dx - sxx * dy);
+      }
+    }
     for (let i = nFixed; i < n; i++) {
       const o = gid[i] << 3;
       const k = acc[o + 6];

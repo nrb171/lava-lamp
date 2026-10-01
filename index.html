@@ -1753,7 +1753,11 @@ class MetaballRenderer {
     // normalisation, bdRef, divides the scale back out.)
     gl.uniform1f(t.uRayScale, 1e7 / (NPH * NAZ));
     gl.uniform3i(t.uRayDim, NAZ, NPH, NSRC);
-    const ring = this.taaRing("wall", this.WG_W, this.WG_H, lowQ ? 4 : 8);
+    // (the same ring in both quality tiers: the adaptive quality switches
+    // tier whenever frame time crosses its threshold, and rebuilding the
+    // ring threw the accumulated light away — the wall flashed back to
+    // noise at every switch)
+    const ring = this.taaRing("wall", this.WG_W, this.WG_H, 8);
     gl.useProgram(this.lightProg);
     this.taaSeed(t, ring);
     gl.bindVertexArray(this.vao);
@@ -1772,8 +1776,11 @@ class MetaballRenderer {
     gl.uniform1i(pU.uRays, 6);
     gl.uniform2i(pU.uRaySize, NAZ, NPH * NSRC);
     gl.uniform2f(pU.uView, VIEW_W, VIEW_H);
-    // kernel: a fixed width on the wall (sim px), in 2× grid texels
-    gl.uniform1f(pU.uSigma, Math.min(20, WALL_PHOTON_SIGMA * (lowQ ? 1.5 : 1) * 2 * GWc / VIEW_W));
+    // kernel: a fixed width on the wall (sim px), in 2× grid texels — the
+    // same in both tiers, and small enough for the GPU's largest point
+    // sprite (some mobile GPUs stop at 64 px, cutting the splat's edges)
+    this._maxPoint = this._maxPoint || gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1];
+    gl.uniform1f(pU.uSigma, Math.min(20, (this._maxPoint - 1) / 6.5, WALL_PHOTON_SIGMA * 2 * GWc / VIEW_W));
     gl.enable(gl.BLEND);
     gl.blendEquation(gl.FUNC_ADD);
     gl.blendFunc(gl.ONE, gl.ONE);
@@ -1847,7 +1854,9 @@ class MetaballRenderer {
     const rs = this.rayScale || 1;
     const NAZ = Math.max(16, Math.round((lowQ ? 128 : 256) * rs)), NPH = Math.max(6, Math.round((lowQ ? 48 : 96) * rs));
     this.causRays = NAZ * NPH * NSRC;
-    const cell = lowQ ? 4 : 2;
+    // one grid for both quality tiers: a new grid restarts the accumulated
+    // light and re-measures the normalisation (a flash at every switch)
+    const cell = 2;
     const CW = Math.round(SIM_W / cell), CH = Math.round(SIM_H / cell);
     const rows = NPH * NSRC;
     // targets
@@ -1884,7 +1893,7 @@ class MetaballRenderer {
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.pathFbo);
     gl.uniform1i(t.uMode, 1);
     gl.uniform1f(t.uAzSpan, 2 * Math.PI);
-    const ring = this.taaRing("caus", CW, CH, lowQ ? 4 : 8);
+    const ring = this.taaRing("caus", CW, CH, 8);
     gl.useProgram(this.lightProg);
     this.taaSeed(t, ring);
     gl.uniform1f(t.uRayScale, 1e3 / (NPH * NAZ));             // ~1 per texel: see gpuWall
