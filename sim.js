@@ -66,8 +66,15 @@ class SPH {
     // Bo = g'R²/(σ/ρ) ≈ 0.3 for a typical 12-particle blob (R ≈ 30 px,
     // g' = gravity·hotDensityDeficit ≈ 11 px/s²): surface tension beats
     // buoyancy, so rising blobs stay round. (Real lamps sit near Bo ≈ 1-2.)
-    this.capSigma = 15000;
+    this.capSigma = 30000;
     this.capMinN = 5;        // fewer particles than this: no resolvable shape
+    // Viscous damping of each free blob's shape change (1/s): the
+    // traceless part of its best-fit linear velocity field — the rate it
+    // stretches or shears — is damped, leaving its motion, spin and the
+    // pool alone. Without it the capillary mode rings: blobs wobble between
+    // ellipses rather than settling round (stiffer surface tension only
+    // made them ring faster).
+    this.shapeDamp = 3;
 
     // Distinct masses ("blobs")
     this.MAX_BLOBS = 32;
@@ -1202,17 +1209,56 @@ class SPH {
     const px = this.x, py = this.y, gid = this.groupId;
     const acc = this._capAcc;     // per group: N, Σx, Σy, Σxx, Σyy, Σxy, -, -
     acc.fill(0);
+    const pvx = this.vx, pvy = this.vy;
+    // velocity moments for shapeDamp: Σvx, Σvy, Σ vx·x, Σ vx·y, Σ vy·x, Σ vy·y
+    const vm = this._capVel || (this._capVel = new Float64Array(K * 8));
+    const shapeDamp = this.shapeDamp;
+    if (shapeDamp > 0) vm.fill(0);
     for (let i = nFixed; i < n; i++) {
       const o = gid[i] << 3;
       const x = px[i], y = py[i];
       acc[o] += 1; acc[o + 1] += x; acc[o + 2] += y;
       acc[o + 3] += x * x; acc[o + 4] += y * y; acc[o + 5] += x * y;
+      if (shapeDamp > 0) {
+        const vx = pvx[i], vy = pvy[i];
+        vm[o] += vx; vm[o + 1] += vy;
+        vm[o + 2] += vx * x; vm[o + 3] += vx * y; vm[o + 4] += vy * x; vm[o + 5] += vy * y;
+      }
     }
     // Walls belong to the pool body, which is not a free drop.
     const skipA = nFixed > 0 ? gid[0] : -1;
     const skipB = this._poolBlobId;
     const V0 = this.mass / this.restDensity;       // area per particle
     const sig = this.capSigma * this.surfaceTensionScale;
+    // shapeDamp: fit v ≈ v̄ + G·d per free blob (G = C_vd · C_dd⁻¹ from the
+    // moments), keep the traceless symmetric part S (stretch and shear
+    // rates) and push back against it: a_i = −shapeDamp · S · d_i. No net
+    // force (Σd = 0), no torque (S symmetric), no change of area (trace 0).
+    const sd = this._capS || (this._capS = new Float64Array(K * 6));   // cx, cy, Sxx, Sxy, -, on
+    if (shapeDamp > 0) {
+      for (let g = 0; g < K; g++) {
+        const o = g << 3, N = acc[o], q = g * 6;
+        sd[q + 5] = 0;
+        if (N < this.capMinN || g === skipA || g === skipB) continue;
+        const cx = acc[o + 1] / N, cy = acc[o + 2] / N;
+        if (cy > this.poolZoneTop) continue;        // plumes rising out of the pool: leave be
+        const dxx = acc[o + 3] / N - cx * cx, dyy = acc[o + 4] / N - cy * cy, dxy = acc[o + 5] / N - cx * cy;
+        const det = dxx * dyy - dxy * dxy;
+        if (det < 1e-6) continue;
+        const mvx = vm[o] / N, mvy = vm[o + 1] / N;
+        // covariances of velocity with position
+        const cvxx = vm[o + 2] / N - mvx * cx, cvxy = vm[o + 3] / N - mvx * cy;
+        const cvyx = vm[o + 4] / N - mvy * cx, cvyy = vm[o + 5] / N - mvy * cy;
+        // G = Cvd · Cdd⁻¹
+        const ixx = dyy / det, iyy = dxx / det, ixy = -dxy / det;
+        const gxx = cvxx * ixx + cvxy * ixy, gxy = cvxx * ixy + cvxy * iyy;
+        const gyx = cvyx * ixx + cvyy * ixy, gyy = cvyx * ixy + cvyy * iyy;
+        const tr = 0.5 * (gxx + gyy);
+        sd[q] = cx; sd[q + 1] = cy;
+        sd[q + 2] = gxx - tr; sd[q + 3] = 0.5 * (gxy + gyx);
+        sd[q + 5] = 1;
+      }
+    }
     for (let g = 0; g < K; g++) {
       const o = g << 3;
       const N = acc[o];
@@ -1242,6 +1288,17 @@ class SPH {
       acc[o + 6] = sdd * this.mass;               // force = m·a
     }
     const fx = this.fx, fy = this.fy;
+    if (shapeDamp > 0) {
+      const mD = shapeDamp * this.mass;
+      for (let i = nFixed; i < n; i++) {
+        const q = gid[i] * 6;
+        if (sd[q + 5] === 0) continue;
+        const dx = px[i] - sd[q], dy = py[i] - sd[q + 1];
+        const sxx = sd[q + 2], sxy = sd[q + 3];
+        fx[i] -= mD * (sxx * dx + sxy * dy);
+        fy[i] -= mD * (sxy * dx - sxx * dy);
+      }
+    }
     for (let i = nFixed; i < n; i++) {
       const o = gid[i] << 3;
       const k = acc[o + 6];
