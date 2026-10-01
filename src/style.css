@@ -1,0 +1,192 @@
+:root {
+  --bg: #0a0612;
+  --panel: rgba(255,255,255,0.04);
+  --panel-border: rgba(255,255,255,0.08);
+  --text: #e8d8ff;
+  --muted: #8a7ba0;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: #000;
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+  overflow: hidden;
+}
+/* The canvas fills the window: the lamp is fitted in the middle and the
+   wall behind it fills the rest. */
+.stage {
+  position: fixed;
+  inset: 0;
+}
+canvas#lava {
+  display: block;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  /* prevent the browser from translating drag gestures into scroll/zoom */
+  touch-action: none;
+  cursor: grab;
+}
+canvas#lava.grabbing { cursor: grabbing; }
+
+/* Soft Gaussian-looking halo that appears at the cursor while a
+   grab is active. No hard outline — the gradient mirrors the
+   weight falloff the simulation actually uses. (No blend mode or
+   CSS blur: over a canvas that repaints every frame those force the
+   compositor to redo the effect each frame, even while invisible.) */
+.grab-ring {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+  background:
+    radial-gradient(circle,
+      rgba(255,255,255,0.18) 0%,
+      rgba(255,255,255,0.10) 30%,
+      rgba(255,255,255,0.04) 60%,
+      rgba(255,255,255,0.00) 90%);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease-out, visibility 0s linear 0.15s;
+}
+.grab-ring.active { opacity: 1; visibility: visible; transition: opacity 0.15s ease-out; }
+/* Floats over the canvas. Solid tint rather than backdrop-filter: the
+   canvas under it repaints every frame. */
+.controls {
+  position: fixed;
+  top: 62px;
+  right: 14px;
+  z-index: 5;
+  max-height: calc(100vh - 76px);
+  overflow-y: auto;
+  background: rgba(14, 9, 22, 0.86);
+  border: 1px solid var(--panel-border);
+  border-radius: 18px;
+  padding: 22px 22px 18px;
+  width: 280px;
+}
+.controls h1 {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 18px;
+}
+.control { margin-bottom: 16px; }
+.control label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.control .val { font-variant-numeric: tabular-nums; opacity: 0.7; font-size: 11px; }
+input[type=range] {
+  width: 100%;
+  accent-color: #b85cff;
+  background: transparent;
+}
+input[type=color] {
+  width: 100%;
+  height: 32px;
+  border-radius: 6px;
+  border: 1px solid var(--panel-border);
+  background: transparent;
+  cursor: pointer;
+  padding: 2px;
+}
+.row { display: flex; gap: 8px; }
+.row > .control { flex: 1; margin-bottom: 0; }
+button {
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: 9px;
+  background: rgba(184, 92, 255, 0.12);
+  color: inherit;
+  border: 1px solid rgba(184, 92, 255, 0.24);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  transition: background 0.15s;
+}
+button:hover { background: rgba(184, 92, 255, 0.2); }
+.stats {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--panel-border);
+  font-size: 10px;
+  color: var(--muted);
+  letter-spacing: 0.06em;
+  display: flex;
+  justify-content: space-between;
+}
+.preset-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.preset {
+  flex: 1;
+  padding: 6px 4px;
+  font-size: 10px;
+  border-radius: 7px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--panel-border);
+  cursor: pointer;
+  color: var(--muted);
+  transition: all 0.15s;
+}
+.preset:hover { color: var(--text); border-color: rgba(184,92,255,0.4); }
+@media (max-width: 760px) {
+  .controls { left: 14px; right: 14px; width: auto; max-height: 60vh; }
+}
+
+/* Floating toolbar (fullscreen + panel toggle) */
+.toolbar {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  display: flex;
+  gap: 8px;
+  z-index: 10;
+}
+.toolbar button {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: 9px;
+  /* Solid tint instead of backdrop-filter: these buttons float over the
+     canvas, which changes every frame, so a backdrop blur would be
+     recomputed every frame. */
+  background: rgba(24, 16, 36, 0.78);
+  border: 1px solid rgba(255,255,255,0.10);
+  color: var(--text);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+}
+.toolbar button:hover { background: rgba(184, 92, 255, 0.20); }
+
+/* Hidden state for the controls panel */
+.controls.hidden { display: none; }
+
+/* Fullscreen: scale the canvas to fill the viewport, keep aspect ratio */
+:fullscreen body,
+:-webkit-full-screen body {
+  background: #000;
+}

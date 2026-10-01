@@ -1,5 +1,5 @@
 // Long blobPop optimization — runs LHS in batches, writes results to file
-const { KERNELS, optimize } = require('./optimize.js');
+import { KERNELS, optimize } from './optimize.js';
 
 const result = optimize(['blobPop'], {
   samples: 200,

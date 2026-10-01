@@ -2,8 +2,8 @@
 // ============================================================
 //  Headless blob-behaviour harness.
 //
-//  Runs the sim exactly as index.html does (60 fps, 5 substeps) with a
-//  seeded RNG and reports:
+//  Runs the sim exactly as the page does (src/main.js: 60 fps, 5
+//  substeps) with a seeded RNG and reports:
 //    tears/min   — a free blob (>= 8 particles) splitting into 2+ pieces
 //                  of >= 3 particles each (what we want to suppress)
 //    detach/min  — a new blob (>= 5 particles) leaving the pool
@@ -30,12 +30,13 @@
 //                  (the whole pool lifted off: a real lamp always keeps one)
 //    ms/frame    — sim cost per rendered frame
 //
-//  Usage: node blobstats.js [seconds=90] [seeds=3] [key=value ...]
+//  Usage: node tools/blobstats.js [seconds=90] [seeds=3] [key=value ...]
 //  key=value pairs are assigned onto the SPH instance before running,
-//  e.g. `node blobstats.js 60 2 capSigma=0 ruptureDist=0`.
+//  e.g. `node tools/blobstats.js 60 2 capSigma=0 ruptureDist=0`.
 // ============================================================
 
-const { SPH, SIM_H } = require('./sim.js');
+import { pathToFileURL } from 'node:url';
+import { SPH, SIM_H } from '../src/sim/sim.js';
 
 function mulberry32(a) {
   return function () {
@@ -199,7 +200,7 @@ function runOnce(seed, seconds, overrides) {
   };
 }
 
-if (require.main === module) {
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const args = process.argv.slice(2);
   const seconds = parseFloat(args[0]) || 90;
   const seeds = parseInt(args[1], 10) || 3;
@@ -218,4 +219,4 @@ if (require.main === module) {
   console.log(`MEAN:   ${fmt(mean)}`);
 }
 
-module.exports = { runOnce };
+export { runOnce };

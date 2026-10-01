@@ -1,6 +1,6 @@
 // ============================================================
-//  Lava-lamp SPH simulation — physics module
-//  Separated from index.html for modularity and headless use.
+//  Lava-lamp SPH simulation — physics module (an ES module: used by the
+//  page, src/main.js, and headless by the tools in tools/)
 // ============================================================
 
 const SIM_W = 380;
@@ -1411,7 +1411,4 @@ class SPH {
   }
 }
 
-// UMD export — works as both Node module and browser script
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { SPH, SIM_W, SIM_H, bottleHalfFrac, bottleHalfWidth };
-}
+export { SPH, SIM_W, SIM_H, bottleHalfFrac, bottleHalfWidth };
