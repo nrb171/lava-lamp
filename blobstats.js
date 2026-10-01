@@ -15,6 +15,15 @@
 //    size        — mean particle count of free blobs (>= 5 particles)
 //    sizeP90     — 90th percentile free-blob size
 //    big         — mean # of free blobs with > 45 particles
+//    vUp / vDown — mean speed of free blobs (>= 8 particles) while rising /
+//                  sinking, in lamp heights per minute
+//    merges/min  — two free blobs (>= 3 particles each) joining into one
+//    contacts    — mean # of free-blob pairs touching (closest particles
+//                  within the inter-blob cushion range), per sample
+//    pool        — mean share of the fluid particles in the pool: the pool
+//                  zone at the bottom (below sim.poolZoneTop), as seen
+//    poolEmpty   — share of samples with under 10% of the fluid in the pool
+//                  (the whole pool lifted off: a real lamp always keeps one)
 //    ms/frame    — sim cost per rendered frame
 //
 //  Usage: node blobstats.js [seconds=90] [seeds=3] [key=value ...]
@@ -45,6 +54,9 @@ function runOnce(seed, seconds, overrides) {
   const tally = new Int32Array(K * K);
   const size = new Int32Array(K), prevSize = new Int32Array(K);
 
+  let poolSum = 0, poolEmpty = 0;
+  let merges = 0, upSum = 0, upN = 0, downSum = 0, downN = 0, contactSum = 0;
+  const prevCy = new Float64Array(K), prevN = new Int32Array(K);
   let tears = 0, detaches = 0, fragSum = 0, aspSum = 0, aspN = 0;
   let jigSum = 0, jigN = 0, aloftSum = 0, samples = 0, simMs = 0;
   const sizes = []; let bigSum = 0;
@@ -81,6 +93,13 @@ function runOnce(seed, seconds, overrides) {
         tears++;
       }
     }
+    // merges: a current free group fed by >= 2 previous free groups
+    for (let c = 1; c < K; c++) {
+      if (c === pool || size[c] < 6) continue;
+      let feeders = 0;
+      for (let p = 1; p < K; p++) if (p !== poolPrev && prevSize[p] >= 3 && tally[p * K + c] >= 3) feeders++;
+      if (feeders >= 2) merges++;
+    }
 
     if (f % 6) continue;
     samples++;
@@ -94,6 +113,28 @@ function runOnce(seed, seconds, overrides) {
       if (sim.y[i] < SIM_H * 0.6) aloft++;
     }
     aloftSum += aloft / (n - nFixed);
+    {
+      let inPool = 0;
+      for (let i = nFixed; i < n; i++) if (sim.y[i] > sim.poolZoneTop) inPool++;
+      const pf = inPool / (n - nFixed);
+      poolSum += pf; if (pf < 0.1) poolEmpty++;
+    }
+    // free-blob pairs in contact
+    {
+      const R2 = sim.cushionRange * sim.cushionRange;
+      const touch = new Uint8Array(K * K);
+      for (let i = nFixed; i < n; i++) {
+        const gi = gid[i];
+        if (gi === pool || size[gi] < 5) continue;
+        for (let j = i + 1; j < n; j++) {
+          const gj = gid[j];
+          if (gj === gi || gj === pool || size[gj] < 5) continue;
+          const dx = sim.x[i] - sim.x[j], dy = sim.y[i] - sim.y[j];
+          if (dx * dx + dy * dy < R2) touch[Math.min(gi, gj) * K + Math.max(gi, gj)] = 1;
+        }
+      }
+      for (let k = 0; k < K * K; k++) contactSum += touch[k];
+    }
     const sxx = new Float64Array(K), syy = new Float64Array(K), sxy = new Float64Array(K);
     const jig = new Float64Array(K);
     for (let k = 0; k < K; k++) if (size[k]) {
@@ -109,6 +150,10 @@ function runOnce(seed, seconds, overrides) {
     for (let k = 1; k < K; k++) {
       if (k === pool || size[k] === 0) continue;
       if (size[k] <= 4) { fragSum++; continue; }
+      if (size[k] >= 8) {
+        const v = cvy[k];                       // sim px/s, + = down
+        if (v < -2) { upSum += -v; upN++; } else if (v > 2) { downSum += v; downN++; }
+      }
       sizes.push(size[k]);
       if (size[k] > 45) bigSum++;
       if (size[k] < 8) continue;
@@ -131,6 +176,12 @@ function runOnce(seed, seconds, overrides) {
     size: sizes.length ? sizes.reduce((a, b) => a + b, 0) / sizes.length : NaN,
     sizeP90: sizes.length ? sizes.sort((a, b) => a - b)[Math.floor(sizes.length * 0.9)] : NaN,
     big: bigSum / samples,
+    vUp: upN ? upSum / upN / SIM_H * 60 : NaN,
+    vDown: downN ? downSum / downN / SIM_H * 60 : NaN,
+    merges: merges / minutes,
+    contacts: contactSum / samples,
+    pool: poolSum / samples,
+    poolEmpty: poolEmpty / samples,
     ms: simMs / frames,
   };
 }
